@@ -44,9 +44,24 @@ subset. The tool must route the correct corpus + protocol per target.
 
 | Component | Role | Protocol it expects | Query it expects |
 |-----------|------|---------------------|------------------|
-| **Retriever / KPs** | Knowledge Providers | sync `POST /query` (TRAPI) | `lookup`-mode queries (pinned/open/batch one-hops). Cheapest. ~40+ endpoints. |
+| **Retriever / KP** | Knowledge Provider (one service: **Retriever**) | sync `POST /query` (TRAPI) | `lookup`-mode queries; set `parameters.tier` to 0 or 1 (see below). Cheapest layer. |
 | **Shepherd / ARAs** | Reasoning agents | sync `POST /query` (or `/asyncquery`) | `inferred`/creative-mode queries. Expensive. |
 | **ARS** | Autonomous Relay System | **async**: `POST /submit` → poll `GET /messages/{pk}` until `Done`/`Error` → fetch merged results | `inferred` query; very long-running (minutes–~1 hr). |
+
+### Retriever and the `tier` parameter
+
+In the **current** system the KP layer is a single service, **Retriever** — not the
+~40+ independent KP endpoints of the old architecture (those survive only in git
+history; see **Reusable assets**). Retriever exposes a
+`message["parameters"]["tier"]` field that selects the backend graph it queries:
+
+- **Tier 0** — backend graph that can handle **arbitrary multi-hop** queries.
+- **Tier 1** — backend graph that handles **mostly single-hop** queries.
+
+So when characterizing Retriever, `tier` is a first-class load dimension: a Tier 0
+multi-hop query is a heavier cost profile than a Tier 1 single-hop. A KP corpus
+should set `tier` **deliberately per query** (and pair multi-hop shapes with Tier 0,
+single-hop shapes with Tier 1) rather than sending one fixed value for everything.
 
 ### Layering rule — a run targets exactly ONE layer
 
@@ -118,6 +133,11 @@ batch size, predicate specificity. See the module docstring in `trapi_corpus.py`
   `POST`. The ARS submit → poll → merge workflow is unimplemented.
 - **Corpus is not segmented by component contract.** KPs want `lookup`; ARAs/ARS
   want `inferred`. Today every run draws from the same mixed `CORPUS`.
+- **Tier is hardcoded and uses the wrong shape.** `_qg()` in `trapi_corpus.py`
+  sets `parameters` to `{"tiers": [1]}` for every query, but Retriever's contract
+  is a scalar `parameters.tier` of `0` or `1` (see Retriever section). This needs
+  reconciling, and the KP corpus should vary `tier` per query rather than pinning
+  one value.
 - **Config is module-level constants**, not CLI/env/file driven (only
   `CSV_PREFIX` reads an env var, `LOCUST_CSV_PREFIX`).
 
