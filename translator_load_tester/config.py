@@ -31,7 +31,7 @@ TARGETS = {
         "endpoint": "/query",
         "corpus": "shepherd",
         "protocol": "sync",
-        "implemented": False,
+        "implemented": True,
     },
     "ars": {
         "label": "ARS",

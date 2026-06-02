@@ -6,8 +6,8 @@ NCATS Translator component and reports the **max sustainable concurrency** (the
 
 The Translator stack cascades **ARS → ARAs → KPs**, so a run targets exactly
 **one** layer at a time (testing a higher layer already loads everything beneath
-it). Today the **Retriever (KP)** workflow is wired up; Shepherd (ARA) and ARS
-are coming in a later phase.
+it). Today the **Retriever (KP)** and **Shepherd (ARA)** workflows are wired up;
+ARS is coming in a later phase.
 
 ## Install
 
@@ -15,17 +15,23 @@ are coming in a later phase.
 pip install -e .          # Python >= 3.12; installs locust
 ```
 
-## Run the Retriever (KP) workflow
+## Run a workflow
 
 ```bash
+# Retriever (KP) — sync lookup queries, scalar parameters.tier per query
 run_performance_tests --targets kps \
     --host https://your-retriever-service.example.org \
     --csv-prefix run1
+
+# Shepherd (ARA) — sync creative-mode (inferred) queries, cache bypassed
+run_performance_tests --targets aras \
+    --host https://your-ara-service.example.org \
+    --csv-prefix run1
 ```
 
-- `--targets kps` selects the Retriever layer. `aras` and `ars` are accepted but
-  print "not yet implemented" and exit non-zero.
-- `--host` is **required** — the base URL of the Retriever service. The endpoint
+- `--targets` selects the layer: `kps` (Retriever) or `aras` (Shepherd). `ars`
+  is accepted but prints "not yet implemented" and exits non-zero.
+- `--host` is **required** — the base URL of the target service. The endpoint
   path (`/query`) is appended automatically.
 - `--csv-prefix` is optional; it falls back to the `LOCUST_CSV_PREFIX` env var,
   then to `trapi_run`.
@@ -47,12 +53,19 @@ Written to the working directory by the standalone/master node:
 ## Tuning notes
 
 - **Swap the CURIEs.** The corpus in `translator_load_tester/trapi_corpus.py`
-  uses a few real MONDO/CHEBI entities; replace them with entities your Retriever
-  actually knows about, or lookups return empty and won't reflect real cost.
-- **Tier is per query.** Retriever exposes `parameters.tier` (0 or 1) to pick its
-  backend graph. The Retriever corpus pairs multi-hop shapes with tier 0 and
-  single-hop shapes with tier 1.
-- **Adjust corpus weights** in `RETRIEVER_CORPUS` to match your traffic mix.
+  uses a few real MONDO/CHEBI entities; replace them with entities your target
+  service actually knows about, or queries return empty and won't reflect real
+  cost.
+- **Tier is per query (Retriever only).** Retriever exposes `parameters.tier`
+  (0 or 1) to pick its backend graph. `RETRIEVER_CORPUS` pairs multi-hop shapes
+  with tier 0 and single-hop shapes with tier 1. ARA queries carry no tier.
+- **Shepherd sends inferred + bypass_cache.** `SHEPHERD_CORPUS` holds creative
+  "what treats disease X?" queries with `knowledge_type: "inferred"` and
+  `bypass_cache: true`, so the run measures reasoning cost rather than cache
+  hits. These are far heavier than KP lookups — expect the knee at much lower
+  concurrency; tune `STAGES` down accordingly.
+- **Adjust corpus weights** in `RETRIEVER_CORPUS` / `SHEPHERD_CORPUS` to match
+  your traffic mix.
 
 ## Running the engine directly
 

@@ -56,9 +56,11 @@ def main(argv=None):
     tgt = config.TARGETS[args.targets]
 
     if not tgt["implemented"]:
+        runnable = ", ".join(t for t in sorted(config.TARGETS)
+                             if config.TARGETS[t]["implemented"])
         print(
             f"The {tgt['label']} ({args.targets}) pipeline is not yet "
-            f"implemented. Only --targets kps (Retriever) is runnable today.",
+            f"implemented. Runnable targets: {runnable}.",
             file=sys.stderr,
         )
         return 1
