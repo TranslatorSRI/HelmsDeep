@@ -6,8 +6,8 @@ NCATS Translator component and reports the **max sustainable concurrency** (the
 
 The Translator stack cascades **ARS → ARAs → KPs**, so a run targets exactly
 **one** layer at a time (testing a higher layer already loads everything beneath
-it). Today the **Retriever (KP)** and **Shepherd (ARA)** workflows are wired up;
-ARS is coming in a later phase.
+it). All three workflows are wired up: **Retriever (KP)**, **Shepherd (ARA)**,
+and the asynchronous **ARS**.
 
 ## Install
 
@@ -27,12 +27,17 @@ run_performance_tests --targets kps \
 run_performance_tests --targets aras \
     --host https://your-ara-service.example.org \
     --csv-prefix run1
+
+# ARS — async submit/poll/merge of inferred queries (host = the ARS API base)
+run_performance_tests --targets ars \
+    --host https://ars.ci.transltr.io/ars/api \
+    --csv-prefix run1
 ```
 
-- `--targets` selects the layer: `kps` (Retriever) or `aras` (Shepherd). `ars`
-  is accepted but prints "not yet implemented" and exits non-zero.
-- `--host` is **required** — the base URL of the target service. The endpoint
-  path (`/query`) is appended automatically.
+- `--targets` selects the layer: `kps` (Retriever), `aras` (Shepherd), or `ars`.
+- `--host` is **required** — the base URL of the target service. For `kps`/`aras`
+  the `/query` path is appended; for `ars` the host is the API base and the tool
+  uses `/submit` then `/messages/{pk}`.
 - `--csv-prefix` is optional; it falls back to the `LOCUST_CSV_PREFIX` env var,
   then to `trapi_run`.
 
@@ -49,7 +54,29 @@ Written to the working directory by the standalone/master node:
 - `<prefix>_by_qtype.csv` — one row per (stage, query type)
 - `<prefix>_summary.json` — config (including which `target` was measured), all
   stages, and the chosen knee
+- `<prefix>_ars_health.csv` — **ARS only**: per-stage health signals (see below)
 - a printed summary table ending in the headline **max sustainable concurrency**
+
+### ARS async workflow and health signals
+
+The `ars` target is asynchronous: each logical query is `POST /submit` → poll
+`GET /messages/{pk}?trace=y` (every `poll_interval_s`, capped at `max_poll_s`,
+default 15 min) until `status` is `Done`/`Error` → fetch `GET /messages/{merged_pk}`
+and count `fields.data.message.results`. Latency is the wall-clock submit→terminal
+time; one measurement is recorded per logical query (the submit/poll/merge calls
+appear separately in Locust's own table but aren't double-counted).
+
+Because the ARS is what real users hit, the run also captures health signals to
+flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
+`summary.json` (`ars_health` + a human-readable `red_flags` list):
+
+- **result-count variation** (min/mean/max + coefficient of variation) across
+  identical queries;
+- **zero-result `Done`** count — a `Done` with 0 results is treated as a
+  **failure** (counts against the error rate and the knee) and flagged;
+- **response size** (merged-message bytes, mean/max);
+- **result drop under load** — flagged when the mean result count falls sharply
+  as concurrency rises across stages.
 
 ## Tuning notes
 
@@ -65,6 +92,9 @@ Written to the working directory by the standalone/master node:
   `bypass_cache: true`, so the run measures reasoning cost rather than cache
   hits. These are far heavier than KP lookups, so the `aras` target ships a
   gentler ramp and a looser `p99_slo_ms` than `kps` (see `config.py`).
+- **ARS reuses the Shepherd corpus** (`ARS_CORPUS = SHEPHERD_CORPUS`) — the same
+  inferred query the ARS fans out to its ARAs. Its poll cadence and per-query
+  timeout (`poll_interval_s`, `max_poll_s`) are tunable in `config.py`.
 - **Adjust corpus weights** in `RETRIEVER_CORPUS` / `SHEPHERD_CORPUS` to match
   your traffic mix.
 

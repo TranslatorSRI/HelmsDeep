@@ -6,9 +6,9 @@ layer at a time (see CLAUDE.md "Layering rule"). Each layer differs only in
 (1) the request protocol and (2) which corpus subset is sent; the step-load
 engine in ``trapi_loadtest.py`` is shared across all of them.
 
-``--targets`` on the CLI selects one of these keys. ``kps`` (Retriever) and
-``aras`` (Shepherd) are wired up; ``ars`` is a placeholder that marks where the
-ARS async pipeline will plug in.
+``--targets`` on the CLI selects one of these keys. ``kps`` (Retriever),
+``aras`` (Shepherd), and ``ars`` (the async submit/poll/merge pipeline) are all
+wired up.
 
 Per-target load + SLO tuning lives here because cost profiles differ wildly by
 layer: a KP lookup is cheap, an ARA creative query is expensive, and an ARS run
@@ -24,6 +24,11 @@ Fields:
   stages       step-load ramp: list of (users, spawn_rate, hold_seconds). Each
                stage should hold long enough for a stable measurement.
   p99_slo_ms   knee requires this layer's stage p99 <= this (ms)
+
+Async (``ars``) targets add:
+  messages_endpoint  base path for polling/merge: /messages/{pk}
+  poll_interval_s    seconds between status polls (gevent.sleep)
+  max_poll_s         per-query poll cap; exceeding it marks a Timeout failure
 """
 
 # Shared across all targets: a stage also needs error_rate <= this to be a knee.
@@ -68,18 +73,20 @@ TARGETS = {
     },
     "ars": {
         "label": "ARS",
-        "endpoint": "/submit",
+        "endpoint": "/submit",            # submit path (appended to --host)
+        "messages_endpoint": "/messages", # poll/merge base: /messages/{pk}
         "corpus": "ars",
         "protocol": "async",
-        "implemented": False,
-        # Placeholder until the async pipeline lands: runs take minutes-~1hr, so
-        # very low concurrency, long holds, and an hour-scale p99.
+        "implemented": True,
+        "poll_interval_s": 10,            # gevent.sleep between status polls
+        "max_poll_s": 900,                # 15-min cap; exceeding it = Timeout
+        # Runs take minutes -- very low concurrency, long holds.
         "stages": [
-            (1, 1, 300),
-            (2, 1, 600),
-            (5, 1, 600),
+            (1, 1, 600),
+            (2, 1, 900),
+            (4, 1, 900),
         ],
-        "p99_slo_ms": 3600000,
+        "p99_slo_ms": 600000,             # 10-min knee target (< max_poll_s)
     },
 }
 
