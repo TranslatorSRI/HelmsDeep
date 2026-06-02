@@ -39,7 +39,8 @@ import config
 from trapi_corpus import corpus_for
 
 # ----------------------------------------------------------------------------
-# Configuration -- edit these for your service / SLO.
+# Configuration. Per-target load + SLO live in config.py (cost profiles differ
+# wildly by layer); edit them there. REQUEST_TIMEOUT is shared.
 # ----------------------------------------------------------------------------
 # Which Translator layer this run targets (one layer per run; see CLAUDE.md).
 # Set by the run_performance_tests CLI; defaults so `locust -f` works directly.
@@ -47,21 +48,10 @@ TARGET = os.environ.get("LOADTEST_TARGET", config.DEFAULT_TARGET)
 _TGT = config.TARGETS[TARGET]
 ENDPOINT = _TGT["endpoint"]    # request path for this component
 CORPUS = corpus_for(_TGT["corpus"])   # query subset for this component
+STAGES = _TGT["stages"]               # per-target step-load ramp
+P99_SLO_MS = _TGT["p99_slo_ms"]       # per-target knee threshold
+MAX_ERROR_RATE = config.MAX_ERROR_RATE   # shared error-rate cap
 REQUEST_TIMEOUT = 210           # seconds; TRAPI queries can be slow
-P99_SLO_MS = 60000              # knee requires stage p99 <= this
-MAX_ERROR_RATE = 0.01          # and stage error rate <= this (1%)
-
-# Step-load profile: (users, spawn_rate, hold_seconds).
-# Each stage holds long enough to get a stable measurement (>= ~30s recommended).
-STAGES = [
-    (5,   5, 60),
-    (10,  5, 60),
-    (20,  5, 60),
-    (40, 10, 60),
-    (80, 10, 60),
-    (120, 20, 60),
-    (160, 20, 60),
-]
 
 CSV_PREFIX = os.environ.get("LOCUST_CSV_PREFIX", "trapi_run")
 

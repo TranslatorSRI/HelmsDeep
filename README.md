@@ -36,9 +36,10 @@ run_performance_tests --targets aras \
 - `--csv-prefix` is optional; it falls back to the `LOCUST_CSV_PREFIX` env var,
   then to `trapi_run`.
 
-The load profile (users, spawn rate, duration) is driven by the `StepLoad` shape
-in `translator_load_tester/trapi_loadtest.py`, **not** by CLI flags — so there is
-intentionally no `-u/-r/-t`. To change the ramp, edit the `STAGES` table.
+The load profile (users, spawn rate, duration) is driven by the `StepLoad` shape,
+**not** by CLI flags — so there is intentionally no `-u/-r/-t`. The ramp and knee
+threshold are **per target** in `translator_load_tester/config.py` (`stages` and
+`p99_slo_ms`), since cost profiles differ wildly by layer; edit them there.
 
 ## Outputs
 
@@ -62,8 +63,8 @@ Written to the working directory by the standalone/master node:
 - **Shepherd sends inferred + bypass_cache.** `SHEPHERD_CORPUS` holds creative
   "what treats disease X?" queries with `knowledge_type: "inferred"` and
   `bypass_cache: true`, so the run measures reasoning cost rather than cache
-  hits. These are far heavier than KP lookups — expect the knee at much lower
-  concurrency; tune `STAGES` down accordingly.
+  hits. These are far heavier than KP lookups, so the `aras` target ships a
+  gentler ramp and a looser `p99_slo_ms` than `kps` (see `config.py`).
 - **Adjust corpus weights** in `RETRIEVER_CORPUS` / `SHEPHERD_CORPUS` to match
   your traffic mix.
 
