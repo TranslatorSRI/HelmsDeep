@@ -46,6 +46,9 @@ METFORMIN = "CHEBI:6801"
 ALZHEIMERS = "MONDO:0004975"
 PARKINSONS = "MONDO:0005180"
 ASTHMA = "MONDO:0004979"
+LEVODOPA = "CHEBI:15765"
+DONEPEZIL = "CHEBI:53289"
+ALBUTEROL = "CHEBI:2549"       # salbutamol
 
 DISEASE_BATCH = [T2D, ALZHEIMERS, PARKINSONS, ASTHMA, "MONDO:0007739"]  # +Huntington
 
@@ -105,6 +108,21 @@ GENES = [
 ]
 _ASPECTS = ["activity", "abundance"]
 _DIRECTIONS = ["increased", "decreased"]
+
+
+# ---------------------------------------------------------------------------
+# Drug<->disease endpoint pairs for the Pathfinder corpus (ARA/ARS only). Each
+# Pathfinder query pins BOTH endpoints and asks for connecting paths, so we use
+# pairs that plausibly connect (drug relevant to disease) -- otherwise paths come
+# back empty, and on ARS a zero-result Done counts as a failure. Swap these for
+# (chemical, disease) pairs your target service actually knows about.
+# ---------------------------------------------------------------------------
+CHEM_DISEASE_PAIRS = [
+    (METFORMIN, T2D),
+    (LEVODOPA, PARKINSONS),
+    (DONEPEZIL, ALZHEIMERS),
+    (ALBUTEROL, ASTHMA),
+]
 
 
 def _qg(nodes, edges, tier=None, bypass_cache=None):
@@ -247,6 +265,52 @@ def mvp2_gene_affects_chem():
     )
 
 
+# ----------------------------------------------------------------------------
+# Pathfinder builders (ARA/ARS only -- its own run type).
+#
+# A Pathfinder query pins TWO endpoint nodes and asks for connecting paths via a
+# `paths` map in the query_graph (not `edges`). The service combines lookup +
+# inferred reasoning to find multi-hop paths between them, so this is the most
+# intensive query class -- hence its own heavier ramp / looser SLO in config.
+# `predicates` on a QPath conveys the *desired* path type (not a hard filter);
+# `constraints[].intermediate_categories` hints at what may sit on the path.
+# Pathfinder has no `knowledge_type` (that's edge-only) and no `tier` (ARA/ARS).
+# ----------------------------------------------------------------------------
+def _pathfinder_qg(nodes, paths, bypass_cache=True):
+    """Wrap a Pathfinder query graph (nodes + paths) in the TRAPI envelope.
+
+    An empty ``edges`` map is included for validators that still require the key;
+    the ``paths`` map carries the actual query.
+    """
+    env = {
+        "message": {
+            "query_graph": {"nodes": nodes, "edges": {}, "paths": paths}
+        }
+    }
+    if bypass_cache is not None:
+        env["bypass_cache"] = bypass_cache
+    return env
+
+
+def pathfinder_drug_disease():
+    """Pathfinder: find paths between a pinned drug and a pinned disease."""
+    chem, disease = random.choice(CHEM_DISEASE_PAIRS)
+    return _pathfinder_qg(
+        nodes={
+            "n0": {"ids": [chem], "categories": ["biolink:ChemicalEntity"]},
+            "n1": {"ids": [disease], "categories": ["biolink:Disease"]},
+        },
+        paths={
+            "p0": {
+                "subject": "n0",
+                "object": "n1",
+                # Hint that gene-mediated mechanism paths are of interest.
+                "constraints": [{"intermediate_categories": ["biolink:Gene"]}],
+            },
+        },
+    )
+
+
 def one_hop_no_predicate():
     """No predicate constraint -- matches any relationship; broad. Single-hop -> tier 1."""
     return _qg(
@@ -345,10 +409,18 @@ SHEPHERD_CORPUS = [
 # corpus -- same creative query the ARS distributes to its ARAs.
 ARS_CORPUS = SHEPHERD_CORPUS
 
+# Pathfinder (ARA/ARS only): its own run type. A single drug<->disease shape with
+# the endpoint pair varied per request. Far heavier than the inferred corpus, so
+# its targets ship a gentler ramp and looser SLO (see config.py).
+PATHFINDER_CORPUS = [
+    ("pathfinder_drug_disease", pathfinder_drug_disease, 100),
+]
+
 CORPUS_BY_NAME = {
     "retriever": RETRIEVER_CORPUS,
     "shepherd": SHEPHERD_CORPUS,
     "ars": ARS_CORPUS,
+    "pathfinder": PATHFINDER_CORPUS,
 }
 
 

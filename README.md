@@ -32,9 +32,19 @@ run_performance_tests --targets aras \
 run_performance_tests --targets ars \
     --host https://ars.ci.transltr.io/ars/api \
     --csv-prefix run1
+
+# Pathfinder — its own heavier run type (ARA/ARS only); pins two endpoints and
+# asks for connecting paths. Sync via the ARA, async via the ARS.
+run_performance_tests --targets aras_pathfinder \
+    --host https://your-ara-service.example.org \
+    --csv-prefix pf1
+run_performance_tests --targets ars_pathfinder \
+    --host https://ars.ci.transltr.io/ars/api \
+    --csv-prefix pf1
 ```
 
-- `--targets` selects the layer: `kps` (Retriever), `aras` (Shepherd), or `ars`.
+- `--targets` selects the layer: `kps` (Retriever), `aras` (Shepherd), `ars`, or
+  the Pathfinder run types `aras_pathfinder` / `ars_pathfinder` (ARA/ARS only).
 - `--host` is **required** — the base URL of the target service. For `kps`/`aras`
   the `/query` path is appended; for `ars` the host is the API base and the tool
   uses `/submit` then `/messages/{pk}`.
@@ -107,6 +117,15 @@ flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
 - **ARS reuses the Shepherd corpus** (`ARS_CORPUS = SHEPHERD_CORPUS`) — the same
   inferred query the ARS fans out to its ARAs. Its poll cadence and per-query
   timeout (`poll_interval_s`, `max_poll_s`) are tunable in `config.py`.
+- **Pathfinder is its own run type** (`aras_pathfinder` / `ars_pathfinder`, ARA/ARS
+  only). `PATHFINDER_CORPUS` sends a single drug↔disease shape that pins **two**
+  endpoints and asks for connecting paths (a `paths` map in the query_graph, not
+  `edges`); the `(chemical, disease)` pair varies per request from a curated
+  `CHEM_DISEASE_PAIRS` list — **swap these** for pairs your service knows, and keep
+  them plausibly connected so paths come back non-empty (on ARS a zero-result
+  `Done` is a failure). It's the heaviest query class, so its targets ship the
+  gentlest ramps and loosest SLOs (and, for `ars_pathfinder`, the longest
+  `max_poll_s`); tune them in `config.py`.
 - **Adjust corpus weights** in `RETRIEVER_CORPUS` / `SHEPHERD_CORPUS` to match
   your traffic mix.
 

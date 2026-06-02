@@ -88,6 +88,39 @@ TARGETS = {
         ],
         "p99_slo_ms": 600000,             # 10-min knee target (< max_poll_s)
     },
+    # Pathfinder is its own run type (ARA + ARS only): it pins two endpoints and
+    # asks for connecting paths -- the most intensive query class. Same endpoints
+    # as aras/ars; only the corpus, ramp, and SLO differ (gentler + looser).
+    "aras_pathfinder": {
+        "label": "Shepherd (Pathfinder)",
+        "endpoint": "/query",
+        "corpus": "pathfinder",
+        "protocol": "sync",
+        "implemented": True,
+        # Heavier than `aras`: lower concurrency, longer holds, looser p99.
+        "stages": [
+            (1, 1, 120),
+            (2, 1, 180),
+            (4, 1, 240),
+            (8, 2, 240),
+        ],
+        "p99_slo_ms": 300000,             # 5-min knee target (vs 2 min for aras)
+    },
+    "ars_pathfinder": {
+        "label": "ARS (Pathfinder)",
+        "endpoint": "/submit",
+        "messages_endpoint": "/messages",
+        "corpus": "pathfinder",
+        "protocol": "async",
+        "implemented": True,
+        "poll_interval_s": 15,
+        "max_poll_s": 1800,               # 30-min cap (vs 15 min for ars)
+        "stages": [
+            (1, 1, 1200),
+            (2, 1, 1800),
+        ],
+        "p99_slo_ms": 1200000,            # 20-min knee target (< max_poll_s)
+    },
 }
 
 DEFAULT_TARGET = "kps"

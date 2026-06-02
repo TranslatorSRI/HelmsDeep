@@ -49,6 +49,14 @@ subset. The tool must route the correct corpus + protocol per target.
 | **Shepherd / ARAs** | Reasoning agents | sync `POST /query` (or `/asyncquery`) | `inferred`/creative-mode queries. Expensive. |
 | **ARS** | Autonomous Relay System | **async**: `POST /submit` → poll `GET /messages/{pk}` until `Done`/`Error` → fetch merged results | `inferred` query; very long-running (minutes–~1 hr). |
 
+**Pathfinder** is an additional, heavier query class for the **ARA and ARS layers
+only** (never KPs). It pins **two** endpoint entities and asks for connecting
+paths via a `paths` map in the query_graph (not `edges`; no `knowledge_type`). It
+gets its **own run types** — `aras_pathfinder` (sync, via the ARA `/query`) and
+`ars_pathfinder` (async, via the ARS submit/poll/merge) — so it's never mixed into
+the inferred corpus. Same protocols/endpoints as `aras`/`ars`, just a different
+corpus + a gentler ramp / looser SLO.
+
 ### Retriever and the `tier` parameter
 
 In the **current** system the KP layer is a single service, **Retriever** — not the
@@ -101,10 +109,14 @@ sent (`lookup` for KPs, `inferred` for ARAs/ARS) — both selected from
 Package `translator_load_tester/`:
 
 - **`config.py`** — the target registry. `TARGETS` maps each `--targets` value
-  (`kps`/`aras`/`ars`) to a component config: `label`, `endpoint`, `corpus`
+  (`kps`/`aras`/`ars` plus the Pathfinder run types `aras_pathfinder`/
+  `ars_pathfinder`) to a component config: `label`, `endpoint`, `corpus`
   (key into the corpus module), `protocol` (`sync`/`async`), `implemented`, and
-  per-target `stages` + `p99_slo_ms`. Async targets (`ars`) add `messages_endpoint`,
-  `poll_interval_s`, `max_poll_s`. `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
+  per-target `stages` + `p99_slo_ms`. Async targets (`ars`, `ars_pathfinder`) add
+  `messages_endpoint`, `poll_interval_s`, `max_poll_s`. The `*_pathfinder` targets
+  reuse the ARA/ARS endpoints + protocols but point at the `pathfinder` corpus and
+  ship a gentler ramp + looser SLO (pinned-two-endpoint path-finding is the
+  heaviest query class). `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
   Per-target ramps/SLOs live here because cost profiles differ wildly by layer.
 - **`cli.py`** — the `run_performance_tests` entry point (registered in
   `setup.py` `console_scripts`). Parses `--targets` (required, one layer),
@@ -145,9 +157,16 @@ Package `translator_load_tester/`:
     - **MVP2** chemical⇄gene `biolink:affects` with object aspect/direction
       qualifiers, both edge directions: `mvp2_chem_affects_gene` /
       `mvp2_gene_affects_chem` (25/25), gene + qualifier sampled per request.
+  - **`PATHFINDER_CORPUS`** — the Pathfinder run type (ARA/ARS only, selected by
+    `aras_pathfinder`/`ars_pathfinder`). `pathfinder_drug_disease` pins **two**
+    endpoints (a drug + a disease, sampled per request from `CHEM_DISEASE_PAIRS`)
+    and asks for connecting paths via a `paths` map in the query_graph — built by
+    `_pathfinder_qg(nodes, paths)` (`nodes` + empty `edges` + `paths`; no
+    `knowledge_type`, no `tier`; `bypass_cache=True`). Most intensive query class.
   - Entity pools: `HEAVY_DISEASES` (curated hubs) + `LONG_TAIL_DISEASES` from
     **`curie_list.json`** (~1000 real MONDO CURIEs, shipped via `package_data`),
-    and a curated `GENES` pool (NCBIGene). `corpus_for(name)` returns the right list.
+    a curated `GENES` pool (NCBIGene), and curated drug↔disease `CHEM_DISEASE_PAIRS`.
+    `corpus_for(name)` returns the right list.
 
 For KPs, cost is driven by query-graph **shape** (hops, mode, pinned vs open,
 batch, predicate). For ARA/ARS creative queries, the dominant cost driver is the
@@ -200,6 +219,10 @@ pip install -e .          # Python >= 3.12; installs locust
 run_performance_tests --targets kps --host https://your-retriever.example.org --csv-prefix run1
 run_performance_tests --targets aras --host https://your-ara.example.org --csv-prefix run1
 run_performance_tests --targets ars  --host https://ars.ci.transltr.io/ars/api --csv-prefix run1
+
+# Pathfinder is its own (heavier) run type, ARA/ARS only:
+run_performance_tests --targets aras_pathfinder --host https://your-ara.example.org --csv-prefix pf1
+run_performance_tests --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --csv-prefix pf1
 ```
 
 - The `LoadTestShape` (`StepLoad`) **drives users, spawn rate, and duration**, so
