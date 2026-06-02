@@ -20,5 +20,10 @@ setup(
     python_requires=">=3.12",
     install_requires=[
         "locust>=2.38.1",
-    ]
+    ],
+    entry_points={
+        "console_scripts": [
+            "run_performance_tests=translator_load_tester.cli:main",
+        ],
+    },
 )

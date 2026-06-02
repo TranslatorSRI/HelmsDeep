@@ -35,12 +35,18 @@ from locust import HttpUser, task, constant, events
 from locust import LoadTestShape
 from locust.runners import MasterRunner, WorkerRunner
 
-from trapi_corpus import CORPUS
+import config
+from trapi_corpus import corpus_for
 
 # ----------------------------------------------------------------------------
 # Configuration -- edit these for your service / SLO.
 # ----------------------------------------------------------------------------
-ENDPOINT = "/query"            # TRAPI sync query endpoint; use /asyncquery if async
+# Which Translator layer this run targets (one layer per run; see CLAUDE.md).
+# Set by the run_performance_tests CLI; defaults so `locust -f` works directly.
+TARGET = os.environ.get("LOADTEST_TARGET", config.DEFAULT_TARGET)
+_TGT = config.TARGETS[TARGET]
+ENDPOINT = _TGT["endpoint"]    # request path for this component
+CORPUS = corpus_for(_TGT["corpus"])   # query subset for this component
 REQUEST_TIMEOUT = 210           # seconds; TRAPI queries can be slow
 P99_SLO_MS = 60000              # knee requires stage p99 <= this
 MAX_ERROR_RATE = 0.01          # and stage error rate <= this (1%)
@@ -253,6 +259,8 @@ def on_test_stop(environment, **_kw):
 
     summary = {
         "config": {
+            "target": TARGET,
+            "component": _TGT["label"],
             "endpoint": ENDPOINT,
             "p99_slo_ms": P99_SLO_MS,
             "max_error_rate": MAX_ERROR_RATE,
