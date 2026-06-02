@@ -26,7 +26,18 @@ so each builder pins its own tier deliberately:
   - tier 0 -- backend graph that handles arbitrary multi-hop queries
   - tier 1 -- backend graph that handles mostly single-hop queries
 Multi-hop shapes are paired with tier 0, single-hop shapes with tier 1.
+
+The inferred (ARA/ARS) corpus instead varies the pinned DISEASE per request:
+for creative "what treats X?" queries the answer-set size of the pinned disease
+dominates cost far more than graph shape, so we sample from size-tiered disease
+pools (heavy/medium/light) to be representative of production traffic and to
+avoid the cache-warming artifact of repeating one entity.
 """
+
+import json
+import os
+import random
+
 
 # A few real-ish CURIEs from the Biolink/MONDO/CHEBI space used in TRAPI docs.
 # Swap these for entities your target service actually knows about.
@@ -37,6 +48,40 @@ PARKINSONS = "MONDO:0005180"
 ASTHMA = "MONDO:0004979"
 
 DISEASE_BATCH = [T2D, ALZHEIMERS, PARKINSONS, ASTHMA, "MONDO:0007739"]  # +Huntington
+
+
+# ---------------------------------------------------------------------------
+# Disease entity pools for the inferred (ARA/ARS) corpus.
+#
+# Heavy = common, heavily-studied disease hubs with large answer sets (curated
+# by domain knowledge). The long-tail pool is ~1000 real MONDO diseases restored
+# from git history (curie_list.json) and is dominated by rarer diseases, so it
+# stands in for medium/light traffic. Tiering by *measured* answer-set size
+# isn't possible offline -- medium and light currently draw from the same
+# long-tail pool; split it once you have per-disease degree/result-size data.
+# The heavy/medium/light WEIGHTS (in SHEPHERD_CORPUS) and the per-tier qtype
+# labels are already in place, so that refinement is a data change, not a code
+# change.
+# ---------------------------------------------------------------------------
+HEAVY_DISEASES = [T2D, ASTHMA, ALZHEIMERS, PARKINSONS, "MONDO:0007739"]
+
+
+def _load_disease_pool():
+    """Load the long-tail disease pool (MONDO CURIEs) from curie_list.json."""
+    path = os.path.join(os.path.dirname(__file__), "curie_list.json")
+    try:
+        with open(path) as f:
+            pool = [c for c in json.load(f)
+                    if isinstance(c, str) and c.startswith("MONDO:")]
+        if pool:
+            return pool
+    except (OSError, ValueError):
+        pass
+    # Fallback so the module still imports if the data file is missing.
+    return [ALZHEIMERS, PARKINSONS, ASTHMA, T2D]
+
+
+LONG_TAIL_DISEASES = _load_disease_pool()
 
 
 def _qg(nodes, edges, tier=None, bypass_cache=None):
@@ -103,8 +148,8 @@ def one_hop_lookup_open():
 # reasoning cost instead of cache retrieval. No `tier` -- that's KP-only.
 #
 # The canonical Translator creative query is "what chemicals treat disease X?".
-# Cost varies with the pinned disease (answer-set size / reasoning depth), so we
-# vary the disease across a few entities and break out latency per qtype.
+# Cost varies with the pinned disease, so we sample a disease per request from
+# size-tiered pools (heavy/medium/light) and break out latency per tier.
 # ----------------------------------------------------------------------------
 def _inferred_treats(disease):
     """Creative-mode: open chemical -[treats, inferred]-> pinned disease."""
@@ -122,19 +167,19 @@ def _inferred_treats(disease):
     )
 
 
-def inferred_treats_t2d():
-    """What treats type-2 diabetes? (common disease, large answer set)."""
-    return _inferred_treats(T2D)
+def inferred_heavy():
+    """Heavy: a common, highly-connected disease hub -> large answer set."""
+    return _inferred_treats(random.choice(HEAVY_DISEASES))
 
 
-def inferred_treats_alzheimers():
-    """What treats Alzheimer's?"""
-    return _inferred_treats(ALZHEIMERS)
+def inferred_medium():
+    """Medium: a long-tail disease (see pool note above)."""
+    return _inferred_treats(random.choice(LONG_TAIL_DISEASES))
 
 
-def inferred_treats_parkinsons():
-    """What treats Parkinson's?"""
-    return _inferred_treats(PARKINSONS)
+def inferred_light():
+    """Light: a long-tail disease -> typically small answer set."""
+    return _inferred_treats(random.choice(LONG_TAIL_DISEASES))
 
 
 def one_hop_no_predicate():
@@ -217,16 +262,17 @@ RETRIEVER_CORPUS = [
     ("malformed_query",       malformed_query,        5),
 ]
 
-# Shepherd (ARA): inferred (creative) mode, cache bypassed. Weighted toward the
-# common disease (the heaviest answer set); vary the entity to spread cost.
+# Shepherd (ARA): inferred (creative) mode, cache bypassed. A disease is sampled
+# per request from size-tiered pools; weights set the production traffic mix
+# (heavy/medium/light = 20/30/50). Tune to your real distribution.
 SHEPHERD_CORPUS = [
-    ("inferred_treats_t2d",        inferred_treats_t2d,        40),
-    ("inferred_treats_alzheimers", inferred_treats_alzheimers, 30),
-    ("inferred_treats_parkinsons", inferred_treats_parkinsons, 30),
+    ("inferred_heavy",  inferred_heavy,  20),
+    ("inferred_medium", inferred_medium, 30),
+    ("inferred_light",  inferred_light,  50),
 ]
 
 # ARS: also inferred queries (it fans out to the ARAs). Reuses the Shepherd
-# corpus for now; wired when the ARS async submit/poll/merge pipeline lands.
+# corpus -- same creative query the ARS distributes to its ARAs.
 ARS_CORPUS = SHEPHERD_CORPUS
 
 CORPUS_BY_NAME = {

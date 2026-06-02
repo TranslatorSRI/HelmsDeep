@@ -87,11 +87,17 @@ flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
 - **Tier is per query (Retriever only).** Retriever exposes `parameters.tier`
   (0 or 1) to pick its backend graph. `RETRIEVER_CORPUS` pairs multi-hop shapes
   with tier 0 and single-hop shapes with tier 1. ARA queries carry no tier.
-- **Shepherd sends inferred + bypass_cache.** `SHEPHERD_CORPUS` holds creative
-  "what treats disease X?" queries with `knowledge_type: "inferred"` and
-  `bypass_cache: true`, so the run measures reasoning cost rather than cache
-  hits. These are far heavier than KP lookups, so the `aras` target ships a
-  gentler ramp and a looser `p99_slo_ms` than `kps` (see `config.py`).
+- **Shepherd/ARS send inferred + bypass_cache, with a tiered disease mix.**
+  `SHEPHERD_CORPUS` holds creative "what treats disease X?" queries
+  (`knowledge_type: "inferred"`, `bypass_cache: true`) and **samples the pinned
+  disease per request** from size-tiered pools — heavy/medium/light weighted
+  `20/30/50` to approximate production traffic. The pinned disease's answer-set
+  size dominates cost, so this spreads load across the real cost surface and
+  avoids cache-warming from repeating one entity; `by_qtype.csv` then breaks out
+  latency per tier. The heavy pool is a curated list of common disease hubs; the
+  long-tail pool is ~1000 real MONDO CURIEs in `curie_list.json`. These are far
+  heavier than KP lookups, so the `aras` target ships a gentler ramp and a looser
+  `p99_slo_ms` (see `config.py`). Tune the tier weights/pools to your traffic.
 - **ARS reuses the Shepherd corpus** (`ARS_CORPUS = SHEPHERD_CORPUS`) — the same
   inferred query the ARS fans out to its ARAs. Its poll cadence and per-query
   timeout (`poll_interval_s`, `max_poll_s`) are tunable in `config.py`.

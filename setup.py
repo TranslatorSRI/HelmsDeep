@@ -15,6 +15,7 @@ setup(
     long_description=readme,
     packages=find_packages(),
     include_package_data=True,
+    package_data={"translator_load_tester": ["*.json"]},
     zip_safe=False,
     license="MIT",
     python_requires=">=3.12",
