@@ -137,12 +137,17 @@ Package `translator_load_tester/`:
     `one_hop_lookup_open`, `one_hop_no_predicate`, `two_hop_lookup`,
     `batch_lookup`, `malformed_query`.
   - **`SHEPHERD_CORPUS`** (also used as **`ARS_CORPUS`**) — `inferred` +
-    `bypass_cache` creative "what treats disease X?" queries. The pinned disease
-    is **sampled per request** from size-tiered pools via `inferred_heavy` /
-    `inferred_medium` / `inferred_light`, weighted 20/30/50.
-  - Disease pools: `HEAVY_DISEASES` (curated common hubs) and `LONG_TAIL_DISEASES`
-    loaded from **`curie_list.json`** (~1000 real MONDO CURIEs, shipped via
-    `package_data`). `corpus_for(name)` returns the right list.
+    `bypass_cache` creative queries, an even MVP1/MVP2 split (50/50), entity
+    varied per request:
+    - **MVP1** "what treats disease X?" (`chemical-[treats]->disease`), disease
+      sampled from size-tiered pools via `mvp1_heavy`/`mvp1_medium`/`mvp1_light`
+      (10/15/25 = the 50% MVP1 half, tiered 20/30/50 within it).
+    - **MVP2** chemical⇄gene `biolink:affects` with object aspect/direction
+      qualifiers, both edge directions: `mvp2_chem_affects_gene` /
+      `mvp2_gene_affects_chem` (25/25), gene + qualifier sampled per request.
+  - Entity pools: `HEAVY_DISEASES` (curated hubs) + `LONG_TAIL_DISEASES` from
+    **`curie_list.json`** (~1000 real MONDO CURIEs, shipped via `package_data`),
+    and a curated `GENES` pool (NCBIGene). `corpus_for(name)` returns the right list.
 
 For KPs, cost is driven by query-graph **shape** (hops, mode, pinned vs open,
 batch, predicate). For ARA/ARS creative queries, the dominant cost driver is the
@@ -233,10 +238,12 @@ run_performance_tests --targets ars  --host https://ars.ci.transltr.io/ars/api -
   latency = wall-clock submit→terminal. A `Done` that returns **0 results counts
   as a failure** (and raises a red flag); a non-terminal status past `max_poll_s`
   is a `Timeout` failure.
-- **Inferred corpus varies the disease per request.** `inferred_heavy/medium/light`
-  sample a pinned disease from size-tiered pools (weighted 20/30/50) so we cover
-  the real cost surface and don't warm caches by repeating one entity. Medium and
-  light share the long-tail pool until calibrated (see Status & what's left).
+- **Inferred corpus mixes MVP1 + MVP2 and varies entities per request.** MVP1
+  (`mvp1_heavy/medium/light`, treats-disease) samples a tiered disease; MVP2
+  (`mvp2_chem_affects_gene`/`mvp2_gene_affects_chem`, affects-gene with
+  qualifiers) samples a gene + qualifier combo. The per-request variation covers
+  the real cost surface and avoids warming caches. MVP1 medium and light share
+  the long-tail pool until calibrated (see Status & what's left).
 - **Environments & TRAPI versions vary per service.** Endpoints live across
   `*.ci.transltr.io`, `*.test.transltr.io`, and prod, and individual services pin
   different TRAPI versions in their URL paths. Target deliberately.

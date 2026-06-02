@@ -84,6 +84,29 @@ def _load_disease_pool():
 LONG_TAIL_DISEASES = _load_disease_pool()
 
 
+# ---------------------------------------------------------------------------
+# Gene pool for MVP2 (chemical<->gene "affects") creative queries. A small
+# curated set of well-studied human genes by NCBIGene CURIE; extend/replace with
+# genes your target service knows. (Not size-tiered -- no gene-degree data.)
+# ---------------------------------------------------------------------------
+GENES = [
+    "NCBIGene:1956",   # EGFR
+    "NCBIGene:7157",   # TP53
+    "NCBIGene:3845",   # KRAS
+    "NCBIGene:673",    # BRAF
+    "NCBIGene:4609",   # MYC
+    "NCBIGene:207",    # AKT1
+    "NCBIGene:5290",   # PIK3CA
+    "NCBIGene:1499",   # CTNNB1
+    "NCBIGene:348",    # APOE
+    "NCBIGene:351",    # APP
+    "NCBIGene:7124",   # TNF
+    "NCBIGene:3569",   # IL6
+]
+_ASPECTS = ["activity", "abundance"]
+_DIRECTIONS = ["increased", "decreased"]
+
+
 def _qg(nodes, edges, tier=None, bypass_cache=None):
     """Wrap a query graph in the TRAPI envelope.
 
@@ -139,20 +162,22 @@ def one_hop_lookup_open():
 
 
 # ----------------------------------------------------------------------------
-# Shepherd (ARA) creative-mode builders.
+# Shepherd (ARA) / ARS creative-mode builders (also used as the ARS corpus).
 #
-# ARAs answer "inferred" (creative) queries: an open subject node, a pinned
-# object, and `knowledge_type: "inferred"` on the edge. The ARA reasons over the
-# graph rather than doing an exact lookup, so these are far more expensive than
-# any KP lookup. We bypass the cache so repeated identical queries measure real
-# reasoning cost instead of cache retrieval. No `tier` -- that's KP-only.
+# ARAs/ARS answer "inferred" (creative) queries with `knowledge_type:"inferred"`
+# and an open node they reason out. These are far more expensive than any KP
+# lookup; we bypass the cache so repeated queries measure real reasoning cost.
+# No `tier` -- that's KP-only. Two Translator creative templates are covered:
 #
-# The canonical Translator creative query is "what chemicals treat disease X?".
-# Cost varies with the pinned disease, so we sample a disease per request from
-# size-tiered pools (heavy/medium/light) and break out latency per tier.
+#   MVP1  "what chemicals treat disease X?"  -- open chemical -[treats]-> disease.
+#         Cost tracks the pinned disease's answer-set size, so the disease is
+#         sampled per request from size-tiered pools (heavy/medium/light).
+#   MVP2  chemical <-> gene "affects" with object aspect/direction qualifiers
+#         ("what changes gene X's activity/abundance?" and the inverse). Both
+#         edge directions are generated; the gene + qualifier vary per request.
 # ----------------------------------------------------------------------------
 def _inferred_treats(disease):
-    """Creative-mode: open chemical -[treats, inferred]-> pinned disease."""
+    """MVP1: open chemical -[treats, inferred]-> pinned disease."""
     return _qg(
         nodes={
             "n0": {"categories": ["biolink:ChemicalEntity"]},          # open answer set
@@ -167,19 +192,59 @@ def _inferred_treats(disease):
     )
 
 
-def inferred_heavy():
-    """Heavy: a common, highly-connected disease hub -> large answer set."""
+def mvp1_heavy():
+    """MVP1 heavy: a common, highly-connected disease hub -> large answer set."""
     return _inferred_treats(random.choice(HEAVY_DISEASES))
 
 
-def inferred_medium():
-    """Medium: a long-tail disease (see pool note above)."""
+def mvp1_medium():
+    """MVP1 medium: a long-tail disease (see pool note above)."""
     return _inferred_treats(random.choice(LONG_TAIL_DISEASES))
 
 
-def inferred_light():
-    """Light: a long-tail disease -> typically small answer set."""
+def mvp1_light():
+    """MVP1 light: a long-tail disease -> typically small answer set."""
     return _inferred_treats(random.choice(LONG_TAIL_DISEASES))
+
+
+def _affects(subject_node, object_node, aspect, direction):
+    """MVP2: an inferred `affects` edge with object aspect/direction qualifiers.
+
+    Qualifiers always describe the OBJECT node (the thing being changed).
+    """
+    return _qg(
+        nodes={"n0": subject_node, "n1": object_node},
+        edges={
+            "e0": {"subject": "n0", "object": "n1",
+                   "predicates": ["biolink:affects"],
+                   "knowledge_type": "inferred",
+                   "qualifier_constraints": [{"qualifier_set": [
+                       {"qualifier_type_id": "biolink:object_aspect_qualifier",
+                        "qualifier_value": aspect},
+                       {"qualifier_type_id": "biolink:object_direction_qualifier",
+                        "qualifier_value": direction},
+                   ]}]},
+        },
+        bypass_cache=True,
+    )
+
+
+def mvp2_chem_affects_gene():
+    """MVP2: what chemicals change a gene's activity/abundance? (chem -> gene)."""
+    return _affects(
+        {"categories": ["biolink:ChemicalEntity"]},                 # open subject
+        {"ids": [random.choice(GENES)], "categories": ["biolink:Gene"]},  # pinned object
+        random.choice(_ASPECTS), random.choice(_DIRECTIONS),
+    )
+
+
+def mvp2_gene_affects_chem():
+    """MVP2 inverse: what chemicals' abundance does a gene change? (gene -> chem)."""
+    return _affects(
+        {"ids": [random.choice(GENES)], "categories": ["biolink:Gene"]},  # pinned subject
+        {"categories": ["biolink:ChemicalEntity"]},                 # open object
+        "abundance", random.choice(_DIRECTIONS),   # chemicals have abundance, not activity
+    )
 
 
 def one_hop_no_predicate():
@@ -262,13 +327,18 @@ RETRIEVER_CORPUS = [
     ("malformed_query",       malformed_query,        5),
 ]
 
-# Shepherd (ARA): inferred (creative) mode, cache bypassed. A disease is sampled
-# per request from size-tiered pools; weights set the production traffic mix
-# (heavy/medium/light = 20/30/50). Tune to your real distribution.
+# Shepherd (ARA): inferred (creative) mode, cache bypassed. An even MVP1/MVP2
+# split (50/50). MVP1 (treats-disease) keeps its tiered disease sampling
+# (heavy/medium/light = 20/30/50 within its half); MVP2 (affects-gene) covers
+# both edge directions evenly. Tune all weights to your real traffic mix.
 SHEPHERD_CORPUS = [
-    ("inferred_heavy",  inferred_heavy,  20),
-    ("inferred_medium", inferred_medium, 30),
-    ("inferred_light",  inferred_light,  50),
+    # MVP1 -- "what treats disease X?" (tiered by disease answer-set size): 50%.
+    ("mvp1_heavy",  mvp1_heavy,  10),
+    ("mvp1_medium", mvp1_medium, 15),
+    ("mvp1_light",  mvp1_light,  25),
+    # MVP2 -- chemical<->gene "affects" with qualifiers, both directions: 50%.
+    ("mvp2_chem_affects_gene", mvp2_chem_affects_gene, 25),
+    ("mvp2_gene_affects_chem", mvp2_gene_affects_chem, 25),
 ]
 
 # ARS: also inferred queries (it fans out to the ARAs). Reuses the Shepherd

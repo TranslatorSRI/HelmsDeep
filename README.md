@@ -87,17 +87,23 @@ flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
 - **Tier is per query (Retriever only).** Retriever exposes `parameters.tier`
   (0 or 1) to pick its backend graph. `RETRIEVER_CORPUS` pairs multi-hop shapes
   with tier 0 and single-hop shapes with tier 1. ARA queries carry no tier.
-- **Shepherd/ARS send inferred + bypass_cache, with a tiered disease mix.**
-  `SHEPHERD_CORPUS` holds creative "what treats disease X?" queries
-  (`knowledge_type: "inferred"`, `bypass_cache: true`) and **samples the pinned
-  disease per request** from size-tiered pools — heavy/medium/light weighted
-  `20/30/50` to approximate production traffic. The pinned disease's answer-set
-  size dominates cost, so this spreads load across the real cost surface and
-  avoids cache-warming from repeating one entity; `by_qtype.csv` then breaks out
-  latency per tier. The heavy pool is a curated list of common disease hubs; the
-  long-tail pool is ~1000 real MONDO CURIEs in `curie_list.json`. These are far
-  heavier than KP lookups, so the `aras` target ships a gentler ramp and a looser
-  `p99_slo_ms` (see `config.py`). Tune the tier weights/pools to your traffic.
+- **Shepherd/ARS send inferred + bypass_cache, mixing MVP1 and MVP2.**
+  `SHEPHERD_CORPUS` (also used for `ars`) holds creative-mode queries
+  (`knowledge_type: "inferred"`, `bypass_cache: true`) split evenly between two
+  Translator templates, with entities varied per request to spread load and avoid
+  cache-warming. `by_qtype.csv` breaks out latency per template/tier.
+  - **MVP1 — "what treats disease X?"** (`chemical -[treats]-> disease`): the
+    pinned disease is sampled from size-tiered pools (heavy/medium/light), so
+    cost tracks answer-set size. Heavy is a curated list of common disease hubs;
+    the long-tail pool is ~1000 real MONDO CURIEs in `curie_list.json`.
+  - **MVP2 — chemical⇄gene "affects"** (`biolink:affects`, `inferred`, with
+    `object_aspect`/`object_direction` qualifiers): both edge directions
+    (chemical→gene and gene→chemical), with the gene (curated `GENES` pool) and
+    qualifier combo varied per request.
+
+  These are far heavier than KP lookups, so the `aras` target ships a gentler
+  ramp and a looser `p99_slo_ms` (see `config.py`). Tune the per-template weights
+  and entity pools (`HEAVY_DISEASES`, `GENES`, the tiers) to your real traffic.
 - **ARS reuses the Shepherd corpus** (`ARS_CORPUS = SHEPHERD_CORPUS`) — the same
   inferred query the ARS fans out to its ARAs. Its poll cadence and per-query
   timeout (`poll_interval_s`, `max_poll_s`) are tunable in `config.py`.
