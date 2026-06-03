@@ -51,7 +51,7 @@ from trapi_corpus import corpus_for
 # wildly by layer); edit them there. REQUEST_TIMEOUT is shared.
 # ----------------------------------------------------------------------------
 # Which Translator layer this run targets (one layer per run; see CLAUDE.md).
-# Set by the run_performance_tests CLI; defaults so `locust -f` works directly.
+# Set by the helmsdeep CLI; defaults so `locust -f` works directly.
 TARGET = os.environ.get("LOADTEST_TARGET", config.DEFAULT_TARGET)
 _TGT = config.TARGETS[TARGET]
 ENDPOINT = _TGT["endpoint"]    # request path for this component

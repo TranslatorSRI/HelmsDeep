@@ -5,7 +5,8 @@ if you change behavior, update this file.
 
 ## Purpose
 
-`LoadTester` measures, **for each NCATS Translator service, the maximum
+`HelmsDeep` (HTTP Endpoint Load Measurement System, Determining Each Endpoint's
+Performance) measures, **for each NCATS Translator service, the maximum
 sustainable concurrency** — how many concurrent users the service can feasibly
 handle before it violates a latency/error SLO. The Translator stack has three
 classes of service (Retriever/**KPs**, Shepherd/**ARAs**, and the **ARS**), each
@@ -14,7 +15,7 @@ TRAPI query. This tool sends each component the query type it expects and report
 a single headline number per run: the *knee*.
 
 > The architecture below is now **implemented**: all three layers (KPs/ARAs/ARS)
-> are runnable through a real `run_performance_tests` CLI, config is per-target,
+> are runnable through a real `helmsdeep` CLI, config is per-target,
 > and the corpus is segmented per component. A few refinements remain — see
 > **Status & what's left**. Check the **Current code map** for exactly what each
 > file does before assuming behavior.
@@ -35,7 +36,7 @@ sustainable concurrency for that service.
 
 Implementation: `_stage_stats()` computes per-stage metrics and the Little's-Law
 concurrency; the knee-selection loop lives in `on_test_stop()` in
-`translator_load_tester/trapi_loadtest.py`. If no stage meets the SLO, the service
+`helmsdeep/trapi_loadtest.py`. If no stage meets the SLO, the service
 saturated below the first stage (or the SLO is too strict).
 
 ## Translator component model
@@ -106,7 +107,7 @@ sent (`lookup` for KPs, `inferred` for ARAs/ARS) — both selected from
 
 ## Current code map (what exists today)
 
-Package `translator_load_tester/`:
+Package `helmsdeep/`:
 
 - **`config.py`** — the target registry. `TARGETS` maps each `--targets` value
   (`kps`/`aras`/`ars` plus the Pathfinder run types `aras_pathfinder`/
@@ -118,7 +119,7 @@ Package `translator_load_tester/`:
   ship a gentler ramp + looser SLO (pinned-two-endpoint path-finding is the
   heaviest query class). `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
   Per-target ramps/SLOs live here because cost profiles differ wildly by layer.
-- **`cli.py`** — the `run_performance_tests` entry point (registered in
+- **`cli.py`** — the `helmsdeep` entry point (registered in
   `setup.py` `console_scripts`). Parses `--targets` (required, one layer),
   `--host` (required), `--csv-prefix`; rejects not-yet-`implemented` targets;
   sets `LOADTEST_TARGET` (+ `LOCUST_CSV_PREFIX`) and launches
@@ -174,7 +175,7 @@ batch, predicate). For ARA/ARS creative queries, the dominant cost driver is the
 
 ## Status & what's left
 
-Implemented: component awareness, the `run_performance_tests` CLI + entry point,
+Implemented: component awareness, the `helmsdeep` CLI + entry point,
 per-target stages/SLO, segmented corpuses, scalar `parameters.tier` per KP query,
 the ARS async submit/poll/merge user, ARS health metrics + red flags, and the
 tiered inferred disease mix.
@@ -207,7 +208,7 @@ they contain assets worth recovering for the roadmap below. Retrieve with
 - `git show b912968:generate_message.py` — TRAPI message builders, including batch
   handling (`set_interpretation: "BATCH"`) and `inferred` ARA queries.
 - `git show b912968:curie_list.json` — ~1000 MONDO disease CURIEs. **Already
-  restored** into the package as `translator_load_tester/curie_list.json` (the
+  restored** into the package as `helmsdeep/curie_list.json` (the
   long-tail disease pool for the inferred corpus).
 
 ## How to run
@@ -216,13 +217,13 @@ they contain assets worth recovering for the roadmap below. Retrieve with
 pip install -e .          # Python >= 3.12; installs locust
 
 # One layer per run (kps | aras | ars); --host required.
-run_performance_tests --targets kps --host https://your-retriever.example.org --csv-prefix run1
-run_performance_tests --targets aras --host https://your-ara.example.org --csv-prefix run1
-run_performance_tests --targets ars  --host https://ars.ci.transltr.io/ars/api --csv-prefix run1
+helmsdeep --targets kps --host https://your-retriever.example.org --csv-prefix run1
+helmsdeep --targets aras --host https://your-ara.example.org --csv-prefix run1
+helmsdeep --targets ars  --host https://ars.ci.transltr.io/ars/api --csv-prefix run1
 
 # Pathfinder is its own (heavier) run type, ARA/ARS only:
-run_performance_tests --targets aras_pathfinder --host https://your-ara.example.org --csv-prefix pf1
-run_performance_tests --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --csv-prefix pf1
+helmsdeep --targets aras_pathfinder --host https://your-ara.example.org --csv-prefix pf1
+helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --csv-prefix pf1
 ```
 
 - The `LoadTestShape` (`StepLoad`) **drives users, spawn rate, and duration**, so
@@ -230,7 +231,7 @@ run_performance_tests --targets ars_pathfinder  --host https://ars.ci.transltr.i
   `config.py`.
 - `--csv-prefix` is optional; it falls back to the `LOCUST_CSV_PREFIX` env var,
   then to `trapi_run`.
-- You can also run the locustfile directly (`locust -f translator_load_tester/
+- You can also run the locustfile directly (`locust -f helmsdeep/
   trapi_loadtest.py --headless --host …`), selecting the layer with the
   `LOADTEST_TARGET` env var (defaults to `kps`). Note locust has no
   `--csv-prefix` flag — set `LOCUST_CSV_PREFIX` instead.

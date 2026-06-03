@@ -1,5 +1,5 @@
 """
-``run_performance_tests`` -- CLI entry point for the Translator Load Tester.
+``helmsdeep`` -- CLI entry point for HelmsDeep.
 
 Selects exactly ONE Translator layer per run (the stack cascades
 ARS -> ARAs -> KPs, so testing one layer already loads everything beneath it;
@@ -10,7 +10,7 @@ The StepLoad shape owns users/spawn-rate/duration, so this CLI intentionally
 does NOT expose -u/-r/-t -- they would fight the shape.
 
 Usage:
-    run_performance_tests --targets kps --host https://retriever.example.org \
+    helmsdeep --targets kps --host https://retriever.example.org \
         --csv-prefix run1
 """
 
@@ -26,7 +26,7 @@ _LOCUSTFILE = os.path.join(os.path.dirname(__file__), "trapi_loadtest.py")
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        prog="run_performance_tests",
+        prog="helmsdeep",
         description="Measure max sustainable concurrency for a Translator "
                     "component (KPs/ARAs/ARS). One layer per run.",
     )

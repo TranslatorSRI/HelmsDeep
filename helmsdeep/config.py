@@ -1,5 +1,5 @@
 """
-Component (target) registry for the Translator Load Tester.
+Component (target) registry for HelmsDeep.
 
 The Translator stack cascades ARS -> ARAs -> KPs, so a run targets exactly ONE
 layer at a time (see CLAUDE.md "Layering rule"). Each layer differs only in

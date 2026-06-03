@@ -1,8 +1,10 @@
-# Translator Performance Test Runner
+# HelmsDeep
 
-This load tester drives a stepped ramp of concurrent users against a single
-NCATS Translator component and reports the **max sustainable concurrency** (the
-"knee") — the highest load where the service still meets a latency/error SLO.
+**HelmsDeep** — *HTTP Endpoint Load Measurement System, Determining Each
+Endpoint's Performance* — drives a stepped ramp of concurrent users against a
+single NCATS Translator component and reports the **max sustainable
+concurrency** (the "knee") — the highest load where the service still meets a
+latency/error SLO.
 
 The Translator stack cascades **ARS → ARAs → KPs**, so a run targets exactly
 **one** layer at a time (testing a higher layer already loads everything beneath
@@ -19,26 +21,26 @@ pip install -e .          # Python >= 3.12; installs locust
 
 ```bash
 # Retriever (KP) — sync lookup queries, scalar parameters.tier per query
-run_performance_tests --targets kps \
+helmsdeep --targets kps \
     --host https://your-retriever-service.example.org \
     --csv-prefix run1
 
 # Shepherd (ARA) — sync creative-mode (inferred) queries, cache bypassed
-run_performance_tests --targets aras \
+helmsdeep --targets aras \
     --host https://your-ara-service.example.org \
     --csv-prefix run1
 
 # ARS — async submit/poll/merge of inferred queries (host = the ARS API base)
-run_performance_tests --targets ars \
+helmsdeep --targets ars \
     --host https://ars.ci.transltr.io/ars/api \
     --csv-prefix run1
 
 # Pathfinder — its own heavier run type (ARA/ARS only); pins two endpoints and
 # asks for connecting paths. Sync via the ARA, async via the ARS.
-run_performance_tests --targets aras_pathfinder \
+helmsdeep --targets aras_pathfinder \
     --host https://your-ara-service.example.org \
     --csv-prefix pf1
-run_performance_tests --targets ars_pathfinder \
+helmsdeep --targets ars_pathfinder \
     --host https://ars.ci.transltr.io/ars/api \
     --csv-prefix pf1
 ```
@@ -53,7 +55,7 @@ run_performance_tests --targets ars_pathfinder \
 
 The load profile (users, spawn rate, duration) is driven by the `StepLoad` shape,
 **not** by CLI flags — so there is intentionally no `-u/-r/-t`. The ramp and knee
-threshold are **per target** in `translator_load_tester/config.py` (`stages` and
+threshold are **per target** in `helmsdeep/config.py` (`stages` and
 `p99_slo_ms`), since cost profiles differ wildly by layer; edit them there.
 
 ## Outputs
@@ -90,7 +92,7 @@ flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
 
 ## Tuning notes
 
-- **Swap the CURIEs.** The corpus in `translator_load_tester/trapi_corpus.py`
+- **Swap the CURIEs.** The corpus in `helmsdeep/trapi_corpus.py`
   uses a few real MONDO/CHEBI entities; replace them with entities your target
   service actually knows about, or queries return empty and won't reflect real
   cost.
@@ -136,7 +138,7 @@ target):
 
 ```bash
 LOCUST_CSV_PREFIX=run1 \
-locust -f translator_load_tester/trapi_loadtest.py --headless \
+locust -f helmsdeep/trapi_loadtest.py --headless \
     --host https://your-retriever-service.example.org
 ```
 
