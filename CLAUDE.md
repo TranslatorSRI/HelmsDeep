@@ -5,7 +5,8 @@ if you change behavior, update this file.
 
 ## Purpose
 
-`LoadTester` measures, **for each NCATS Translator service, the maximum
+`HelmsDeep` (HTTP Endpoint Load Measurement System, Determining Each Endpoint's
+Performance) measures, **for each NCATS Translator service, the maximum
 sustainable concurrency** — how many concurrent users the service can feasibly
 handle before it violates a latency/error SLO. The Translator stack has three
 classes of service (Retriever/**KPs**, Shepherd/**ARAs**, and the **ARS**), each
@@ -13,20 +14,21 @@ of which speaks a slightly different protocol and expects a different kind of
 TRAPI query. This tool sends each component the query type it expects and reports
 a single headline number per run: the *knee*.
 
-> This file describes the **target architecture** the repo is being reshaped
-> toward. The current code (`trapi_loadtest.py` + `trapi_corpus.py`) is the
-> measurement engine that target is built around, but several pieces below do not
-> exist yet — see **Gap to target**. Don't assume a feature exists just because
-> it's described here; check the **Current code map**.
+> The architecture below is now **implemented**: all three layers (KPs/ARAs/ARS)
+> are runnable through a real `helmsdeep` CLI, config is per-target,
+> and the corpus is segmented per component. A few refinements remain — see
+> **Status & what's left**. Check the **Current code map** for exactly what each
+> file does before assuming behavior.
 
 ## The metric we produce: the "knee"
 
-A run drives a **stepped ramp** of concurrent users (the `STAGES` table) and, for
-each stage, records RPS, mean/p50/p95/p99 latency, and error rate. The **knee** is
-the highest stage where **both**:
+A run drives a **stepped ramp** of concurrent users (the per-target `stages`
+table) and, for each stage, records RPS, mean/p50/p95/p99 latency, and error
+rate. The **knee** is the highest stage where **both**:
 
-- `p99 <= P99_SLO_MS` (default 60 000 ms), **and**
-- `error_rate <= MAX_ERROR_RATE` (default 0.01 = 1%)
+- `p99 <= P99_SLO_MS` (per-target `p99_slo_ms`; e.g. 60 000 ms for KPs, larger
+  for the slower ARA/ARS layers), **and**
+- `error_rate <= MAX_ERROR_RATE` (shared, default 0.01 = 1%)
 
 The knee's *effective concurrency* — computed via Little's Law,
 `concurrency = rps * mean_latency_seconds` — is the deliverable: the max
@@ -34,10 +36,10 @@ sustainable concurrency for that service.
 
 Implementation: `_stage_stats()` computes per-stage metrics and the Little's-Law
 concurrency; the knee-selection loop lives in `on_test_stop()` in
-`translator_load_tester/trapi_loadtest.py`. If no stage meets the SLO, the service
+`helmsdeep/trapi_loadtest.py`. If no stage meets the SLO, the service
 saturated below the first stage (or the SLO is too strict).
 
-## Translator component model (target)
+## Translator component model
 
 Each component class has its own (a) endpoint + protocol and (b) expected query
 subset. The tool must route the correct corpus + protocol per target.
@@ -47,6 +49,14 @@ subset. The tool must route the correct corpus + protocol per target.
 | **Retriever / KP** | Knowledge Provider (one service: **Retriever**) | sync `POST /query` (TRAPI) | `lookup`-mode queries; set `parameters.tier` to 0 or 1 (see below). Cheapest layer. |
 | **Shepherd / ARAs** | Reasoning agents | sync `POST /query` (or `/asyncquery`) | `inferred`/creative-mode queries. Expensive. |
 | **ARS** | Autonomous Relay System | **async**: `POST /submit` → poll `GET /messages/{pk}` until `Done`/`Error` → fetch merged results | `inferred` query; very long-running (minutes–~1 hr). |
+
+**Pathfinder** is an additional, heavier query class for the **ARA and ARS layers
+only** (never KPs). It pins **two** endpoint entities and asks for connecting
+paths via a `paths` map in the query_graph (not `edges`; no `knowledge_type`). It
+gets its **own run types** — `aras_pathfinder` (sync, via the ARA `/query`) and
+`ars_pathfinder` (async, via the ARS submit/poll/merge) — so it's never mixed into
+the inferred corpus. Same protocols/endpoints as `aras`/`ars`, just a different
+corpus + a gentler ramp / looser SLO.
 
 ### Retriever and the `tier` parameter
 
@@ -80,66 +90,108 @@ The ARS contract is **fundamentally different** from KP/ARA: it is asynchronous
 (submit → poll → merge), not a single blocking `POST /query`. Any ARS support must
 model that submit/poll loop rather than reuse the sync request path.
 
-## Target architecture
+## Architecture
 
 ```
-endpoint registry  →  per-component adapter  →  Locust step-load engine  →  per-service report
-(KPs/ARAs/ARS URLs)   (picks protocol +          (STAGES ramp, knee         (stages.csv,
-                       corpus subset for          detection — reused          by_qtype.csv,
-                       the chosen layer)          as-is)                      summary.json)
+target registry   →  per-component dispatch  →  Locust step-load engine  →  per-service report
+(config.TARGETS:     (TRAPIUser picks protocol   (stages ramp, knee         (stages.csv,
+ endpoint/protocol/   + corpus for the chosen     detection — shared         by_qtype.csv,
+ corpus/stages/SLO)   layer via LOADTEST_TARGET)   across layers)            summary.json[, ars_health])
 ```
 
 The Locust step-load engine in `trapi_loadtest.py` is the **reusable core** and
-should not need to change much per component. What varies by component is only
-(1) the request protocol (sync POST vs ARS submit/poll) and (2) which corpus
-subset is sent (`lookup` for KPs, `inferred` for ARAs/ARS).
+is shared across layers. What varies by component is only (1) the request
+protocol (sync `POST` vs ARS submit/poll/merge) and (2) which corpus subset is
+sent (`lookup` for KPs, `inferred` for ARAs/ARS) — both selected from
+`config.TARGETS` by the `LOADTEST_TARGET` the CLI sets.
 
 ## Current code map (what exists today)
 
-Two files under `translator_load_tester/`:
+Package `helmsdeep/`:
 
-- **`trapi_loadtest.py`** — the measurement engine (Locust):
-  - `StepLoad(LoadTestShape)` — drives the `STAGES` ramp and tells the collector
-    which stage is active.
+- **`config.py`** — the target registry. `TARGETS` maps each `--targets` value
+  (`kps`/`aras`/`ars` plus the Pathfinder run types `aras_pathfinder`/
+  `ars_pathfinder`) to a component config: `label`, `endpoint`, `corpus`
+  (key into the corpus module), `protocol` (`sync`/`async`), `implemented`, and
+  per-target `stages` + `p99_slo_ms`. Async targets (`ars`, `ars_pathfinder`) add
+  `messages_endpoint`, `poll_interval_s`, `max_poll_s`. The `*_pathfinder` targets
+  reuse the ARA/ARS endpoints + protocols but point at the `pathfinder` corpus and
+  ship a gentler ramp + looser SLO (pinned-two-endpoint path-finding is the
+  heaviest query class). `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
+  Per-target ramps/SLOs live here because cost profiles differ wildly by layer.
+- **`cli.py`** — the `helmsdeep` entry point (registered in
+  `setup.py` `console_scripts`). Parses `--targets` (required, one layer),
+  `--host` (required), `--csv-prefix`; rejects not-yet-`implemented` targets;
+  sets `LOADTEST_TARGET` (+ `LOCUST_CSV_PREFIX`) and launches
+  `python -m locust -f trapi_loadtest.py --headless --host …`.
+- **`trapi_loadtest.py`** — the measurement engine (Locust). The component under
+  test is chosen by `LOADTEST_TARGET`; `ENDPOINT`, `CORPUS`, `STAGES`,
+  `P99_SLO_MS`, and the async knobs (`PROTOCOL`, `MESSAGES_PATH`,
+  `POLL_INTERVAL_S`, `MAX_POLL_S`) are all derived from `config.TARGETS[...]`.
+  - `StepLoad(LoadTestShape)` — drives the `stages` ramp and marks the active stage.
   - `StageCollector` / `COLLECTOR` — buckets every completed request into the
-    stage that was active when it *finished* (per-stage, per-`qtype`).
-  - `_stage_stats()` — per-stage RPS, latency percentiles, error rate, Little's-Law
-    concurrency.
-  - `TRAPIUser(HttpUser)` — picks a weighted query from the corpus and `POST`s it.
-  - `on_test_stop()` — finds the knee and writes the output files.
-  - Module-level config block: `ENDPOINT`, `REQUEST_TIMEOUT`, `P99_SLO_MS`,
-    `MAX_ERROR_RATE`, `STAGES`, `CSV_PREFIX`.
-- **`trapi_corpus.py`** — the query corpus:
-  - `_qg(nodes, edges)` — wraps a query graph into the TRAPI `{message, parameters}`
-    envelope.
-  - 7 builder functions, each returning a TRAPI query of a different *shape*:
-    `one_hop_lookup_pinned`, `one_hop_lookup_open`, `one_hop_inferred`,
-    `one_hop_no_predicate`, `two_hop_lookup`, `batch_lookup`, `malformed_query`.
-  - `CORPUS` — list of `(qtype_label, builder, weight)`; weights are relative.
-  - Tunable real CURIEs (MONDO/CHEBI), e.g. `T2D`, `METFORMIN`, `ALZHEIMERS`.
+    stage active when it *finished* (per-stage, per-`qtype`). `record()` also
+    takes optional ARS signals: `status`, `result_count`, `response_bytes`.
+  - `_stage_stats()` — per-stage RPS, percentiles, error rate, Little's-Law
+    concurrency. `_ars_stage_health()` — per-stage ARS health row.
+  - `TRAPIUser(HttpUser)` — dispatches on `PROTOCOL`: `_run_sync()` (KP/ARA: one
+    blocking `POST`) or `_run_ars()` (submit → poll `/messages/{pk}` with
+    `gevent.sleep` until `Done`/`Error`/timeout → `_fetch_merged()` counts
+    `fields.data.message.results`). One `COLLECTOR.record` per logical query.
+  - `on_test_stop()` — finds the knee, writes `stages.csv` / `by_qtype.csv` /
+    `summary.json`, and (async only) `ars_health.csv` plus `red_flags` in the
+    summary + printed block.
+- **`trapi_corpus.py`** — the per-component query corpuses:
+  - `_qg(nodes, edges, tier=None, bypass_cache=None)` — TRAPI envelope; adds
+    scalar `parameters.tier` (KP-only) or top-level `bypass_cache` (ARA/ARS) only
+    when supplied.
+  - **`RETRIEVER_CORPUS`** — `lookup`-mode KP builders, each pinning its own
+    `tier` (multi-hop→0, single-hop→1): `one_hop_lookup_pinned`,
+    `one_hop_lookup_open`, `one_hop_no_predicate`, `two_hop_lookup`,
+    `batch_lookup`, `malformed_query`.
+  - **`SHEPHERD_CORPUS`** (also used as **`ARS_CORPUS`**) — `inferred` +
+    `bypass_cache` creative queries, an even MVP1/MVP2 split (50/50), entity
+    varied per request:
+    - **MVP1** "what treats disease X?" (`chemical-[treats]->disease`), disease
+      sampled from size-tiered pools via `mvp1_heavy`/`mvp1_medium`/`mvp1_light`
+      (10/15/25 = the 50% MVP1 half, tiered 20/30/50 within it).
+    - **MVP2** chemical⇄gene `biolink:affects` with object aspect/direction
+      qualifiers, both edge directions: `mvp2_chem_affects_gene` /
+      `mvp2_gene_affects_chem` (25/25), gene + qualifier sampled per request.
+  - **`PATHFINDER_CORPUS`** — the Pathfinder run type (ARA/ARS only, selected by
+    `aras_pathfinder`/`ars_pathfinder`). `pathfinder_drug_disease` pins **two**
+    endpoints (a drug + a disease, sampled per request from `CHEM_DISEASE_PAIRS`)
+    and asks for connecting paths via a `paths` map in the query_graph — built by
+    `_pathfinder_qg(nodes, paths)` (`nodes` + empty `edges` + `paths`; no
+    `knowledge_type`, no `tier`; `bypass_cache=True`). Most intensive query class.
+  - Entity pools: `HEAVY_DISEASES` (curated hubs) + `LONG_TAIL_DISEASES` from
+    **`curie_list.json`** (~1000 real MONDO CURIEs, shipped via `package_data`),
+    a curated `GENES` pool (NCBIGene), and curated drug↔disease `CHEM_DISEASE_PAIRS`.
+    `corpus_for(name)` returns the right list.
 
-Cost in TRAPI is driven by query-graph **shape**, not text length. The dimensions
-that matter: hops, mode (`lookup` vs `inferred`), constraint (pinned vs open),
-batch size, predicate specificity. See the module docstring in `trapi_corpus.py`.
+For KPs, cost is driven by query-graph **shape** (hops, mode, pinned vs open,
+batch, predicate). For ARA/ARS creative queries, the dominant cost driver is the
+**pinned disease's answer-set size**, which is why that corpus varies the entity.
 
-## Gap to target (what's missing — do not assume these exist)
+## Status & what's left
 
-- **No component awareness.** There is a single hardcoded `ENDPOINT = "/query"`
-  and a single `--host`. KPs/ARAs/ARS are not distinguished.
-- **No endpoint registry and no `--targets` selection.** `README.md` advertises
-  `run_performance_tests --targets kps`, but `setup.py` defines **no**
-  `console_scripts` entry point — that command does not exist yet.
-- **No ARS async submit/poll support.** The Locust user only does a blocking
-  `POST`. The ARS submit → poll → merge workflow is unimplemented.
-- **Corpus is not segmented by component contract.** KPs want `lookup`; ARAs/ARS
-  want `inferred`. Today every run draws from the same mixed `CORPUS`.
-- **Tier is hardcoded and uses the wrong shape.** `_qg()` in `trapi_corpus.py`
-  sets `parameters` to `{"tiers": [1]}` for every query, but Retriever's contract
-  is a scalar `parameters.tier` of `0` or `1` (see Retriever section). This needs
-  reconciling, and the KP corpus should vary `tier` per query rather than pinning
-  one value.
-- **Config is module-level constants**, not CLI/env/file driven (only
-  `CSV_PREFIX` reads an env var, `LOCUST_CSV_PREFIX`).
+Implemented: component awareness, the `helmsdeep` CLI + entry point,
+per-target stages/SLO, segmented corpuses, scalar `parameters.tier` per KP query,
+the ARS async submit/poll/merge user, ARS health metrics + red flags, and the
+tiered inferred disease mix.
+
+Remaining refinements (not yet done — don't assume these exist):
+
+- **Medium vs light tiers aren't calibrated.** `inferred_medium` and
+  `inferred_light` currently draw from the same `LONG_TAIL_DISEASES` pool; split
+  it by measured answer-set size (a one-time profiling pass) for true separation.
+- **No per-ARA child-result breakdown.** ARS health treats the merged message as
+  a whole; the `trace=y` response exposes children, so per-agent health is possible.
+- **No full multi-endpoint registry.** Retriever is a single service today; the
+  old per-KP/ARA URL registries survive only in git history (see below).
+- **Config is env/registry-driven, not file-driven.** Stages/SLO are edited in
+  `config.py`; there's no external config-file or full CLI override yet.
+- **No `results/` output convention** — outputs land in the working directory.
 
 ## Reusable assets in git history
 
@@ -155,32 +207,43 @@ they contain assets worth recovering for the roadmap below. Retrieve with
   (base URL `https://ars.ci.transltr.io/ars/api`).
 - `git show b912968:generate_message.py` — TRAPI message builders, including batch
   handling (`set_interpretation: "BATCH"`) and `inferred` ARA queries.
-- `git show b912968:curie_list.json` — ~1000 MONDO disease CURIEs for batch tests.
+- `git show b912968:curie_list.json` — ~1000 MONDO disease CURIEs. **Already
+  restored** into the package as `helmsdeep/curie_list.json` (the
+  long-tail disease pool for the inferred corpus).
 
-## How to run (today)
+## How to run
 
 ```bash
 pip install -e .          # Python >= 3.12; installs locust
 
-locust -f translator_load_tester/trapi_loadtest.py --headless \
-    --host https://your-trapi-service.example.org \
-    --csv-prefix run1
+# One layer per run (kps | aras | ars); --host required.
+helmsdeep --targets kps --host https://your-retriever.example.org --csv-prefix run1
+helmsdeep --targets aras --host https://your-ara.example.org --csv-prefix run1
+helmsdeep --targets ars  --host https://ars.ci.transltr.io/ars/api --csv-prefix run1
+
+# Pathfinder is its own (heavier) run type, ARA/ARS only:
+helmsdeep --targets aras_pathfinder --host https://your-ara.example.org --csv-prefix pf1
+helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --csv-prefix pf1
 ```
 
 - The `LoadTestShape` (`StepLoad`) **drives users, spawn rate, and duration**, so
-  do **NOT** pass `-u` / `-r` / `-t` — they would be ignored or fight the shape.
+  there is no `-u` / `-r` / `-t`. Tune the ramp via the per-target `stages` in
+  `config.py`.
 - `--csv-prefix` is optional; it falls back to the `LOCUST_CSV_PREFIX` env var,
   then to `trapi_run`.
+- You can also run the locustfile directly (`locust -f helmsdeep/
+  trapi_loadtest.py --headless --host …`), selecting the layer with the
+  `LOADTEST_TARGET` env var (defaults to `kps`). Note locust has no
+  `--csv-prefix` flag — set `LOCUST_CSV_PREFIX` instead.
 - Outputs (written by the master/standalone node only):
-  `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json`, plus a
+  `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json` (+
+  `<prefix>_ars_health.csv` and a `red_flags` list for the `ars` target), plus a
   printed summary table with the knee.
-
-> The `run_performance_tests --targets kps` command in `README.md` is
-> **aspirational** — it is not wired up yet (see Gap to target).
 
 ## Conventions & gotchas
 
-- **The shape owns concurrency.** Tune load by editing `STAGES`, not CLI flags.
+- **The shape owns concurrency.** Tune load by editing the per-target `stages`
+  in `config.py`, not CLI flags.
 - **Closed-loop load.** `TRAPIUser.wait_time = constant(0)` — no think time; users
   hammer the endpoint as fast as responses return.
 - **Don't trust Locust's blended aggregate during a ramp.** We bucket per stage in
@@ -192,30 +255,44 @@ locust -f translator_load_tester/trapi_loadtest.py --headless \
 - **Long timeouts on purpose.** `REQUEST_TIMEOUT = 210` s because TRAPI queries are
   slow; ARS runs are far longer still (minutes–~1 hr) and need the async model.
 - **gevent concurrency.** Locust uses gevent green-threads; avoid blocking calls in
-  the user path.
+  the user path. The ARS poll loop uses `gevent.sleep`, **never** `time.sleep`.
+- **ARS submit/poll/merge is one logical measurement.** `_run_ars` issues several
+  HTTP calls (named `ars_submit`/`ars_poll`/`ars_merge` — they show in Locust's
+  own table) but records exactly one `COLLECTOR.record` per logical query, with
+  latency = wall-clock submit→terminal. A `Done` that returns **0 results counts
+  as a failure** (and raises a red flag); a non-terminal status past `max_poll_s`
+  is a `Timeout` failure.
+- **Inferred corpus mixes MVP1 + MVP2 and varies entities per request.** MVP1
+  (`mvp1_heavy/medium/light`, treats-disease) samples a tiered disease; MVP2
+  (`mvp2_chem_affects_gene`/`mvp2_gene_affects_chem`, affects-gene with
+  qualifiers) samples a gene + qualifier combo. The per-request variation covers
+  the real cost surface and avoids warming caches. MVP1 medium and light share
+  the long-tail pool until calibrated (see Status & what's left).
 - **Environments & TRAPI versions vary per service.** Endpoints live across
   `*.ci.transltr.io`, `*.test.transltr.io`, and prod, and individual services pin
   different TRAPI versions in their URL paths. Target deliberately.
-- **Swap the CURIEs.** The corpus uses a few real MONDO/CHEBI entities; replace
-  them with entities the target service actually knows about, or lookups return
-  empty and won't reflect real cost.
+- **Swap the CURIEs.** The KP corpus uses a few real MONDO/CHEBI entities and the
+  inferred corpus draws diseases from `curie_list.json`; replace/extend them with
+  entities the target service actually knows about, or queries return empty and
+  won't reflect real cost.
 
 ## Roadmap (broader repo, next phases)
 
-Ordered so a future session can pick up where this leaves off:
+Done in earlier phases: per-component adapter + `--targets` CLI entry point
+(one layer per run — there is intentionally no "all" mode, which would
+double-load shared downstream services per the layering rule), the ARS async
+submit→poll→merge user, per-target config, and a README for human onboarding.
 
-a. **Restore the endpoint registry as config** (KPs/ARAs/ARS URLs + per-service
-   predicate/query overrides), sourced from the git-history assets above.
-b. **Add a per-component adapter** that selects the corpus subset (`lookup` vs
-   `inferred`) and request protocol for the chosen layer.
-c. **Add an ARS async user** implementing submit → poll `messages/{pk}` → merge.
-d. **Add a real CLI entry point** in `setup.py` `console_scripts`:
-   `run_performance_tests --targets {kps,aras,ars}` — selects **one** layer per
-   run (mutually exclusive). There is intentionally no "all" option that hits every
-   layer at once, because that double-loads shared downstream services
-   (see the layering rule).
-e. **Make config CLI/env/file driven** instead of module-level constants.
-f. **Expand `README.md`** for human onboarding (this `CLAUDE.md` is agent/dev
-   guidance; the README should be the friendly run-it-yourself doc).
-g. **Adopt a `results/` output convention** so each service's reports land in a
+Remaining, ordered so a future session can pick up where this leaves off:
+
+a. **Calibrate the inferred tiers.** Profile each disease once (sort by merged
+   result count) and split `LONG_TAIL_DISEASES` into real medium/light pools.
+b. **Per-ARA health breakdown** for ARS, parsing the `trace=y` children so a
+   red flag can name *which* downstream agent dropped answers.
+c. **Restore the full endpoint registry as config** (per-KP/ARA URLs +
+   predicate/query overrides) from the git-history assets above, if/when the
+   stack returns to multiple independent KP/ARA endpoints.
+d. **Make config file-driven** (external config file / full CLI overrides for
+   stages, SLOs, poll knobs) instead of editing `config.py`.
+e. **Adopt a `results/` output convention** so each service's reports land in a
    predictable, per-service location.
