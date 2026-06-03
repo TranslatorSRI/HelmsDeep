@@ -284,7 +284,7 @@ def _pathfinder_qg(nodes, paths, bypass_cache=True):
     """
     env = {
         "message": {
-            "query_graph": {"nodes": nodes, "edges": {}, "paths": paths}
+            "query_graph": {"nodes": nodes, "paths": paths}
         }
     }
     if bypass_cache is not None:
@@ -305,7 +305,7 @@ def pathfinder_drug_disease():
                 "subject": "n0",
                 "object": "n1",
                 # Hint that gene-mediated mechanism paths are of interest.
-                "constraints": [{"intermediate_categories": ["biolink:Gene"]}],
+                # "constraints": [{"intermediate_categories": ["biolink:Gene"]}],
             },
         },
     )
