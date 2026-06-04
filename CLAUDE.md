@@ -155,9 +155,13 @@ Package `helmsdeep/`:
     - **MVP1** "what treats disease X?" (`chemical-[treats]->disease`), disease
       sampled from size-tiered pools via `mvp1_heavy`/`mvp1_medium`/`mvp1_light`
       (10/15/25 = the 50% MVP1 half, tiered 20/30/50 within it).
-    - **MVP2** chemical⇄gene `biolink:affects` with object aspect/direction
-      qualifiers, both edge directions: `mvp2_chem_affects_gene` /
-      `mvp2_gene_affects_chem` (25/25), gene + qualifier sampled per request.
+    - **MVP2** chemical `biolink:affects` gene, with object aspect/direction
+      qualifiers on the gene. The edge is **always** oriented chemical(subject)→
+      gene(object) (matching the Translator TestHarness `generate_query.py`); the
+      two variants differ only by which endpoint is pinned —
+      `mvp2_chem_affects_gene` (pinned gene, open chemical) /
+      `mvp2_chem_affects_open_gene` (pinned chemical, open gene) (25/25). Aspect is
+      the canonical `activity_or_abundance`; direction + entity sampled per request.
   - **`PATHFINDER_CORPUS`** — the Pathfinder run type (ARA/ARS only, selected by
     `aras_pathfinder`/`ars_pathfinder`). `pathfinder_drug_disease` pins **two**
     endpoints (a drug + a disease, sampled per request from `CHEM_DISEASE_PAIRS`)
@@ -264,10 +268,13 @@ helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --
   is a `Timeout` failure.
 - **Inferred corpus mixes MVP1 + MVP2 and varies entities per request.** MVP1
   (`mvp1_heavy/medium/light`, treats-disease) samples a tiered disease; MVP2
-  (`mvp2_chem_affects_gene`/`mvp2_gene_affects_chem`, affects-gene with
-  qualifiers) samples a gene + qualifier combo. The per-request variation covers
-  the real cost surface and avoids warming caches. MVP1 medium and light share
-  the long-tail pool until calibrated (see Status & what's left).
+  (`mvp2_chem_affects_gene`/`mvp2_chem_affects_open_gene`, a chemical→gene
+  `affects` edge with the gene-pinned and chemical-pinned variants) samples the
+  pinned entity + direction. The edge orientation is always chemical(subject)→
+  gene(object) and the aspect qualifier is always `activity_or_abundance`. The
+  per-request variation covers the real cost surface and avoids warming caches.
+  MVP1 medium and light share the long-tail pool until calibrated (see Status &
+  what's left).
 - **Environments & TRAPI versions vary per service.** Endpoints live across
   `*.ci.transltr.io`, `*.test.transltr.io`, and prod, and individual services pin
   different TRAPI versions in their URL paths. Target deliberately.
