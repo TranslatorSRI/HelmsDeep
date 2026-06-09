@@ -243,12 +243,30 @@ class TRAPIUser(HttpUser):
             latency_ms = resp.request_meta["response_time"] or 0.0
             COLLECTOR.record(qtype, latency_ms, failed)
 
+    def _record_ars(self, qtype, latency_ms, failed, exc_msg=None, **health):
+        """Record one logical ARS query: into the per-stage COLLECTOR (drives
+        HelmsDeep's own reports) AND as a single Locust request event named
+        'ars_query', so the native stats table shows the full submit->terminal
+        wall-clock -- not just the final ars_merge GET.
+        """
+        COLLECTOR.record(qtype, latency_ms, failed, **health)
+        self.environment.events.request.fire(
+            request_type="ARS",
+            name="ars_query",
+            response_time=latency_ms,
+            response_length=health.get("response_bytes") or 0,
+            exception=(exc_msg if failed else None),
+            context={"qtype": qtype},
+        )
+
     def _run_ars(self, qtype, payload):
         """ARS: submit -> poll /messages/{pk} until terminal -> fetch merged.
 
         Latency is wall-clock submit->terminal. One COLLECTOR.record per logical
-        query (the submit/poll/merge HTTP calls show separately in Locust's own
-        table but are not double-counted). A Done with 0 results is a failure.
+        query, plus one synthetic 'ars_query' Locust request event carrying that
+        same full wall-clock (the submit/poll/merge HTTP calls also show
+        separately in Locust's own table for diagnostics, but are not
+        double-counted as the query time). A Done with 0 results is a failure.
         """
         start = time.time()
 
@@ -262,7 +280,9 @@ class TRAPIUser(HttpUser):
         ) as resp:
             if resp.status_code != 201:
                 resp.failure(f"submit status {resp.status_code}")
-                COLLECTOR.record(qtype, _elapsed_ms(), True, status="SubmitError")
+                self._record_ars(qtype, _elapsed_ms(), True,
+                                 f"submit status {resp.status_code}",
+                                 status="SubmitError")
                 return
             try:
                 pk = (resp.json() or {}).get("pk")
@@ -270,7 +290,8 @@ class TRAPIUser(HttpUser):
                 pk = None
             if not pk:
                 resp.failure("no pk in submit response")
-                COLLECTOR.record(qtype, _elapsed_ms(), True, status="NoPK")
+                self._record_ars(qtype, _elapsed_ms(), True,
+                                 "no pk in submit response", status="NoPK")
                 return
             resp.success()
 
@@ -300,14 +321,18 @@ class TRAPIUser(HttpUser):
         # 3) Terminal handling.
         if status == "Done":
             result_count, nbytes = self._fetch_merged(merged_pk)
-            COLLECTOR.record(
+            self._record_ars(
                 qtype, _elapsed_ms(), failed=(result_count == 0),
+                exc_msg=("Done with 0 results" if result_count == 0 else None),
                 status="Done", result_count=result_count, response_bytes=nbytes,
             )
         elif status == "Error":
-            COLLECTOR.record(qtype, _elapsed_ms(), True, status="Error")
+            self._record_ars(qtype, _elapsed_ms(), True, "ARS Error status",
+                             status="Error")
         else:
-            COLLECTOR.record(qtype, _elapsed_ms(), True, status="Timeout")
+            self._record_ars(qtype, _elapsed_ms(), True,
+                             f"no terminal status within {MAX_POLL_S}s",
+                             status="Timeout")
 
     def _fetch_merged(self, merged_pk):
         """Fetch the merged message; return (result_count, response_bytes)."""

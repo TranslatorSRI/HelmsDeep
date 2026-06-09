@@ -75,8 +75,11 @@ The `ars` target is asynchronous: each logical query is `POST /submit` → poll
 `GET /messages/{pk}?trace=y` (every `poll_interval_s`, capped at `max_poll_s`,
 default 15 min) until `status` is `Done`/`Error` → fetch `GET /messages/{merged_pk}`
 and count `fields.data.message.results`. Latency is the wall-clock submit→terminal
-time; one measurement is recorded per logical query (the submit/poll/merge calls
-appear separately in Locust's own table but aren't double-counted).
+time; one measurement is recorded per logical query. A single `ars_query` Locust
+request event carries that full wall-clock, so Locust's native stats table shows
+the true per-query time — the individual `ars_submit`/`ars_poll`/`ars_merge` calls
+also appear there as per-step diagnostics (e.g. `ars_merge` times only the final
+merge fetch, not the whole query), but aren't double-counted as the query time.
 
 Because the ARS is what real users hit, the run also captures health signals to
 flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
