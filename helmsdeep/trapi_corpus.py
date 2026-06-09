@@ -118,10 +118,35 @@ _DIRECTIONS = ["increased", "decreased"]
 # (chemical, disease) pairs your target service actually knows about.
 # ---------------------------------------------------------------------------
 CHEM_DISEASE_PAIRS = [
-    (METFORMIN, T2D),
-    (LEVODOPA, PARKINSONS),
-    (DONEPEZIL, ALZHEIMERS),
-    (ALBUTEROL, ASTHMA),
+    # (METFORMIN, T2D),
+    # (LEVODOPA, PARKINSONS),
+    # (DONEPEZIL, ALZHEIMERS),
+    # (ALBUTEROL, ASTHMA),
+    ('MONDO:0021095', 'MONDO:0005105'),
+    ('CHEBI:9139', 'MONDO:0004975'),
+    ('CHEBI:5118', 'MONDO:0100233'),
+    ('MONDO:0005180', 'MONDO:0005105'),
+    ('MONDO:0019632', 'MONDO:0005340'),
+    ('CHEBI:27881', 'NCBIGene:2739'),
+    ('CHEBI:45783', 'MONDO:0004979'),  # Imatinib -> Asthma
+    ('GO:0006914', 'MONDO:0005265'),
+    # ('CHEBI:10033', 'MONDO:0004992'),  # Warfarin -> Cancer, DON'T RUN
+    ('NCBIGene:3458', 'CHEBI:16828'),
+    ('MONDO:0005532', 'MONDO:0005180'),
+    ('CHEBI:15647', 'UNII:31YO63LBSN'),
+    ('CHEBI:28364', 'MONDO:0005311'),
+    ('NCBIGene:3458', 'MONDO:0100096'),
+    ('NCBIGene:27240', 'MONDO:0100096'),
+    ('CHEBI:3750', 'MONDO:0013209'),
+    ('CHEBI:83766', 'MONDO:0008170'),
+    ('CHEBI:45783', 'MONDO:0004784'),
+    ('UNII:7SE5582Q2P', 'MONDO:0007037'),
+    ('MONDO:0005011', 'MONDO:0005180'),
+    ('CHEBI:15365', 'MONDO:0005575'),
+    ('CHEBI:50924', 'MONDO:0007256'),
+    ('CHEBI:45713', 'NCBIGene:2739'),
+    ('NCBIGene:54716', 'MONDO:0100096'),
+    ('CHEBI:7465', 'MONDO:0008218'),
 ]
 
 
