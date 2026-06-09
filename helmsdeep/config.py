@@ -62,14 +62,14 @@ TARGETS = {
         # Creative (inferred) reasoning is far heavier -- gentler ramp, longer
         # holds (slow queries need time to accumulate samples), looser p99.
         "stages": [
-            (1,  1, 90),
-            (2,  1, 90),
-            (5,  2, 90),
-            (10, 2, 120),
-            (20, 5, 120),
-            (40, 5, 120),
+            (2,  1, 300),  # 5 mins
+            (3,  1, 300),  # 5 mins
+            (5,  2, 330),  # 5.5 mins
+            (10, 2, 360),  # 6 mins
+            (20, 5, 420),  # 7 mins
+            (40, 5, 600),  # 10 mins
         ],
-        "p99_slo_ms": 120000,
+        "p99_slo_ms": 210000,
     },
     "ars": {
         "label": "ARS",
@@ -79,14 +79,17 @@ TARGETS = {
         "protocol": "async",
         "implemented": True,
         "poll_interval_s": 10,            # gevent.sleep between status polls
-        "max_poll_s": 900,                # 15-min cap; exceeding it = Timeout
+        "max_poll_s": 360,                # 6-min cap; exceeding it = Timeout
         # Runs take minutes -- very low concurrency, long holds.
         "stages": [
-            (1, 1, 600),
-            (2, 1, 900),
-            (4, 1, 900),
+            (2,  1, 300),  # 5 mins
+            (3,  1, 300),  # 5 mins
+            (5,  2, 330),  # 5.5 mins
+            (10, 2, 360),  # 6 mins
+            (20, 5, 420),  # 7 mins
+            (40, 5, 600),  # 10 mins
         ],
-        "p99_slo_ms": 600000,             # 10-min knee target (< max_poll_s)
+        "p99_slo_ms": 240000,             # 5-min knee target (< max_poll_s)
     },
     # Pathfinder is its own run type (ARA + ARS only): it pins two endpoints and
     # asks for connecting paths -- the most intensive query class. Same endpoints
@@ -99,10 +102,12 @@ TARGETS = {
         "implemented": True,
         # Heavier than `aras`: lower concurrency, longer holds, looser p99.
         "stages": [
-            (1, 1, 120),
-            (2, 1, 180),
-            (4, 1, 240),
-            (8, 2, 240),
+            (2,  1, 300),  # 5 mins
+            (3,  1, 300),  # 5 mins
+            (5,  2, 330),  # 5.5 mins
+            (10, 2, 360),  # 6 mins
+            (20, 5, 420),  # 7 mins
+            (40, 5, 600),  # 10 mins
         ],
         "p99_slo_ms": 300000,             # 5-min knee target (vs 2 min for aras)
     },
@@ -113,13 +118,17 @@ TARGETS = {
         "corpus": "pathfinder",
         "protocol": "async",
         "implemented": True,
-        "poll_interval_s": 15,
-        "max_poll_s": 1800,               # 30-min cap (vs 15 min for ars)
+        "poll_interval_s": 10,
+        "max_poll_s": 360,               # 6-min cap
         "stages": [
-            (1, 1, 1200),
-            (2, 1, 1800),
+            (2,  1, 300),  # 5 mins
+            (3,  1, 300),  # 5 mins
+            (5,  2, 330),  # 5.5 mins
+            (10, 2, 360),  # 6 mins
+            (20, 5, 420),  # 7 mins
+            (40, 5, 600),  # 10 mins
         ],
-        "p99_slo_ms": 1200000,            # 20-min knee target (< max_poll_s)
+        "p99_slo_ms": 300000,            # 5-min knee target (< max_poll_s)
     },
 }
 
