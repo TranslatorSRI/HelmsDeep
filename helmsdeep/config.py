@@ -73,8 +73,8 @@ TARGETS = {
     },
     "ars": {
         "label": "ARS",
-        "endpoint": "/submit",            # submit path (appended to --host)
-        "messages_endpoint": "/messages", # poll/merge base: /messages/{pk}
+        "endpoint": "/ars/api/submit",            # submit path (appended to --host)
+        "messages_endpoint": "/ars/api/messages", # poll/merge base: /messages/{pk}
         "corpus": "ars",
         "protocol": "async",
         "implemented": True,
@@ -89,7 +89,7 @@ TARGETS = {
             (20, 5, 420),  # 7 mins
             (40, 5, 600),  # 10 mins
         ],
-        "p99_slo_ms": 240000,             # 5-min knee target (< max_poll_s)
+        "p99_slo_ms": 240000,             # 4-min knee target (< max_poll_s)
     },
     # Pathfinder is its own run type (ARA + ARS only): it pins two endpoints and
     # asks for connecting paths -- the most intensive query class. Same endpoints

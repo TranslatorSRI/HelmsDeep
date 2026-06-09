@@ -260,7 +260,7 @@ class TRAPIUser(HttpUser):
             ENDPOINT, json=payload, name="ars_submit",
             timeout=REQUEST_TIMEOUT, catch_response=True,
         ) as resp:
-            if resp.status_code != 200:
+            if resp.status_code != 201:
                 resp.failure(f"submit status {resp.status_code}")
                 COLLECTOR.record(qtype, _elapsed_ms(), True, status="SubmitError")
                 return
