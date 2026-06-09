@@ -262,10 +262,14 @@ helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --
   the user path. The ARS poll loop uses `gevent.sleep`, **never** `time.sleep`.
 - **ARS submit/poll/merge is one logical measurement.** `_run_ars` issues several
   HTTP calls (named `ars_submit`/`ars_poll`/`ars_merge` — they show in Locust's
-  own table) but records exactly one `COLLECTOR.record` per logical query, with
-  latency = wall-clock submit→terminal. A `Done` that returns **0 results counts
-  as a failure** (and raises a red flag); a non-terminal status past `max_poll_s`
-  is a `Timeout` failure.
+  own table as per-step diagnostics) but records exactly one `COLLECTOR.record`
+  per logical query, with latency = wall-clock submit→terminal. It also fires a
+  single synthetic `ars_query` Locust request event carrying that same full
+  wall-clock, so Locust's native stats table shows the true per-query time
+  (otherwise the only ARS rows would be the individual sub-calls — e.g. the
+  `ars_merge` GET, which times just the final merge fetch, not the whole query).
+  A `Done` that returns **0 results counts as a failure** (and raises a red
+  flag); a non-terminal status past `max_poll_s` is a `Timeout` failure.
 - **Inferred corpus mixes MVP1 + MVP2 and varies entities per request.** MVP1
   (`mvp1_heavy/medium/light`, treats-disease) samples a tiered disease; MVP2
   (`mvp2_chem_affects_gene`/`mvp2_chem_affects_open_gene`, a chemical→gene
