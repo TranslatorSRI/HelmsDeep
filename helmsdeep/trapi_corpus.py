@@ -106,7 +106,26 @@ GENES = [
     "NCBIGene:7124",   # TNF
     "NCBIGene:3569",   # IL6
 ]
-_ASPECTS = ["activity", "abundance"]
+
+# Chemical pool for the pinned-chemical MVP2 variant ("what genes does chemical X
+# affect?"). The chemical side is otherwise an open answer set; this small curated
+# set of real CHEBI drug CURIEs is only used when the chemical is the pinned
+# endpoint. Swap/extend with chemicals your target service actually knows about.
+CHEMICALS = [
+    METFORMIN,    # CHEBI:6801
+    LEVODOPA,     # CHEBI:15765
+    DONEPEZIL,    # CHEBI:53289
+    ALBUTEROL,    # CHEBI:2549 (salbutamol)
+    "CHEBI:15365",  # aspirin
+    "CHEBI:5118",   # gefitinib
+    "CHEBI:45783",  # imatinib
+    "CHEBI:8382",   # prednisone
+]
+
+# Canonical MVP2 object-qualifier values (mirrors the Translator TestHarness
+# generate_query.py): the aspect is the combined `activity_or_abundance` value the
+# real MVP2 acceptance assets send; direction is increased/decreased.
+_ASPECT = "activity_or_abundance"
 _DIRECTIONS = ["increased", "decreased"]
 
 
@@ -215,9 +234,13 @@ def one_hop_lookup_open():
 #   MVP1  "what chemicals treat disease X?"  -- open chemical -[treats]-> disease.
 #         Cost tracks the pinned disease's answer-set size, so the disease is
 #         sampled per request from size-tiered pools (heavy/medium/light).
-#   MVP2  chemical <-> gene "affects" with object aspect/direction qualifiers
-#         ("what changes gene X's activity/abundance?" and the inverse). Both
-#         edge directions are generated; the gene + qualifier vary per request.
+#   MVP2  chemical -[affects]-> gene with object aspect/direction qualifiers on
+#         the gene. The edge is ALWAYS oriented chemical(subject) -> gene(object)
+#         (matching the Translator TestHarness generate_query.py); the two
+#         variants differ only in which endpoint is pinned -- pin the gene and
+#         leave the chemical open ("what chemicals affect gene X?"), or pin the
+#         chemical and leave the gene open ("what genes does chemical X affect?").
+#         The entity + direction vary per request.
 # ----------------------------------------------------------------------------
 def _inferred_treats(disease):
     """MVP1: open chemical -[treats, inferred]-> pinned disease."""
@@ -253,7 +276,10 @@ def mvp1_light():
 def _affects(subject_node, object_node, aspect, direction):
     """MVP2: an inferred `affects` edge with object aspect/direction qualifiers.
 
-    Qualifiers always describe the OBJECT node (the thing being changed).
+    The edge is always oriented chemical(subject) -> gene(object), so the object
+    node is the gene and the qualifiers always describe that gene. Only the two
+    qualifiers the reference emits are sent (object aspect + direction); the
+    `qualified_predicate` carried on real test assets is intentionally omitted.
     """
     return _qg(
         nodes={"n0": subject_node, "n1": object_node},
@@ -273,20 +299,27 @@ def _affects(subject_node, object_node, aspect, direction):
 
 
 def mvp2_chem_affects_gene():
-    """MVP2: what chemicals change a gene's activity/abundance? (chem -> gene)."""
+    """MVP2 (gene pinned): what chemicals change gene X's activity/abundance?
+
+    Open ChemicalEntity subject -> pinned Gene object; qualifiers on the gene.
+    """
     return _affects(
         {"categories": ["biolink:ChemicalEntity"]},                 # open subject
         {"ids": [random.choice(GENES)], "categories": ["biolink:Gene"]},  # pinned object
-        random.choice(_ASPECTS), random.choice(_DIRECTIONS),
+        _ASPECT, random.choice(_DIRECTIONS),
     )
 
 
-def mvp2_gene_affects_chem():
-    """MVP2 inverse: what chemicals' abundance does a gene change? (gene -> chem)."""
+def mvp2_chem_affects_open_gene():
+    """MVP2 (chemical pinned): what genes does chemical X affect?
+
+    Pinned ChemicalEntity subject -> open Gene object. Same chemical -> gene edge
+    orientation as the gene-pinned variant; qualifiers still describe the gene.
+    """
     return _affects(
-        {"ids": [random.choice(GENES)], "categories": ["biolink:Gene"]},  # pinned subject
-        {"categories": ["biolink:ChemicalEntity"]},                 # open object
-        "abundance", random.choice(_DIRECTIONS),   # chemicals have abundance, not activity
+        {"ids": [random.choice(CHEMICALS)], "categories": ["biolink:ChemicalEntity"]},  # pinned subject
+        {"categories": ["biolink:Gene"]},                           # open object
+        _ASPECT, random.choice(_DIRECTIONS),
     )
 
 
@@ -418,16 +451,17 @@ RETRIEVER_CORPUS = [
 
 # Shepherd (ARA): inferred (creative) mode, cache bypassed. An even MVP1/MVP2
 # split (50/50). MVP1 (treats-disease) keeps its tiered disease sampling
-# (heavy/medium/light = 20/30/50 within its half); MVP2 (affects-gene) covers
-# both edge directions evenly. Tune all weights to your real traffic mix.
+# (heavy/medium/light = 20/30/50 within its half); MVP2 (chemical -[affects]->
+# gene) covers both pinning variants evenly. Tune all weights to your traffic mix.
 SHEPHERD_CORPUS = [
     # MVP1 -- "what treats disease X?" (tiered by disease answer-set size): 50%.
     ("mvp1_heavy",  mvp1_heavy,  10),
     ("mvp1_medium", mvp1_medium, 15),
     ("mvp1_light",  mvp1_light,  25),
-    # MVP2 -- chemical<->gene "affects" with qualifiers, both directions: 50%.
-    ("mvp2_chem_affects_gene", mvp2_chem_affects_gene, 25),
-    ("mvp2_gene_affects_chem", mvp2_gene_affects_chem, 25),
+    # MVP2 -- chemical -[affects]-> gene with qualifiers, gene-pinned and
+    # chemical-pinned variants: 50%.
+    ("mvp2_chem_affects_gene",      mvp2_chem_affects_gene,      25),
+    ("mvp2_chem_affects_open_gene", mvp2_chem_affects_open_gene, 25),
 ]
 
 # ARS: also inferred queries (it fans out to the ARAs). Reuses the Shepherd
