@@ -96,7 +96,7 @@ TARGETS = {
             (40, 5, 600),  # 10 mins
         ],
         "p99_slo_ms": 240000,             # 4-min knee target (< max_poll_s)
-        "cooldown_s": 60,                 # drain slow queries between stages
+        "cooldown_s": 240,                 # drain slow queries between stages
     },
     # Pathfinder is its own run type (ARA + ARS only): it pins two endpoints and
     # asks for connecting paths -- the most intensive query class. Same endpoints
