@@ -24,6 +24,11 @@ Fields:
   stages       step-load ramp: list of (users, spawn_rate, hold_seconds). Each
                stage should hold long enough for a stable measurement.
   p99_slo_ms   knee requires this layer's stage p99 <= this (ms)
+  cooldown_s   optional quiet gap BETWEEN stages (default 0). Users ramp to 0 so
+               slow in-flight queries drain and are counted under the stage that
+               launched them, rather than bleeding into the next stage. Set it on
+               the expensive layers (ARA/ARS/Pathfinder); cheap KP lookups don't
+               bleed, so they leave it at 0.
 
 Async (``ars``) targets add:
   messages_endpoint  base path for polling/merge: /messages/{pk}
@@ -70,6 +75,7 @@ TARGETS = {
             (40, 5, 600),  # 10 mins
         ],
         "p99_slo_ms": 210000,
+        "cooldown_s": 60,                 # drain slow queries between stages
     },
     "ars": {
         "label": "ARS",
@@ -90,6 +96,7 @@ TARGETS = {
             (40, 5, 600),  # 10 mins
         ],
         "p99_slo_ms": 240000,             # 4-min knee target (< max_poll_s)
+        "cooldown_s": 60,                 # drain slow queries between stages
     },
     # Pathfinder is its own run type (ARA + ARS only): it pins two endpoints and
     # asks for connecting paths -- the most intensive query class. Same endpoints
@@ -110,6 +117,7 @@ TARGETS = {
             (40, 5, 600),  # 10 mins
         ],
         "p99_slo_ms": 300000,             # 5-min knee target (vs 2 min for aras)
+        "cooldown_s": 60,                 # drain slow queries between stages
     },
     "ars_pathfinder": {
         "label": "ARS (Pathfinder)",
@@ -129,6 +137,7 @@ TARGETS = {
             (40, 5, 600),  # 10 mins
         ],
         "p99_slo_ms": 300000,            # 5-min knee target (< max_poll_s)
+        "cooldown_s": 60,                # drain slow queries between stages
     },
 }
 

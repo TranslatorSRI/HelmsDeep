@@ -58,11 +58,18 @@ The load profile (users, spawn rate, duration) is driven by the `StepLoad` shape
 threshold are **per target** in `helmsdeep/config.py` (`stages` and
 `p99_slo_ms`), since cost profiles differ wildly by layer; edit them there.
 
+An optional per-target `cooldown_s` inserts a quiet gap **between** stages: users
+ramp to 0 so slow in-flight queries drain (counted under the stage that launched
+them) before the next stage starts clean, instead of bleeding into it. It defaults
+to 0 (cheap KP lookups don't bleed) and is set on the expensive ARA/ARS/Pathfinder
+targets.
+
 ## Outputs
 
 Written to the working directory by the standalone/master node:
 
-- `<prefix>_stages.csv` — one row per stage (overall metrics)
+- `<prefix>_stages.csv` — one row per stage (overall metrics), including a
+  `stage_start` column with the stage's wall-clock start time (ISO 8601 UTC)
 - `<prefix>_by_qtype.csv` — one row per (stage, query type)
 - `<prefix>_summary.json` — config (including which `target` was measured), all
   stages, and the chosen knee

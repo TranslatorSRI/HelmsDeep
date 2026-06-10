@@ -68,6 +68,10 @@ MESSAGES_PATH = _TGT.get("messages_endpoint", "/messages")
 POLL_INTERVAL_S = _TGT.get("poll_interval_s", 10)
 MAX_POLL_S = _TGT.get("max_poll_s", 900)
 
+# Optional quiet gap between stages (users ramp to 0) so slow in-flight queries
+# drain into the stage that launched them instead of bleeding into the next one.
+COOLDOWN_S = _TGT.get("cooldown_s", 0)
+
 CSV_PREFIX = os.environ.get("LOCUST_CSV_PREFIX", "trapi_run")
 
 # Weighted, flattened corpus for O(1)-ish random selection.
@@ -101,9 +105,16 @@ class StageCollector:
 
     def mark_stage(self, idx):
         if idx != self.stage_idx:
-            self.stage_ended[self.stage_idx] = time.time()
+            # setdefault (not =) so a cooldown that already froze this stage's end
+            # time isn't overwritten when the next stage begins.
+            self.stage_ended.setdefault(self.stage_idx, time.time())
         self.stage_idx = idx
         self.stage_started.setdefault(idx, time.time())
+
+    def end_active_stage(self):
+        # Called at cooldown start: freeze the just-finished stage's end time so
+        # its duration reflects the active-load window, not the drain period.
+        self.stage_ended.setdefault(self.stage_idx, time.time())
 
     def record(self, qtype, latency_ms, failed, *,
                status=None, result_count=None, response_bytes=None):
@@ -151,10 +162,15 @@ def _stage_stats(idx, qtype):
     dur = max(ended - started, 1e-9) if started else 1e-9
     rps = n_req / dur
     mean = sum(lat) / len(lat) if lat else 0.0
+    # Wall-clock stage start, ISO 8601 UTC (e.g. 2026-06-10T14:30:05Z).
+    stage_start = (
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)) if started else ""
+    )
     return {
         "stage": idx,
         "qtype": qtype,
         "users": STAGES[idx][0] if idx < len(STAGES) else None,
+        "stage_start": stage_start,
         "requests": n_req,
         "errors": n_err,
         "error_rate": (n_err / n_req) if n_req else 0.0,
@@ -356,6 +372,15 @@ class TRAPIUser(HttpUser):
                 return 0, nbytes
 
 
+# When cooldown is enabled, stages ramp down to 0 users between holds. Set a
+# stop_timeout so a user finishing its (possibly very slow) current query is
+# allowed to complete and be counted, rather than killed mid-request.
+@events.init.add_listener
+def _set_stop_timeout(environment, **_kw):
+    if COOLDOWN_S:
+        environment.stop_timeout = REQUEST_TIMEOUT
+
+
 # ----------------------------------------------------------------------------
 # Step-load shape. tick() returns (user_count, spawn_rate) or None to stop.
 # It also tells the collector which stage is active.
@@ -363,11 +388,16 @@ class TRAPIUser(HttpUser):
 class StepLoad(LoadTestShape):
     def __init__(self):
         super().__init__()
-        self._bounds = []
+        self._bounds = []      # (start, end, idx) active-load windows
+        self._cooldowns = []   # (start, end) drain gaps between stages
         t = 0
+        n = len(STAGES)
         for i, (_users, _rate, hold) in enumerate(STAGES):
             self._bounds.append((t, t + hold, i))
             t += hold
+            if COOLDOWN_S and i < n - 1:   # gap BETWEEN stages, not after the last
+                self._cooldowns.append((t, t + COOLDOWN_S))
+                t += COOLDOWN_S
         self._total = t
 
     def tick(self):
@@ -379,6 +409,13 @@ class StepLoad(LoadTestShape):
                 COLLECTOR.mark_stage(idx)
                 users, rate, _hold = STAGES[idx]
                 return (users, rate)
+        # In a cooldown gap: ramp users to 0 so slow in-flight queries drain into
+        # the just-finished stage (its end time is frozen here) rather than the
+        # next one. stop_timeout (set at init) lets those queries finish.
+        for start, end in self._cooldowns:
+            if start <= run_time < end:
+                COLLECTOR.end_active_stage()
+                return (0, max(1, len(STAGES)))
         return None
 
 
@@ -449,7 +486,7 @@ def on_test_stop(environment, **_kw):
             prev = h
 
     # Write overall CSV.
-    fields = ["stage", "users", "requests", "errors", "error_rate",
+    fields = ["stage", "users", "stage_start", "requests", "errors", "error_rate",
               "duration_s", "rps", "mean_ms", "p50_ms", "p95_ms", "p99_ms",
               "concurrency"]
     with open(f"{CSV_PREFIX}_stages.csv", "w") as f:
