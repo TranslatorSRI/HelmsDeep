@@ -113,7 +113,10 @@ Package `helmsdeep/`:
   (`kps`/`aras`/`ars` plus the Pathfinder run types `aras_pathfinder`/
   `ars_pathfinder`) to a component config: `label`, `endpoint`, `corpus`
   (key into the corpus module), `protocol` (`sync`/`async`), `implemented`, and
-  per-target `stages` + `p99_slo_ms`. Async targets (`ars`, `ars_pathfinder`) add
+  per-target `stages` + `p99_slo_ms` + an optional `cooldown_s` (a quiet gap
+  between stages — users ramp to 0 so slow in-flight queries drain into the stage
+  that launched them instead of bleeding into the next; defaults to 0, set on the
+  expensive ARA/ARS/Pathfinder targets). Async targets (`ars`, `ars_pathfinder`) add
   `messages_endpoint`, `poll_interval_s`, `max_poll_s`. The `*_pathfinder` targets
   reuse the ARA/ARS endpoints + protocols but point at the `pathfinder` corpus and
   ship a gentler ramp + looser SLO (pinned-two-endpoint path-finding is the
@@ -127,10 +130,18 @@ Package `helmsdeep/`:
 - **`trapi_loadtest.py`** — the measurement engine (Locust). The component under
   test is chosen by `LOADTEST_TARGET`; `ENDPOINT`, `CORPUS`, `STAGES`,
   `P99_SLO_MS`, and the async knobs (`PROTOCOL`, `MESSAGES_PATH`,
-  `POLL_INTERVAL_S`, `MAX_POLL_S`) are all derived from `config.TARGETS[...]`.
+  `POLL_INTERVAL_S`, `MAX_POLL_S`) plus `COOLDOWN_S` are all derived from
+  `config.TARGETS[...]`.
   - `StepLoad(LoadTestShape)` — drives the `stages` ramp and marks the active stage.
+    When `COOLDOWN_S` is set it inserts a drain gap between stages (`tick()`
+    returns 0 users in the gap and calls `COLLECTOR.end_active_stage()` to freeze
+    the just-finished stage's end time); an `@events.init` listener sets
+    `stop_timeout = REQUEST_TIMEOUT` so a slow in-flight query finishes rather than
+    being killed when users ramp to 0.
   - `StageCollector` / `COLLECTOR` — buckets every completed request into the
-    stage active when it *finished* (per-stage, per-`qtype`). `record()` also
+    stage active when it *finished* (per-stage, per-`qtype`). Records each stage's
+    wall-clock `stage_started` / `stage_ended` (the latter is `setdefault`, so a
+    cooldown freeze isn't overwritten by the next `mark_stage`). `record()` also
     takes optional ARS signals: `status`, `result_count`, `response_bytes`.
   - `_stage_stats()` — per-stage RPS, percentiles, error rate, Little's-Law
     concurrency. `_ars_stage_health()` — per-stage ARS health row.
@@ -138,9 +149,9 @@ Package `helmsdeep/`:
     blocking `POST`) or `_run_ars()` (submit → poll `/messages/{pk}` with
     `gevent.sleep` until `Done`/`Error`/timeout → `_fetch_merged()` counts
     `fields.data.message.results`). One `COLLECTOR.record` per logical query.
-  - `on_test_stop()` — finds the knee, writes `stages.csv` / `by_qtype.csv` /
-    `summary.json`, and (async only) `ars_health.csv` plus `red_flags` in the
-    summary + printed block.
+  - `on_test_stop()` — finds the knee, writes `stages.csv` (incl. a `stage_start`
+    ISO-8601-UTC column) / `by_qtype.csv` / `summary.json`, and (async only)
+    `ars_health.csv` plus `red_flags` in the summary + printed block.
 - **`trapi_corpus.py`** — the per-component query corpuses:
   - `_qg(nodes, edges, tier=None, bypass_cache=None)` — TRAPI envelope; adds
     scalar `parameters.tier` (KP-only) or top-level `bypass_cache` (ARA/ARS) only
@@ -248,6 +259,10 @@ helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --
 
 - **The shape owns concurrency.** Tune load by editing the per-target `stages`
   in `config.py`, not CLI flags.
+- **Cooldown drains, it doesn't bleed.** With `cooldown_s` set, the gap between
+  stages ramps users to 0; the just-finished stage's end time is frozen so its
+  `duration_s`/RPS reflect the active window, and a slow query still running
+  drains into *that* stage (via `stop_timeout`), keeping the next stage clean.
 - **Closed-loop load.** `TRAPIUser.wait_time = constant(0)` — no think time; users
   hammer the endpoint as fast as responses return.
 - **Don't trust Locust's blended aggregate during a ramp.** We bucket per stage in
