@@ -72,14 +72,25 @@ def main(argv=None):
     if args.csv_prefix:
         env["LOCUST_CSV_PREFIX"] = args.csv_prefix
 
+    # Derive the output prefix exactly as the locustfile does (CLI flag ->
+    # LOCUST_CSV_PREFIX env var -> "trapi_run") so the HTML report file name
+    # lines up with the CSV/JSON outputs.
+    prefix = args.csv_prefix or os.environ.get("LOCUST_CSV_PREFIX") or "trapi_run"
+    html_report = f"{prefix}_report.html"
+
     cmd = [
         sys.executable, "-m", "locust",
         "-f", _LOCUSTFILE,
         "--headless",
         "--host", args.host,
+        # Locust's native self-contained HTML report (charts + request/failure
+        # tables). It's a supplementary visual artifact; the authoritative knee
+        # lives in <prefix>_summary.json (see README "How to read the results").
+        "--html", html_report,
     ]
 
     print(f"Load-testing {tgt['label']} ({args.targets}) at {args.host}{tgt['endpoint']}")
+    print(f"Locust HTML report will be written to {html_report}")
     return subprocess.run(cmd, env=env).returncode
 
 
