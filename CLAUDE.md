@@ -117,7 +117,10 @@ Package `helmsdeep/`:
   between stages — users ramp to 0 so slow in-flight queries drain into the stage
   that launched them instead of bleeding into the next; defaults to 0, set on the
   expensive ARA/ARS/Pathfinder targets). Async targets (`ars`, `ars_pathfinder`) add
-  `messages_endpoint`, `poll_interval_s`, `max_poll_s`. The `*_pathfinder` targets
+  `messages_endpoint`, `poll_interval_s`, `max_poll_s`, and an optional
+  `completion_max_poll_s` (>= `max_poll_s`; the extended cap for the completion
+  sidecar — how long a background poller keeps watching a timed-out query to see if
+  it *eventually* finishes; defaults to `max_poll_s` = off). The `*_pathfinder` targets
   reuse the ARA/ARS endpoints + protocols but point at the `pathfinder` corpus and
   ship a gentler ramp + looser SLO (pinned-two-endpoint path-finding is the
   heaviest query class). `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
@@ -148,10 +151,17 @@ Package `helmsdeep/`:
   - `TRAPIUser(HttpUser)` — dispatches on `PROTOCOL`: `_run_sync()` (KP/ARA: one
     blocking `POST`) or `_run_ars()` (submit → poll `/messages/{pk}` with
     `gevent.sleep` until `Done`/`Error`/timeout → `_fetch_merged()` counts
-    `fields.data.message.results`). One `COLLECTOR.record` per logical query.
-  - `on_test_stop()` — finds the knee, writes `stages.csv` (incl. a `stage_start`
-    ISO-8601-UTC column) / `by_qtype.csv` / `summary.json`, and (async only)
-    `ars_health.csv` plus `red_flags` in the summary + printed block.
+    `fields.data.message.results`). One `COLLECTOR.record` per logical query. When a
+    query blows `MAX_POLL_S` (already recorded as a Timeout failure — main stats
+    unchanged), `_run_ars` spawns a detached `_extended_poll` greenlet that keeps
+    polling to `COMPLETION_MAX_POLL_S` and appends one `COLLECTOR.record_completion`
+    row (end-to-end time + whether it `finished`); queries that finish within
+    `MAX_POLL_S` record their completion row inline.
+  - `on_test_stop()` — drains any in-flight completion greenlets (bounded), finds
+    the knee, writes `stages.csv` (incl. a `stage_start` ISO-8601-UTC column) /
+    `by_qtype.csv` / `summary.json`, and (async only) `ars_health.csv`, the
+    `ars_completion.csv` sidecar, plus `red_flags` + a `completion` roll-up in the
+    summary + printed block.
 - **`trapi_corpus.py`** — the per-component query corpuses:
   - `_qg(nodes, edges, tier=None, bypass_cache=None)` — TRAPI envelope; adds
     scalar `parameters.tier` (KP-only) or top-level `bypass_cache` (ARA/ARS) only
@@ -252,8 +262,9 @@ helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --
   `--csv-prefix` flag — set `LOCUST_CSV_PREFIX` instead.
 - Outputs (written by the master/standalone node only):
   `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json` (+
-  `<prefix>_ars_health.csv` and a `red_flags` list for the `ars` target), plus a
-  printed summary table with the knee.
+  `<prefix>_ars_health.csv`, the `<prefix>_ars_completion.csv` sidecar, and a
+  `red_flags` list + `completion` roll-up for the `ars` target), plus a printed
+  summary table with the knee.
 
 ## Conventions & gotchas
 
@@ -285,6 +296,18 @@ helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --
   `ars_merge` GET, which times just the final merge fetch, not the whole query).
   A `Done` that returns **0 results counts as a failure** (and raises a red
   flag); a non-terminal status past `max_poll_s` is a `Timeout` failure.
+- **Completion tracking is a sidecar, not a metric change.** `max_poll_s` stays the
+  failure threshold for the main stats and the knee — a query not terminal by then
+  is a `Timeout` failure, exactly as before. Separately, `completion_max_poll_s`
+  (>= `max_poll_s`, default 10 min on `ars`/`ars_pathfinder`) lets a **detached
+  background greenlet** keep polling that same query to see if it *eventually*
+  finishes; the outcome (end-to-end time + `finished`/`within_slo`/`status`) goes
+  only to `<prefix>_ars_completion.csv` and the `completion` summary roll-up. It
+  never feeds the per-stage stats, the `ars_query` event, or the knee, so existing
+  measurements are unchanged. The greenlets are drained (bounded by the extra
+  budget) in `on_test_stop`; queries still unfinished at shutdown are simply absent
+  from the sidecar. This separates *slow* (finished after the SLO) from *broken*
+  (never finished).
 - **Inferred corpus mixes MVP1 + MVP2 and varies entities per request.** MVP1
   (`mvp1_heavy/medium/light`, treats-disease) samples a tiered disease; MVP2
   (`mvp2_chem_affects_gene`/`mvp2_chem_affects_open_gene`, a chemical→gene

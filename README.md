@@ -82,6 +82,9 @@ Written to the working directory by the standalone/master node:
 - `<prefix>_summary.json` — config (including which `target` was measured), all
   stages, and the chosen knee
 - `<prefix>_ars_health.csv` — **ARS only**: per-stage health signals (see below)
+- `<prefix>_ars_completion.csv` — **ARS only**: one row per logical query with its
+  end-to-end response time and whether it *eventually* finished — polled past the
+  `max_poll_s` failure threshold up to `completion_max_poll_s` (see below)
 - `<prefix>_report.html` — Locust's native, self-contained **HTML report**
   (latency-over-time charts, request/failure tables). Open it in any browser. See
   the caveat under ["How to read the results"](#how-to-read-the-results): its
@@ -115,6 +118,36 @@ flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
 - **response size** (merged-message bytes, mean/max);
 - **result drop under load** — flagged when the mean result count falls sharply
   as concurrency rises across stages.
+
+### ARS completion tracking (`ars_completion.csv`)
+
+`max_poll_s` (default 6 min for `ars`) is the **failure threshold**: a query that
+hasn't reached a terminal status by then is recorded as a `Timeout` failure in the
+main stats and the knee — unchanged. But a timed-out query isn't necessarily
+*stuck*; the ARS may still finish it, just slowly. To capture that, once a query
+blows `max_poll_s` a **background poller keeps watching it** up to
+`completion_max_poll_s` (default 10 min) and records the outcome to
+`<prefix>_ars_completion.csv` — one row per logical query:
+
+- `total_response_s` — true end-to-end submit→terminal time (up to
+  `completion_max_poll_s`);
+- `finished` — whether it ever reached a terminal status (`Done` or `Error`);
+- `within_slo` — whether it finished inside `max_poll_s` (i.e. was **not** a
+  Timeout failure in the main stats); a slow-but-eventually-done query is
+  `finished=True, within_slo=False`;
+- `status` — the terminal status (`Done`/`Error`/`Timeout`/`SubmitError`/`NoPK`).
+
+`summary.json` carries a `completion` roll-up (finished, finished-within-SLO,
+finished-after-SLO, never-finished, submit-failed), and two red flags surface the
+key distinctions: queries that **exceeded the SLO but did finish** (slow, not
+stuck) and queries that **never finished** even within `completion_max_poll_s`.
+This separates *slow* from *broken* — a service that eventually answers every
+query is degraded differently than one that drops them. Set
+`completion_max_poll_s` equal to (or omit it, defaulting to) `max_poll_s` to turn
+extended tracking off; the sidecar then just marks each timed-out query
+`finished=False`. Any query still being polled when the test ends is drained for a
+bounded window at shutdown; ones still unfinished after that are absent from the
+file.
 
 ## How to read the results
 
