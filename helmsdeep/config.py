@@ -129,8 +129,8 @@ TARGETS = {
     },
     "ars_pathfinder": {
         "label": "ARS (Pathfinder)",
-        "endpoint": "/submit",
-        "messages_endpoint": "/messages",
+        "endpoint": "/ars/api/submit",
+        "messages_endpoint": "/ars/api/messages",
         "corpus": "pathfinder",
         "protocol": "async",
         "implemented": True,
