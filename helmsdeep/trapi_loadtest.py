@@ -17,10 +17,15 @@ capturing health signals (result-count variation, zero-result "Done" responses,
 response size, result-drop-under-load) and surfacing them as red flags.
 
 Outputs:
-  - <prefix>_stages.csv      one row per stage (overall)
-  - <prefix>_by_qtype.csv    one row per (stage, qtype)
-  - <prefix>_ars_health.csv  ARS only: per-stage health signals
-  - <prefix>_summary.json    config, all stages, the knee (+ ars_health/red_flags)
+  - <prefix>_stages.csv         one row per stage (overall)
+  - <prefix>_by_qtype.csv       one row per (stage, qtype)
+  - <prefix>_ars_health.csv     ARS only: per-stage health signals
+  - <prefix>_ars_completion.csv ARS only: per-query end-to-end response time +
+                                whether it eventually finished (polled past the
+                                max_poll_s failure threshold up to
+                                completion_max_poll_s)
+  - <prefix>_summary.json       config, all stages, the knee (+ ars_health/
+                                completion/red_flags)
 
 Usage (headless, recommended for reproducible numbers):
 
@@ -67,6 +72,15 @@ PROTOCOL = _TGT.get("protocol", "sync")
 MESSAGES_PATH = _TGT.get("messages_endpoint", "/messages")
 POLL_INTERVAL_S = _TGT.get("poll_interval_s", 10)
 MAX_POLL_S = _TGT.get("max_poll_s", 900)
+# Extended cap (>= MAX_POLL_S) for the completion sidecar: after a query blows
+# MAX_POLL_S (already a Timeout failure in the main stats), a background greenlet
+# keeps polling up to here to record whether it *eventually* finishes. Defaults
+# to MAX_POLL_S, i.e. no extended tracking.
+COMPLETION_MAX_POLL_S = max(_TGT.get("completion_max_poll_s", MAX_POLL_S), MAX_POLL_S)
+
+# Detached greenlets still polling timed-out queries for the completion sidecar;
+# on_test_stop drains them (bounded) so their rows make it into the file.
+_COMPLETION_GREENLETS = []
 
 # Optional quiet gap between stages (users ramp to 0) so slow in-flight queries
 # drain into the stage that launched them instead of bleeding into the next one.
@@ -102,6 +116,10 @@ class StageCollector:
         self.result_counts = defaultdict(lambda: defaultdict(list))   # answers per query
         self.response_bytes = defaultdict(lambda: defaultdict(list))  # merged-msg size
         self.statuses = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # status -> n
+        # ARS completion sidecar: one row per logical query -- did it eventually
+        # finish (polled up to COMPLETION_MAX_POLL_S, beyond the max_poll_s
+        # failure threshold) and its true end-to-end response time.
+        self.completions = []
 
     def mark_stage(self, idx):
         if idx != self.stage_idx:
@@ -138,6 +156,26 @@ class StageCollector:
         if response_bytes is not None:
             self.response_bytes[s][qtype].append(response_bytes)
             self.response_bytes[s]["__all__"].append(response_bytes)
+
+    def record_completion(self, *, stage, qtype, total_ms, finished, status,
+                          start_ts):
+        """Record one ARS completion-sidecar row. `finished` == the query reached
+        a terminal status (Done or Error); the `status` column preserves which.
+        Purely a sidecar -- never feeds the per-stage stats or the knee.
+        """
+        self.completions.append({
+            "query": len(self.completions),
+            "stage": stage,
+            "qtype": qtype,
+            "submit_start": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                          time.gmtime(start_ts)),
+            "total_response_s": round(total_ms / 1000.0, 2),
+            "finished": finished,
+            # Whether it finished inside the max_poll_s SLO window (i.e. was NOT a
+            # Timeout in the main stats); slow-but-eventually-done => False.
+            "within_slo": bool(finished and total_ms <= MAX_POLL_S * 1000.0),
+            "status": status,
+        })
 
 
 COLLECTOR = StageCollector()
@@ -275,6 +313,48 @@ class TRAPIUser(HttpUser):
             context={"qtype": qtype},
         )
 
+    def _record_completion(self, qtype, start, finished, status, stage):
+        """Append one completion-sidecar row for a logical ARS query."""
+        COLLECTOR.record_completion(
+            stage=stage, qtype=qtype,
+            total_ms=(time.time() - start) * 1000.0,
+            finished=finished, status=status, start_ts=start,
+        )
+
+    def _extended_poll(self, qtype, pk, start, stage):
+        """Background greenlet: a query already blew MAX_POLL_S (and is already a
+        Timeout failure in the main stats). Keep polling up to
+        COMPLETION_MAX_POLL_S to record, in the sidecar only, whether it
+        *eventually* reaches a terminal status and its true end-to-end time.
+        Never touches the per-stage stats, the ars_query event, or the knee.
+        """
+        deadline = start + COMPLETION_MAX_POLL_S
+        status = None
+        try:
+            while time.time() < deadline:
+                gevent.sleep(POLL_INTERVAL_S)
+                try:
+                    with self.client.get(
+                        f"{MESSAGES_PATH}/{pk}?trace=y", name="ars_poll",
+                        timeout=REQUEST_TIMEOUT, catch_response=True,
+                    ) as resp:
+                        if resp.status_code != 200:
+                            resp.failure(f"poll status {resp.status_code}")
+                            continue
+                        resp.success()
+                        status = (resp.json() or {}).get("status")
+                        if status in ("Done", "Error"):
+                            break
+                except Exception:
+                    continue   # transient; keep polling until the deadline
+        finally:
+            self._record_completion(
+                qtype, start,
+                finished=(status in ("Done", "Error")),
+                status=(status if status in ("Done", "Error") else "Timeout"),
+                stage=stage,
+            )
+
     def _run_ars(self, qtype, payload):
         """ARS: submit -> poll /messages/{pk} until terminal -> fetch merged.
 
@@ -299,6 +379,8 @@ class TRAPIUser(HttpUser):
                 self._record_ars(qtype, _elapsed_ms(), True,
                                  f"submit status {resp.status_code}",
                                  status="SubmitError")
+                self._record_completion(qtype, start, False, "SubmitError",
+                                        COLLECTOR.stage_idx)
                 return
             try:
                 pk = (resp.json() or {}).get("pk")
@@ -308,6 +390,8 @@ class TRAPIUser(HttpUser):
                 resp.failure("no pk in submit response")
                 self._record_ars(qtype, _elapsed_ms(), True,
                                  "no pk in submit response", status="NoPK")
+                self._record_completion(qtype, start, False, "NoPK",
+                                        COLLECTOR.stage_idx)
                 return
             resp.success()
 
@@ -334,7 +418,9 @@ class TRAPIUser(HttpUser):
                 if status in ("Done", "Error"):
                     break
 
-        # 3) Terminal handling.
+        # 3) Terminal handling. The stage active now is what the main measurement
+        # is attributed to; the completion sidecar row uses the same stage.
+        stage = COLLECTOR.stage_idx
         if status == "Done":
             result_count, nbytes = self._fetch_merged(merged_pk)
             self._record_ars(
@@ -342,13 +428,24 @@ class TRAPIUser(HttpUser):
                 exc_msg=("Done with 0 results" if result_count == 0 else None),
                 status="Done", result_count=result_count, response_bytes=nbytes,
             )
+            self._record_completion(qtype, start, True, "Done", stage)
         elif status == "Error":
             self._record_ars(qtype, _elapsed_ms(), True, "ARS Error status",
                              status="Error")
+            self._record_completion(qtype, start, True, "Error", stage)
         else:
+            # Not terminal within MAX_POLL_S: fail the main measurement now
+            # (unchanged). Then, if an extended cap is configured, keep polling in
+            # the background up to COMPLETION_MAX_POLL_S to record whether it ever
+            # finishes -- purely for the completion sidecar.
             self._record_ars(qtype, _elapsed_ms(), True,
                              f"no terminal status within {MAX_POLL_S}s",
                              status="Timeout")
+            if COMPLETION_MAX_POLL_S > MAX_POLL_S:
+                g = gevent.spawn(self._extended_poll, qtype, pk, start, stage)
+                _COMPLETION_GREENLETS.append(g)
+            else:
+                self._record_completion(qtype, start, False, "Timeout", stage)
 
     def _fetch_merged(self, merged_pk):
         """Fetch the merged message; return (result_count, response_bytes)."""
@@ -430,6 +527,17 @@ def on_test_stop(environment, **_kw):
 
     COLLECTOR.stage_ended.setdefault(COLLECTOR.stage_idx, time.time())
 
+    # Drain any in-flight completion-sidecar polls (queries that blew MAX_POLL_S
+    # and are still being watched for eventual completion), bounded by the extra
+    # budget, so their rows land in the sidecar. Queries still unfinished after
+    # this are simply absent from the file.
+    pending = [g for g in _COMPLETION_GREENLETS if not g.dead]
+    if pending:
+        extra = max(0, COMPLETION_MAX_POLL_S - MAX_POLL_S)
+        print(f"Waiting up to {extra}s for {len(pending)} ARS completion "
+              f"poll(s) still in flight...")
+        gevent.joinall(pending, timeout=extra)
+
     overall_rows = []
     qtype_rows = []
     seen_stages = sorted(COLLECTOR.requests.keys())
@@ -451,7 +559,26 @@ def on_test_stop(environment, **_kw):
     # ARS health signals + red flags (async target only).
     ars_health = []
     red_flags = []
+    completions = COLLECTOR.completions if PROTOCOL == "async" else []
+    completion_summary = None
     if PROTOCOL == "async":
+        finished = sum(1 for r in completions if r["finished"])
+        within = sum(1 for r in completions if r["within_slo"])
+        late = finished - within   # blew MAX_POLL_S but done by COMPLETION_MAX_POLL_S
+        never = sum(1 for r in completions
+                    if not r["finished"] and r["status"] == "Timeout")
+        submit_failed = sum(1 for r in completions
+                            if r["status"] in ("SubmitError", "NoPK"))
+        completion_summary = {
+            "total_queries": len(completions),
+            "finished": finished,
+            "finished_within_slo": within,
+            "finished_after_slo": late,
+            "never_finished": never,
+            "submit_failed": submit_failed,
+            "max_poll_s": MAX_POLL_S,
+            "completion_max_poll_s": COMPLETION_MAX_POLL_S,
+        }
         ars_health = [_ars_stage_health(idx) for idx in seen_stages]
         prev = None
         for h in ars_health:
@@ -485,6 +612,17 @@ def on_test_stop(environment, **_kw):
                     f"the system may be shedding answers as concurrency rises.")
             prev = h
 
+        # Completion-tracking red flags (from the sidecar).
+        if completion_summary and completion_summary["finished_after_slo"]:
+            red_flags.append(
+                f"{completion_summary['finished_after_slo']} query/queries exceeded "
+                f"the {MAX_POLL_S}s SLO but did finish within "
+                f"{COMPLETION_MAX_POLL_S}s (slow, not stuck).")
+        if completion_summary and completion_summary["never_finished"]:
+            red_flags.append(
+                f"{completion_summary['never_finished']} query/queries never reached "
+                f"a terminal status even within {COMPLETION_MAX_POLL_S}s.")
+
     # Write overall CSV.
     fields = ["stage", "users", "stage_start", "requests", "errors", "error_rate",
               "duration_s", "rps", "mean_ms", "p50_ms", "p95_ms", "p99_ms",
@@ -513,6 +651,17 @@ def on_test_stop(environment, **_kw):
             for r in ars_health:
                 f.write(",".join(str(r[k]) for k in hfields) + "\n")
 
+    # Write ARS completion sidecar (async target only): one row per logical query
+    # -- end-to-end response time + whether it eventually finished (polled up to
+    # COMPLETION_MAX_POLL_S, beyond the max_poll_s failure threshold).
+    cfields = ["query", "stage", "qtype", "submit_start", "total_response_s",
+               "finished", "within_slo", "status"]
+    if completions:
+        with open(f"{CSV_PREFIX}_ars_completion.csv", "w") as f:
+            f.write(",".join(cfields) + "\n")
+            for r in completions:
+                f.write(",".join(str(r[k]) for k in cfields) + "\n")
+
     summary = {
         "config": {
             "target": TARGET,
@@ -530,6 +679,7 @@ def on_test_stop(environment, **_kw):
     }
     if PROTOCOL == "async":
         summary["ars_health"] = ars_health
+        summary["completion"] = completion_summary
         summary["red_flags"] = red_flags
     with open(f"{CSV_PREFIX}_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -563,6 +713,16 @@ def on_test_stop(environment, **_kw):
             print(f"{h['stage']:>3} {h['requests']:>4} {h['done']:>5} "
                   f"{h['errored']:>4} {h['timed_out']:>4} {h['zero_result_done']:>5} "
                   f"{h['results_mean']:>9} {h['results_cv']:>7} {h['bytes_max']:>10}")
+        if completion_summary:
+            c = completion_summary
+            print("-" * 64)
+            print(f"COMPLETION TRACKING (polled to {COMPLETION_MAX_POLL_S}s; "
+                  f"{MAX_POLL_S}s = failure threshold)")
+            print(f"  {c['total_queries']} queries: {c['finished']} finished "
+                  f"({c['finished_within_slo']} within {MAX_POLL_S}s, "
+                  f"{c['finished_after_slo']} after), "
+                  f"{c['never_finished']} never finished, "
+                  f"{c['submit_failed']} submit-failed")
         print("-" * 64)
         if red_flags:
             print(f"RED FLAGS ({len(red_flags)}):")
@@ -571,6 +731,8 @@ def on_test_stop(environment, **_kw):
         else:
             print("RED FLAGS: none detected.")
         wrote.append(f"{CSV_PREFIX}_ars_health.csv")
+        if completions:
+            wrote.append(f"{CSV_PREFIX}_ars_completion.csv")
     wrote.append(f"{CSV_PREFIX}_summary.json")
     print(f"Wrote: {', '.join(wrote)}")
     print("=" * 64 + "\n")
