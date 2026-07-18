@@ -49,8 +49,10 @@ ASTHMA = "MONDO:0004979"
 LEVODOPA = "CHEBI:15765"
 DONEPEZIL = "CHEBI:53289"
 ALBUTEROL = "CHEBI:2549"       # salbutamol
+HUNTINGTON = "MONDO:0007739"
+SKIN_VASCULAR_DISEASE = "MONDO:0019293"
 
-DISEASE_BATCH = [T2D, ALZHEIMERS, PARKINSONS, ASTHMA, "MONDO:0007739"]  # +Huntington
+DISEASE_BATCH = [T2D, ALZHEIMERS, PARKINSONS, ASTHMA, HUNTINGTON, SKIN_VASCULAR_DISEASE]
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +68,7 @@ DISEASE_BATCH = [T2D, ALZHEIMERS, PARKINSONS, ASTHMA, "MONDO:0007739"]  # +Hunti
 # labels are already in place, so that refinement is a data change, not a code
 # change.
 # ---------------------------------------------------------------------------
-HEAVY_DISEASES = [T2D, ASTHMA, ALZHEIMERS, PARKINSONS, "MONDO:0007739"]
+HEAVY_DISEASES = [T2D, ASTHMA, ALZHEIMERS, PARKINSONS, HUNTINGTON, SKIN_VASCULAR_DISEASE]
 
 
 def _load_disease_pool():
