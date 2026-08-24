@@ -51,10 +51,22 @@ helmsdeep --targets aras_pathfinder \
 helmsdeep --targets ars_pathfinder \
     --host https://ars.ci.transltr.io/ars/api \
     --csv-prefix pf1
+
+# Mixed capacity profile (ARA/ARS only) — 2/3 inferred MVP1+MVP2, 1/3 Pathfinder
+# in one blended workload, ramped to 30 → 45 → 60 concurrent users and judged
+# against pass/fail acceptance checkpoints.
+helmsdeep --targets aras_mixed \
+    --host https://your-ara-service.example.org \
+    --csv-prefix mix1
+helmsdeep --targets ars_mixed \
+    --host https://ars.ci.transltr.io/ars/api \
+    --csv-prefix mix1
 ```
 
-- `--targets` selects the layer: `kps` (Retriever), `aras` (Shepherd), `ars`, or
-  the Pathfinder run types `aras_pathfinder` / `ars_pathfinder` (ARA/ARS only).
+- `--targets` selects the layer: `kps` (Retriever), `aras` (Shepherd), `ars`, the
+  Pathfinder run types `aras_pathfinder` / `ars_pathfinder` (ARA/ARS only), or the
+  mixed capacity profile `aras_mixed` / `ars_mixed` (ARA/ARS only — see
+  ["Mixed capacity profile"](#mixed-capacity-profile-aras_mixed--ars_mixed)).
 - `--host` is **required** — the base URL of the target service. For `kps`/`aras`
   the `/query` path is appended; for `ars` the host is the API base and the tool
   uses `/submit` then `/messages/{pk}`.
@@ -80,7 +92,9 @@ Written to the working directory by the standalone/master node:
   `stage_start` column with the stage's wall-clock start time (ISO 8601 UTC)
 - `<prefix>_by_qtype.csv` — one row per (stage, query type)
 - `<prefix>_summary.json` — config (including which `target` was measured), all
-  stages, and the chosen knee
+  stages, and the chosen knee (plus `checkpoints` for targets that define them)
+- `<prefix>_checkpoints.csv` — **targets with acceptance criteria** (`aras_mixed`
+  / `ars_mixed`): one row per checkpoint with its `PASS` / `FAIL` verdict
 - `<prefix>_ars_health.csv` — **ARS only**: per-stage health signals (see below)
 - `<prefix>_ars_completion.csv` — **ARS only**: one row per logical query with its
   end-to-end response time and whether it *eventually* finished — polled past the
@@ -94,6 +108,57 @@ Written to the working directory by the standalone/master node:
 
 For a guide to interpreting every one of these — written for non-specialists —
 see ["How to read the results"](#how-to-read-the-results) below.
+
+### Mixed capacity profile (`aras_mixed` / `ars_mixed`)
+
+Every other target characterizes **one** query class in isolation to *find* the
+knee. The mixed profile answers a different, operational question: **can the
+system hold a target concurrency when both query classes arrive together, the way
+they do in production?**
+
+- **Corpus** — one blended workload: **2/3 inferred MVP1+MVP2** creative queries
+  and **1/3 Pathfinder**. MVP1/MVP2 keep their relative `SHEPHERD_CORPUS` weights
+  (so retuning that mix carries over); only the 2:1 split is imposed.
+  `by_qtype.csv` still breaks the two classes out separately, so you can see
+  which one drives the tail.
+- **Ramp** — a short low-load baseline stage, then the three concurrency levels
+  the profile exists to judge: **30 → 45 → 60** simultaneous users. The baseline
+  exists so a failure at 30 can be read against a healthy reference (is 30 slow,
+  or is *everything* slow?).
+- **Verdict** — each level carries pass/fail **acceptance checkpoints** instead of
+  only feeding the knee:
+
+  | Users | Goal | Criteria |
+  |-------|------|----------|
+  | **30** | sustain peak load | p99 ≤ 300 000 ms **and** errors ≤ 1% |
+  | **45** | headroom above peak | p99 ≤ 300 000 ms **and** errors ≤ 1% |
+  | **60** | no substantial failures under overload | errors ≤ 5% (latency **not** judged — slowdown is expected here, failures are not) |
+
+The verdicts land in `<prefix>_checkpoints.csv`, in `summary.json` (`checkpoints`
+plus a single `checkpoints_passed` boolean), and in the printed report:
+
+```
+ACCEPTANCE CHECKPOINTS
+ usr      p99      bar   err%    bar  verdict  goal
+  30   184203   300000    0.4    1.0     PASS  sustain peak load
+  45   291560   300000    0.9    1.0     PASS  headroom above peak
+  60   402118      n/a    3.1    5.0     PASS  no substantial failures under overload
+RESULT: all 3 checkpoints met.
+```
+
+A missed checkpoint prints why (`-> p99 331402ms > 300000ms`) and makes the run
+**exit non-zero**, so it can gate a CI/acceptance job. A checkpoint whose stage
+recorded no completed requests is reported as `NO DATA` rather than a silent pass.
+The knee is still computed and reported alongside, unchanged.
+
+Checkpoints are a generic per-target feature (`checkpoints` in `config.py`), not
+special-cased to this profile: any target can define them, and targets that don't
+behave exactly as before. Edit the users, goals, and bars there — the ARA and ARS
+variants carry the same three checkpoints so the two layers are directly
+comparable.
+
+> **Layering still applies:** `ars_mixed` fans out to the ARAs, so run one or the
+> other — never both at once.
 
 ### ARS async workflow and health signals
 
@@ -168,6 +233,7 @@ without the jargon:
 | **mean / p50 / p95 / p99** | Different ways to summarize latency. *mean* is the average. *p50* (median) is the typical query. *p95* / *p99* are the slow tail: "95% (or 99%) of queries were at least this fast." p99 is the one we hold to a standard, because it captures the bad experiences, not just the average. |
 | **Error rate** | The fraction of queries that failed (e.g. `0.02` = 2%). For the ARS, a query that finishes but returns **zero answers** also counts as a failure. |
 | **SLO** | Service Level Objective — the line in the sand for "acceptable." Here it's a p99 latency cap (e.g. `60000` ms = 60 s) plus a max error rate (default **1%**). A stage "passes" only if it stays under both. |
+| **Checkpoint** | A pass/fail question asked of one specific load level ("does 30 simultaneous users still work?"), with its own latency/error bars. Only the mixed capacity profile defines these; other runs just report the knee. |
 | **Knee** | The highest-load stage that still passes the SLO. It's the headline result: the most simultaneous users the service handled while staying fast enough and reliable enough. Past the knee, things fall apart. |
 
 ### Start here: `summary.json`
@@ -186,6 +252,11 @@ set tighter than the service can ever meet).
 
 The same file also echoes the **`config`** that produced the run (which target,
 which endpoint, the SLO, the ramp stages) so a result is self-documenting.
+
+On a run with acceptance criteria (`aras_mixed` / `ars_mixed`), two more fields
+answer the pass/fail question directly: **`checkpoints_passed`** (one boolean for
+the whole run) and **`checkpoints`** (per-level verdicts and why). See
+["Mixed capacity profile"](#mixed-capacity-profile-aras_mixed--ars_mixed).
 
 ### Reading `stages.csv` — the story of the ramp
 
@@ -298,6 +369,16 @@ quick visual feel and for sharing a screenshot.
   `Done` is a failure). It's the heaviest query class, so its targets ship the
   gentlest ramps and loosest SLOs (and, for `ars_pathfinder`, the longest
   `max_poll_s`); tune them in `config.py`.
+- **The mixed profile blends the two ARA/ARS classes** (`aras_mixed` /
+  `ars_mixed`). `MIXED_CORPUS` is *computed* from `SHEPHERD_CORPUS` +
+  `PATHFINDER_CORPUS` at the `INFERRED_PATHFINDER_RATIO` (2:1), so it tracks any
+  retuning of the inferred mix. Change the blend by editing that ratio; change
+  what counts as a pass by editing the per-target `checkpoints` in `config.py`.
+  Because 1/3 of the mix is Pathfinder — the heaviest class — and p99 is a tail
+  statistic, both mixed targets inherit the looser Pathfinder SLO. `aras_mixed`
+  also raises `request_timeout_s` above the default 210 s: a sync target whose p99
+  SLO sits near the HTTP timeout records slow queries as client timeouts (errors)
+  instead of latencies.
 - **Adjust corpus weights** in `RETRIEVER_CORPUS` / `SHEPHERD_CORPUS` to match
   your traffic mix.
 

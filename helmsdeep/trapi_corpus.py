@@ -35,6 +35,7 @@ avoid the cache-warming artifact of repeating one entity.
 """
 
 import json
+import math
 import os
 import random
 
@@ -477,11 +478,53 @@ PATHFINDER_CORPUS = [
     ("pathfinder_drug_disease", pathfinder_drug_disease, 100),
 ]
 
+
+# ----------------------------------------------------------------------------
+# Mixed (ARA/ARS only): a realistic blended workload -- 2/3 inferred MVP1+MVP2
+# creative queries, 1/3 Pathfinder. The dedicated `shepherd`/`pathfinder`
+# corpuses characterize ONE query class in isolation; this one asks the
+# operational question instead: can the system hold a target concurrency when
+# both classes arrive together, as they do in production?
+#
+# The split is computed rather than hand-written: MVP1/MVP2 keep their relative
+# SHEPHERD_CORPUS weights (so retuning that mix propagates here) and Pathfinder
+# is scaled to half their combined weight, i.e. 1/3 of the whole.
+# ----------------------------------------------------------------------------
+# Inferred : Pathfinder weight ratio of the blended corpus -- 2/3 MVP1+MVP2,
+# 1/3 Pathfinder.
+INFERRED_PATHFINDER_RATIO = (2, 1)
+
+
+def _mixed_corpus(inferred=None, pathfinder=None, ratio=INFERRED_PATHFINDER_RATIO):
+    """Blend the inferred and Pathfinder corpuses at a fixed ratio of shares.
+
+    Relative weights *within* each corpus are preserved (so retuning the MVP1/MVP2
+    mix in SHEPHERD_CORPUS propagates here); only the split between the two
+    corpuses is imposed. Weights are relative, so each side is scaled by an
+    integer factor -- cross-multiplying by the other side's total makes the
+    requested ratio exact regardless of how either corpus is weighted internally.
+    """
+    inferred = SHEPHERD_CORPUS if inferred is None else inferred
+    pathfinder = PATHFINDER_CORPUS if pathfinder is None else pathfinder
+    a, b = ratio
+    inferred_total = sum(w for _, _, w in inferred)
+    pathfinder_total = sum(w for _, _, w in pathfinder)
+    inf_scale = a * pathfinder_total
+    pf_scale = b * inferred_total
+    g = math.gcd(inf_scale, pf_scale)          # keep the flattened list small
+    inf_scale, pf_scale = inf_scale // g, pf_scale // g
+    return ([(qt, bld, w * inf_scale) for qt, bld, w in inferred]
+            + [(qt, bld, w * pf_scale) for qt, bld, w in pathfinder])
+
+
+MIXED_CORPUS = _mixed_corpus()
+
 CORPUS_BY_NAME = {
     "retriever": RETRIEVER_CORPUS,
     "shepherd": SHEPHERD_CORPUS,
     "ars": ARS_CORPUS,
     "pathfinder": PATHFINDER_CORPUS,
+    "mixed": MIXED_CORPUS,
 }
 
 

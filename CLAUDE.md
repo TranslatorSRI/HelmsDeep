@@ -54,9 +54,14 @@ subset. The tool must route the correct corpus + protocol per target.
 only** (never KPs). It pins **two** endpoint entities and asks for connecting
 paths via a `paths` map in the query_graph (not `edges`; no `knowledge_type`). It
 gets its **own run types** — `aras_pathfinder` (sync, via the ARA `/query`) and
-`ars_pathfinder` (async, via the ARS submit/poll/merge) — so it's never mixed into
-the inferred corpus. Same protocols/endpoints as `aras`/`ars`, just a different
-corpus + a gentler ramp / looser SLO.
+`ars_pathfinder` (async, via the ARS submit/poll/merge) — so the single-class
+targets never mix it into the inferred corpus. Same protocols/endpoints as
+`aras`/`ars`, just a different corpus + a gentler ramp / looser SLO.
+
+The one place the classes *are* combined is the **mixed capacity profile**
+(`aras_mixed`/`ars_mixed`): a deliberate 2/3 inferred + 1/3 Pathfinder blend that
+asks whether the system holds a target concurrency under the workload mix
+production actually sends, rather than characterizing one class in isolation.
 
 ### Retriever and the `tier` parameter
 
@@ -110,8 +115,9 @@ sent (`lookup` for KPs, `inferred` for ARAs/ARS) — both selected from
 Package `helmsdeep/`:
 
 - **`config.py`** — the target registry. `TARGETS` maps each `--targets` value
-  (`kps`/`aras`/`ars` plus the Pathfinder run types `aras_pathfinder`/
-  `ars_pathfinder`) to a component config: `label`, `endpoint`, `corpus`
+  (`kps`/`aras`/`ars`, the Pathfinder run types `aras_pathfinder`/
+  `ars_pathfinder`, and the mixed capacity profile `aras_mixed`/`ars_mixed`) to a
+  component config: `label`, `endpoint`, `corpus`
   (key into the corpus module), `protocol` (`sync`/`async`), `implemented`, and
   per-target `stages` + `p99_slo_ms` + an optional `cooldown_s` (a quiet gap
   between stages — users ramp to 0 so slow in-flight queries drain into the stage
@@ -123,7 +129,12 @@ Package `helmsdeep/`:
   it *eventually* finishes; defaults to `max_poll_s` = off). The `*_pathfinder` targets
   reuse the ARA/ARS endpoints + protocols but point at the `pathfinder` corpus and
   ship a gentler ramp + looser SLO (pinned-two-endpoint path-finding is the
-  heaviest query class). `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
+  heaviest query class). The `*_mixed` targets add two more optional fields:
+  `request_timeout_s` (per-HTTP-call timeout, default 210; raised on `aras_mixed`
+  so its 5-min p99 SLO is measurable instead of landing as client timeouts) and
+  `checkpoints` — a list of pass/fail acceptance criteria (`users`, `goal`,
+  `p99_slo_ms`, `max_error_rate`) evaluated against the stage that ran that many
+  users. `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
   Per-target ramps/SLOs live here because cost profiles differ wildly by layer.
 - **`cli.py`** — the `helmsdeep` entry point (registered in
   `setup.py` `console_scripts`). Parses `--targets` (required, one layer),
@@ -157,11 +168,18 @@ Package `helmsdeep/`:
     polling to `COMPLETION_MAX_POLL_S` and appends one `COLLECTOR.record_completion`
     row (end-to-end time + whether it `finished`); queries that finish within
     `MAX_POLL_S` record their completion row inline.
+  - `_evaluate_checkpoints()` — for targets that configure `checkpoints`, judges
+    each one against the stage matching its user count and returns a
+    `PASS`/`FAIL`/`NO DATA` verdict (a checkpoint's `p99_slo_ms` defaults to the
+    target's; explicit `None` means latency isn't judged — an overload probe where
+    slowdown is expected but failures aren't).
   - `on_test_stop()` — drains any in-flight completion greenlets (bounded), finds
     the knee, writes `stages.csv` (incl. a `stage_start` ISO-8601-UTC column) /
-    `by_qtype.csv` / `summary.json`, and (async only) `ars_health.csv`, the
-    `ars_completion.csv` sidecar, plus `red_flags` + a `completion` roll-up in the
-    summary + printed block.
+    `by_qtype.csv` / `summary.json`, (checkpointed targets only)
+    `checkpoints.csv` + `checkpoints`/`checkpoints_passed` in the summary and a
+    printed verdict block that sets `environment.process_exit_code = 1` on any
+    miss, and (async only) `ars_health.csv`, the `ars_completion.csv` sidecar,
+    plus `red_flags` + a `completion` roll-up in the summary + printed block.
 - **`trapi_corpus.py`** — the per-component query corpuses:
   - `_qg(nodes, edges, tier=None, bypass_cache=None)` — TRAPI envelope; adds
     scalar `parameters.tier` (KP-only) or top-level `bypass_cache` (ARA/ARS) only
@@ -189,6 +207,11 @@ Package `helmsdeep/`:
     and asks for connecting paths via a `paths` map in the query_graph — built by
     `_pathfinder_qg(nodes, paths)` (`nodes` + empty `edges` + `paths`; no
     `knowledge_type`, no `tier`; `bypass_cache=True`). Most intensive query class.
+  - **`MIXED_CORPUS`** — the mixed capacity profile (`aras_mixed`/`ars_mixed`).
+    Not hand-written: `_mixed_corpus()` blends `SHEPHERD_CORPUS` and
+    `PATHFINDER_CORPUS` at `INFERRED_PATHFINDER_RATIO = (2, 1)` — 2/3 inferred
+    MVP1+MVP2, 1/3 Pathfinder — preserving each corpus's internal weights, so
+    retuning the MVP1/MVP2 mix propagates here automatically.
   - Entity pools: `HEAVY_DISEASES` (curated hubs) + `LONG_TAIL_DISEASES` from
     **`curie_list.json`** (~1000 real MONDO CURIEs, shipped via `package_data`),
     a curated `GENES` pool (NCBIGene), and curated drug↔disease `CHEM_DISEASE_PAIRS`.
@@ -202,8 +225,9 @@ batch, predicate). For ARA/ARS creative queries, the dominant cost driver is the
 
 Implemented: component awareness, the `helmsdeep` CLI + entry point,
 per-target stages/SLO, segmented corpuses, scalar `parameters.tier` per KP query,
-the ARS async submit/poll/merge user, ARS health metrics + red flags, and the
-tiered inferred disease mix.
+the ARS async submit/poll/merge user, ARS health metrics + red flags, the
+tiered inferred disease mix, and the mixed capacity profile (2:1
+inferred/Pathfinder blend + pass/fail acceptance checkpoints, ARA and ARS).
 
 Remaining refinements (not yet done — don't assume these exist):
 
@@ -249,6 +273,11 @@ helmsdeep --targets ars  --host https://ars.ci.transltr.io/ars/api --csv-prefix 
 # Pathfinder is its own (heavier) run type, ARA/ARS only:
 helmsdeep --targets aras_pathfinder --host https://your-ara.example.org --csv-prefix pf1
 helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --csv-prefix pf1
+
+# Mixed capacity profile (ARA/ARS only): 2/3 inferred MVP1+MVP2 + 1/3 Pathfinder,
+# ramped to 30 -> 45 -> 60 concurrent and judged pass/fail per checkpoint.
+helmsdeep --targets aras_mixed --host https://your-ara.example.org --csv-prefix mix1
+helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io/ars/api --csv-prefix mix1
 ```
 
 - The `LoadTestShape` (`StepLoad`) **drives users, spawn rate, and duration**, so
@@ -260,8 +289,11 @@ helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --
   trapi_loadtest.py --headless --host …`), selecting the layer with the
   `LOADTEST_TARGET` env var (defaults to `kps`). Note locust has no
   `--csv-prefix` flag — set `LOCUST_CSV_PREFIX` instead.
+- A checkpointed run (`*_mixed`) **exits non-zero** when a checkpoint is missed,
+  so it can gate a CI/acceptance job.
 - Outputs (written by the master/standalone node only):
-  `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json` (+
+  `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json`
+  (+ `<prefix>_checkpoints.csv` for checkpointed targets) (+
   `<prefix>_ars_health.csv`, the `<prefix>_ars_completion.csv` sidecar, and a
   `red_flags` list + `completion` roll-up for the `ars` target), plus a printed
   summary table with the knee.
@@ -270,6 +302,13 @@ helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --
 
 - **The shape owns concurrency.** Tune load by editing the per-target `stages`
   in `config.py`, not CLI flags.
+- **Two kinds of run: knee-finding vs acceptance.** Every target reports the knee
+  ("how far can we go?"). A target that also defines `checkpoints` answers a
+  pass/fail question at named concurrency levels ("does 30 hold?") and exits
+  non-zero on a miss. `aras_mixed`/`ars_mixed` are the acceptance profile: a 2:1
+  inferred/Pathfinder blend checked at 30 (peak) / 45 (headroom) / 60 (overload,
+  error-rate only). Checkpoints are generic, not special-cased to that profile --
+  a target without them behaves exactly as before.
 - **Cooldown drains, it doesn't bleed.** With `cooldown_s` set, the gap between
   stages ramps users to 0; the just-finished stage's end time is frozen so its
   `duration_s`/RPS reflect the active window, and a slow query still running

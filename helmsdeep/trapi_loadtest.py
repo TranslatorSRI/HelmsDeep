@@ -16,16 +16,23 @@ Sync targets (KP/ARA) POST once; the async ARS target submits then polls
 capturing health signals (result-count variation, zero-result "Done" responses,
 response size, result-drop-under-load) and surfacing them as red flags.
 
+A target may also configure acceptance ``checkpoints`` (config.py): pass/fail
+criteria at named concurrency levels, judged against the stage that ran them.
+That turns a run from "find the knee" into "does the system hold N concurrent
+queries?" -- the knee is still computed. A missed checkpoint exits non-zero.
+
 Outputs:
   - <prefix>_stages.csv         one row per stage (overall)
   - <prefix>_by_qtype.csv       one row per (stage, qtype)
+  - <prefix>_checkpoints.csv    targets with acceptance criteria: one row per
+                                checkpoint with its PASS/FAIL verdict
   - <prefix>_ars_health.csv     ARS only: per-stage health signals
   - <prefix>_ars_completion.csv ARS only: per-query end-to-end response time +
                                 whether it eventually finished (polled past the
                                 max_poll_s failure threshold up to
                                 completion_max_poll_s)
-  - <prefix>_summary.json       config, all stages, the knee (+ ars_health/
-                                completion/red_flags)
+  - <prefix>_summary.json       config, all stages, the knee (+ checkpoints,
+                                ars_health/completion/red_flags)
 
 Usage (headless, recommended for reproducible numbers):
 
@@ -64,7 +71,14 @@ CORPUS = corpus_for(_TGT["corpus"])   # query subset for this component
 STAGES = _TGT["stages"]               # per-target step-load ramp
 P99_SLO_MS = _TGT["p99_slo_ms"]       # per-target knee threshold
 MAX_ERROR_RATE = config.MAX_ERROR_RATE   # shared error-rate cap
-REQUEST_TIMEOUT = 210           # seconds; per individual HTTP call
+# Per individual HTTP call. Default 210s; a target whose p99 SLO sits near or
+# above that raises it (otherwise slow queries land as client timeouts, i.e.
+# errors, and the latency they would have reported is never measured).
+REQUEST_TIMEOUT = _TGT.get("request_timeout_s", 210)
+
+# Optional pass/fail acceptance criteria at named concurrency levels (see
+# config.py). Empty for the plain find-the-knee targets.
+CHECKPOINTS = _TGT.get("checkpoints", [])
 
 # ARS is asynchronous (submit -> poll /messages/{pk} -> fetch merged). These are
 # unused by the sync (KP/ARA) path.
@@ -251,6 +265,55 @@ def _ars_stage_health(idx, qtype="__all__"):
         "bytes_mean": round(sum(nbytes) / len(nbytes), 1) if nbytes else 0,
         "bytes_max": max(nbytes) if nbytes else 0,
     }
+
+
+def _evaluate_checkpoints(overall_rows):
+    """Judge each configured checkpoint against the stage that ran its user count.
+
+    A checkpoint asks a pass/fail question ("does 30 concurrent hold?") rather
+    than the knee's open one ("how far can we go?"), so each one carries its own
+    bars: ``p99_slo_ms`` (omitted = the target's, ``None`` = latency not judged,
+    for an overload probe where slowdown is expected but failures are not) and
+    ``max_error_rate`` (omitted = the shared cap).
+    """
+    # Match on user count; if two stages ran the same count, the later one wins.
+    by_users = {r["users"]: r for r in overall_rows if r["users"] is not None}
+    results = []
+    for cp in CHECKPOINTS:
+        users = cp["users"]
+        p99_bar = cp.get("p99_slo_ms", P99_SLO_MS)
+        err_bar = cp.get("max_error_rate", MAX_ERROR_RATE)
+        row = by_users.get(users)
+        base = {
+            "users": users,
+            "goal": cp.get("goal", ""),
+            "p99_slo_ms": p99_bar,
+            "max_error_rate": err_bar,
+        }
+        if row is None or not row["requests"]:
+            results.append({**base, "stage": row["stage"] if row else None,
+                            "requests": row["requests"] if row else 0,
+                            "p99_ms": None, "error_rate": None, "concurrency": None,
+                            "verdict": "NO DATA",
+                            "detail": f"no completed requests at {users} users"})
+            continue
+        misses = []
+        if p99_bar is not None and row["p99_ms"] > p99_bar:
+            misses.append(f"p99 {row['p99_ms']:.0f}ms > {p99_bar}ms")
+        if row["error_rate"] > err_bar:
+            misses.append(f"errors {row['error_rate'] * 100:.2f}% > "
+                          f"{err_bar * 100:.2f}%")
+        results.append({
+            **base,
+            "stage": row["stage"],
+            "requests": row["requests"],
+            "p99_ms": row["p99_ms"],
+            "error_rate": row["error_rate"],
+            "concurrency": row["concurrency"],
+            "verdict": "FAIL" if misses else "PASS",
+            "detail": "; ".join(misses) if misses else "within limits",
+        })
+    return results
 
 
 # ----------------------------------------------------------------------------
@@ -556,6 +619,9 @@ def on_test_stop(environment, **_kw):
             if knee is None or row["concurrency"] > knee["concurrency"]:
                 knee = row
 
+    # Pass/fail acceptance checkpoints (targets that configure them).
+    checkpoints = _evaluate_checkpoints(overall_rows)
+
     # ARS health signals + red flags (async target only).
     ars_health = []
     red_flags = []
@@ -640,6 +706,17 @@ def on_test_stop(environment, **_kw):
         for r in qtype_rows:
             f.write(",".join(str(r[k]) for k in qfields) + "\n")
 
+    # Write the checkpoints CSV (targets that configure acceptance criteria).
+    kfields = ["users", "goal", "stage", "requests", "p99_ms", "p99_slo_ms",
+               "error_rate", "max_error_rate", "concurrency", "verdict", "detail"]
+    if checkpoints:
+        with open(f"{CSV_PREFIX}_checkpoints.csv", "w") as f:
+            f.write(",".join(kfields) + "\n")
+            for r in checkpoints:
+                # Free-text columns are semicolon-separated; strip stray commas
+                # so the naive CSV writer can't produce a ragged row.
+                f.write(",".join(str(r[k]).replace(",", ";") for k in kfields) + "\n")
+
     # Write ARS health CSV (async target only).
     hfields = ["stage", "requests", "done", "errored", "timed_out",
                "submit_failed", "zero_result_done", "results_min",
@@ -677,6 +754,10 @@ def on_test_stop(environment, **_kw):
         "knee": knee,
         "max_sustainable_concurrency": knee["concurrency"] if knee else None,
     }
+    if checkpoints:
+        summary["config"]["checkpoints"] = CHECKPOINTS
+        summary["checkpoints"] = checkpoints
+        summary["checkpoints_passed"] = all(c["verdict"] == "PASS" for c in checkpoints)
     if PROTOCOL == "async":
         summary["ars_health"] = ars_health
         summary["completion"] = completion_summary
@@ -702,7 +783,30 @@ def on_test_stop(environment, **_kw):
         print("No stage met the SLO -- service saturated below the first stage, "
               "or SLO is too strict. Lower the first stage or relax P99_SLO_MS.")
 
+    if checkpoints:
+        print("-" * 64)
+        print("ACCEPTANCE CHECKPOINTS")
+        print(f"{'usr':>4} {'p99':>8} {'bar':>8} {'err%':>6} {'bar':>6} "
+              f"{'verdict':>8}  goal")
+        for c in checkpoints:
+            p99 = f"{c['p99_ms']:.0f}" if c["p99_ms"] is not None else "-"
+            bar = f"{c['p99_slo_ms']:.0f}" if c["p99_slo_ms"] is not None else "n/a"
+            err = f"{c['error_rate'] * 100:.1f}" if c["error_rate"] is not None else "-"
+            print(f"{c['users']:>4} {p99:>8} {bar:>8} {err:>6} "
+                  f"{c['max_error_rate'] * 100:>6.1f} {c['verdict']:>8}  {c['goal']}")
+            if c["verdict"] != "PASS":
+                print(f"     -> {c['detail']}")
+        failed = [c for c in checkpoints if c["verdict"] != "PASS"]
+        if failed:
+            print(f"RESULT: {len(failed)} of {len(checkpoints)} checkpoint(s) not met.")
+            # Non-zero exit so a CI/acceptance run fails on its own criteria.
+            environment.process_exit_code = 1
+        else:
+            print(f"RESULT: all {len(checkpoints)} checkpoints met.")
+
     wrote = [f"{CSV_PREFIX}_stages.csv", f"{CSV_PREFIX}_by_qtype.csv"]
+    if checkpoints:
+        wrote.append(f"{CSV_PREFIX}_checkpoints.csv")
     if ars_health:
         print("-" * 64)
         print("ARS HEALTH (per stage)")

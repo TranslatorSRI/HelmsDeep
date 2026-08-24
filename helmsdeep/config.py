@@ -29,6 +29,23 @@ Fields:
                launched them, rather than bleeding into the next stage. Set it on
                the expensive layers (ARA/ARS/Pathfinder); cheap KP lookups don't
                bleed, so they leave it at 0.
+  request_timeout_s
+               optional per-HTTP-call timeout (default 210). Raise it on sync
+               targets whose p99_slo_ms sits near or above the default, or every
+               slow query is recorded as a client timeout instead of a latency.
+  checkpoints  optional list of pass/fail acceptance criteria, evaluated against
+               the stage running that many users. Turns a run from "find the
+               knee" into "does the system hold N concurrent queries?" -- the
+               knee is still computed either way. Each entry:
+                 users           which stage to judge (matched on user count)
+                 goal            short human label for what the checkpoint proves
+                 p99_slo_ms      latency bar; omit to inherit the target's
+                                 p99_slo_ms, or set None for no latency check
+                                 (an overload probe where slowdown is expected
+                                 but failures are not)
+                 max_error_rate  error-rate bar; omit to inherit MAX_ERROR_RATE
+               Results land in <prefix>_checkpoints.csv, the summary JSON, and
+               the printed report; any failed checkpoint sets a non-zero exit code.
 
 Async (``ars``) targets add:
   messages_endpoint       base path for polling/merge: /messages/{pk}
@@ -126,6 +143,74 @@ TARGETS = {
         ],
         "p99_slo_ms": 300000,             # 5-min knee target (vs 2 min for aras)
         "cooldown_s": 60,                 # drain slow queries between stages
+    },
+    # Mixed profile (ARA + ARS): 2/3 inferred MVP1+MVP2, 1/3 Pathfinder, run as
+    # one blended workload. Unlike the other targets -- which characterize a
+    # single query class to FIND the knee -- this one answers a pass/fail
+    # capacity question at three named concurrency checkpoints (see
+    # ``checkpoints`` below). The knee is still computed and reported.
+    "aras_mixed": {
+        "label": "Shepherd (Mixed 2:1 inferred/Pathfinder)",
+        "endpoint": "/query",
+        "corpus": "mixed",
+        "protocol": "sync",
+        "implemented": True,
+        # The three checkpoints the profile exists to answer, plus a short
+        # low-load stage first so a checkpoint failure can be read against a
+        # healthy baseline (is 30 slow, or is everything slow?).
+        "stages": [
+            (10,  2, 300),  # 5 mins  -- baseline
+            (30,  5, 900),  # 15 mins -- target peak load
+            (45,  5, 900),  # 15 mins -- expected headroom
+            (60, 10, 900),  # 15 mins -- overload probe
+        ],
+        # 1/3 of the mix is Pathfinder, the heaviest query class, and p99 is a
+        # tail statistic -- so this profile inherits the looser Pathfinder SLO
+        # rather than the tighter inferred-only one.
+        "p99_slo_ms": 300000,             # 5-min knee target
+        "request_timeout_s": 400,         # must exceed p99_slo_ms to measure it
+        "cooldown_s": 120,                # drain slow queries between stages
+        "checkpoints": [
+            {"users": 30, "goal": "sustain peak load",
+             "p99_slo_ms": 300000, "max_error_rate": 0.01},
+            {"users": 45, "goal": "headroom above peak",
+             "p99_slo_ms": 300000, "max_error_rate": 0.01},
+            # Overload probe: latency is expected to degrade here, so only the
+            # failure criterion applies (p99_slo_ms: None = no latency check).
+            {"users": 60, "goal": "no substantial failures under overload",
+             "p99_slo_ms": None, "max_error_rate": 0.05},
+        ],
+    },
+    "ars_mixed": {
+        "label": "ARS (Mixed 2:1 inferred/Pathfinder)",
+        "endpoint": "/ars/api/submit",
+        "messages_endpoint": "/ars/api/messages",
+        "corpus": "mixed",
+        "protocol": "async",
+        "implemented": True,
+        "poll_interval_s": 10,
+        # Longer than the single-class ARS targets: a Pathfinder query fanned out
+        # across every ARA is the slowest thing the stack does, and max_poll_s has
+        # to sit above the p99 SLO or every checkpoint failure looks like a
+        # timeout.
+        "max_poll_s": 600,                # 10-min cap; exceeding it = Timeout
+        "completion_max_poll_s": 900,     # sidecar: poll to 15 min for eventual finish
+        "stages": [
+            (10,  2, 600),  # 10 mins -- baseline
+            (30,  5, 900),  # 15 mins -- target peak load
+            (45,  5, 900),  # 15 mins -- expected headroom
+            (60, 10, 900),  # 15 mins -- overload probe
+        ],
+        "p99_slo_ms": 300000,             # 5-min knee target (< max_poll_s)
+        "cooldown_s": 300,                # drain slow queries between stages
+        "checkpoints": [
+            {"users": 30, "goal": "sustain peak load",
+             "p99_slo_ms": 300000, "max_error_rate": 0.01},
+            {"users": 45, "goal": "headroom above peak",
+             "p99_slo_ms": 300000, "max_error_rate": 0.01},
+            {"users": 60, "goal": "no substantial failures under overload",
+             "p99_slo_ms": None, "max_error_rate": 0.05},
+        ],
     },
     "ars_pathfinder": {
         "label": "ARS (Pathfinder)",
