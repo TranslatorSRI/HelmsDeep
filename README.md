@@ -72,6 +72,8 @@ helmsdeep --targets ars_mixed \
   uses `/submit` then `/messages/{pk}`.
 - `--csv-prefix` is optional; it falls back to the `LOCUST_CSV_PREFIX` env var,
   then to `trapi_run`.
+- `--time-budget` / `--quick` compress a run to fit a wall clock — see
+  ["Shorter runs"](#shorter-runs---time-budget----quick) below.
 
 The load profile (users, spawn rate, duration) is driven by the `StepLoad` shape,
 **not** by CLI flags — so there is intentionally no `-u/-r/-t`. The ramp and knee
@@ -84,6 +86,62 @@ them) before the next stage starts clean, instead of bleeding into it. It defaul
 to 0 (cheap KP lookups don't bleed) and is set on the expensive ARA/ARS/Pathfinder
 targets.
 
+## Shorter runs (`--time-budget` / `--quick`)
+
+A full run is long on purpose: slow queries need long holds to accumulate enough
+samples for a trustworthy percentile (`ars_mixed` takes ~70 minutes). When you
+don't need that — checking a host, corpus, or config change end to end, or taking
+a rough read — compress it:
+
+```bash
+# Smoke run: the whole ramp in about 10 minutes.
+helmsdeep --targets ars_mixed --host https://ars.ci.transltr.io/ars/api --quick
+
+# Or name your own budget: 30m, 1h, 90s, or plain seconds.
+helmsdeep --targets aras_mixed --host https://your-ara.example.org --time-budget 30m
+```
+
+`--quick` is shorthand for `--time-budget 10m`. Both scale the **durations** —
+stage holds, cooldowns, and the poll/timeout caps that gate how long one query may
+run — by a single factor. The **shape is untouched**: same user counts, same
+stages, same SLOs, same checkpoints. So `--targets ars_mixed --time-budget 30m`
+still ramps 10 → 30 → 45 → 60 users and still judges all three checkpoints; each
+stage just gets ~6 minutes instead of ~15.
+
+The CLI prints the compressed plan before it starts, so you know what you're
+committing to:
+
+```
+Compressed run: 1h10m -> 30m02s (time scale 0.43), budget 30m00s
+  Stages: 10u x 4m17s -> 30u x 6m26s -> 45u x 6m26s -> 60u x 6m26s, 2m09s cooldown between
+  Per-query cap cut to 4m17s -- a query slower than that is recorded as a
+  timeout failure, so error rates are not comparable to a full run's.
+```
+
+**What you give up.** Two things, and they matter:
+
+1. **Sample count, and with it the tail.** A p99 over a handful of queries is
+   noise. The mean and p50 hold up far better than p95/p99.
+2. **What counts as a failure.** The per-query caps shrink with everything else,
+   so a query that would have finished in 4 minutes is a *timeout* when the cap is
+   2. Error rates — and therefore checkpoint verdicts — are not comparable to a
+   full run's.
+
+Every output is stamped with `config.time_scale` (1.0 = a full run), and the
+printed summary leads with a warning banner. **Don't quote a compressed run's knee
+as a capacity result, and don't gate CI on its checkpoints.**
+
+Compression only ever speeds a run up: a budget above the target's natural
+duration is ignored (`kps` already runs in 7 minutes, so `--quick` leaves it
+alone). Stages won't shrink below a 30-second floor, so a budget too small to fit
+them simply overruns — the CLI says so and prints the real projected duration.
+
+> **Want each stage to get a specific amount of time?** The budget is for the
+> whole run, including cooldowns, so divide accordingly — or edit the per-target
+> `stages` in `config.py` directly, which is the only way to change the *shape*
+> (dropping the baseline stage from a mixed run, say, to give the three
+> checkpoints 10 minutes each).
+
 ## Outputs
 
 Written to the working directory by the standalone/master node:
@@ -91,8 +149,9 @@ Written to the working directory by the standalone/master node:
 - `<prefix>_stages.csv` — one row per stage (overall metrics), including a
   `stage_start` column with the stage's wall-clock start time (ISO 8601 UTC)
 - `<prefix>_by_qtype.csv` — one row per (stage, query type)
-- `<prefix>_summary.json` — config (including which `target` was measured), all
-  stages, and the chosen knee (plus `checkpoints` for targets that define them)
+- `<prefix>_summary.json` — config (including which `target` was measured and the
+  `time_scale` it ran at), all stages, and the chosen knee (plus `checkpoints` for
+  targets that define them)
 - `<prefix>_checkpoints.csv` — **targets with acceptance criteria** (`aras_mixed`
   / `ars_mixed`): one row per checkpoint with its `PASS` / `FAIL` verdict
 - `<prefix>_ars_health.csv` — **ARS only**: per-stage health signals (see below)

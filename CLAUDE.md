@@ -136,13 +136,28 @@ Package `helmsdeep/`:
   `p99_slo_ms`, `max_error_rate`) evaluated against the stage that ran that many
   users. `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
   Per-target ramps/SLOs live here because cost profiles differ wildly by layer.
+  `natural_duration_s()` and `time_scaled(cfg, budget_s)` implement
+  `--time-budget`/`--quick`: `time_scaled` returns a `(compressed_cfg, scale)`
+  pair whose *durations* (stage holds, `cooldown_s`, `request_timeout_s`,
+  `max_poll_s`/`completion_max_poll_s`/`poll_interval_s`) are scaled to fit the
+  budget, with per-knob floors (`MIN_HOLD_S` etc.) and spawn rates raised so a
+  short stage still spends its time at load rather than climbing to it. The
+  *shape* — users, SLOs, checkpoints — is never touched, and a budget above the
+  natural duration is a no-op (scale 1.0): it only ever speeds a run up.
 - **`cli.py`** — the `helmsdeep` entry point (registered in
   `setup.py` `console_scripts`). Parses `--targets` (required, one layer),
-  `--host` (required), `--csv-prefix`; rejects not-yet-`implemented` targets;
-  sets `LOADTEST_TARGET` (+ `LOCUST_CSV_PREFIX`) and launches
-  `python -m locust -f trapi_loadtest.py --headless --host …`.
+  `--host` (required), `--csv-prefix`, and the mutually exclusive
+  `--time-budget DURATION` / `--quick` (= `--time-budget 10m`); rejects
+  not-yet-`implemented` targets; sets `LOADTEST_TARGET` (+ `LOCUST_CSV_PREFIX`,
+  + `HELMSDEEP_TIME_BUDGET_S` when a budget is given) and launches
+  `python -m locust -f trapi_loadtest.py --headless --host …`. `_print_plan()`
+  shows the (possibly compressed) ramp and what was traded away before the run
+  starts; `_duration()` parses `600`/`90s`/`10m`/`1h30m`.
 - **`trapi_loadtest.py`** — the measurement engine (Locust). The component under
-  test is chosen by `LOADTEST_TARGET`; `ENDPOINT`, `CORPUS`, `STAGES`,
+  test is chosen by `LOADTEST_TARGET`, and when `HELMSDEEP_TIME_BUDGET_S` is set
+  the target config is passed through `config.time_scaled` at import (module-level
+  `TIME_SCALE`, stamped into `summary.json` as `config.time_scale` and printed as
+  a warning banner) so everything downstream reads the compressed values; `ENDPOINT`, `CORPUS`, `STAGES`,
   `P99_SLO_MS`, and the async knobs (`PROTOCOL`, `MESSAGES_PATH`,
   `POLL_INTERVAL_S`, `MAX_POLL_S`) plus `COOLDOWN_S` are all derived from
   `config.TARGETS[...]`.
@@ -291,6 +306,8 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io/ars/api --csv-p
   `--csv-prefix` flag — set `LOCUST_CSV_PREFIX` instead.
 - A checkpointed run (`*_mixed`) **exits non-zero** when a checkpoint is missed,
   so it can gate a CI/acceptance job.
+- `--quick` (= `--time-budget 10m`) or `--time-budget 30m` compresses any target
+  to a wall clock; see the conventions note below for what that costs.
 - Outputs (written by the master/standalone node only):
   `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json`
   (+ `<prefix>_checkpoints.csv` for checkpointed targets) (+
@@ -315,14 +332,23 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io/ars/api --csv-p
   drains into *that* stage (via `stop_timeout`), keeping the next stage clean.
 - **Closed-loop load.** `TRAPIUser.wait_time = constant(0)` — no think time; users
   hammer the endpoint as fast as responses return.
+- **A compressed run is not a measurement.** `--time-budget`/`--quick` scale
+  durations only (holds, cooldowns, poll/timeout caps) — the ramp, SLOs, and
+  checkpoints are identical, so the run asks the same questions of the same load
+  levels. But it answers them from far fewer samples (a p99 over a handful of
+  queries is noise), and the shrunken per-query caps *change what counts as a
+  failure*: a query that would finish in 4 minutes is a timeout when the cap is 2.
+  Compressed runs are for exercising a host/corpus/config end to end, not for
+  quoting a knee or gating CI. `config.time_scale` in `summary.json` (< 1.0) is
+  how you tell after the fact.
 - **Don't trust Locust's blended aggregate during a ramp.** We bucket per stage in
   `StageCollector` precisely because an aggregate p99 would mix easy early stages
   with saturated late ones.
 - **`malformed_query` 4xx is success.** A 4xx on the malformed query is treated as
   a valid measurement of the error path; only 5xx counts as a failure. See the
   `TRAPIUser.query` handling.
-- **Long timeouts on purpose.** `REQUEST_TIMEOUT = 210` s because TRAPI queries are
-  slow; ARS runs are far longer still (minutes–~1 hr) and need the async model.
+- **Long timeouts on purpose.** `REQUEST_TIMEOUT` defaults to 210 s (per-target
+  override: `request_timeout_s`) because TRAPI queries are slow; ARS runs are far longer still (minutes–~1 hr) and need the async model.
 - **gevent concurrency.** Locust uses gevent green-threads; avoid blocking calls in
   the user path. The ARS poll loop uses `gevent.sleep`, **never** `time.sleep`.
 - **ARS submit/poll/merge is one logical measurement.** `_run_ars` issues several

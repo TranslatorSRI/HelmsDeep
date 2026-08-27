@@ -236,3 +236,90 @@ TARGETS = {
 }
 
 DEFAULT_TARGET = "kps"
+
+
+# ---------------------------------------------------------------------------
+# Time-budget compression (--time-budget / --quick).
+#
+# A target's natural run is long on purpose: slow queries need long holds to
+# accumulate enough samples for a trustworthy percentile. But sometimes you want
+# a fast pass -- to check a host/corpus/config end to end, or to get a rough read
+# in a coffee break. Compression scales the *durations* (stage holds, cooldowns,
+# and the poll/timeout caps that gate how long one query may run) by a single
+# factor, leaving the shape of the ramp -- user counts, SLOs, checkpoints -- alone.
+#
+# What you give up is sample count, and with it the tail: a p99 over a handful of
+# queries is noise. Compressed poll/timeout caps also *change what counts as a
+# failure* -- a query that would have finished in 4 minutes is a timeout when the
+# cap is 2 -- so a compressed run's error rates and checkpoint verdicts are
+# indicative only. The engine stamps every output with the scale it used.
+# ---------------------------------------------------------------------------
+
+# Floors: below these a stage stops exercising anything, so compression stops
+# rather than shrinking further (a budget too small for the floors simply
+# overruns -- the CLI reports the honest projected duration).
+MIN_HOLD_S = 30            # per stage
+MIN_COOLDOWN_S = 10        # only where the target sets a cooldown at all
+MIN_MAX_POLL_S = 120       # ARS per-query poll cap
+MIN_REQUEST_TIMEOUT_S = 60  # per HTTP call
+MIN_POLL_INTERVAL_S = 5    # ARS status polls; the floor keeps the extra polling
+                           # load on a real service modest
+
+
+def natural_duration_s(cfg):
+    """Wall-clock seconds the target's stages + cooldowns take as configured."""
+    stages = cfg["stages"]
+    cooldown = cfg.get("cooldown_s", 0)
+    return sum(hold for _, _, hold in stages) + cooldown * max(0, len(stages) - 1)
+
+
+def time_scaled(cfg, budget_s):
+    """Return ``(compressed_cfg, scale)`` fitting roughly ``budget_s`` of wall clock.
+
+    Durations shrink; the ramp does not. User counts, spawn rates, SLOs, and
+    checkpoints are untouched, so a compressed run asks the same questions of the
+    same load levels -- just with far fewer samples behind each answer.
+
+    A budget at or above the natural duration is a no-op (scale 1.0): this only
+    ever speeds a run up, never pads it out.
+    """
+    natural = natural_duration_s(cfg)
+    if not natural or budget_s >= natural:
+        return dict(cfg), 1.0
+    scale = budget_s / natural
+
+    def _scaled(value, floor):
+        return max(floor, int(round(value * scale)))
+
+    out = dict(cfg)
+    stages = []
+    for users, rate, hold in cfg["stages"]:
+        hold = _scaled(hold, MIN_HOLD_S)
+        # Raise the spawn rate where a compressed hold is too short to ramp up in
+        # (reaching 60 users at 10/s takes 6s -- nothing at a 900s hold, a fifth
+        # of a 30s one), so each stage still spends its time at the load it is
+        # measuring rather than climbing towards it.
+        rate = max(rate, -(-users // max(1, int(hold * 0.2))))
+        stages.append((users, rate, hold))
+    out["stages"] = stages
+    if cfg.get("cooldown_s"):
+        out["cooldown_s"] = _scaled(cfg["cooldown_s"], MIN_COOLDOWN_S)
+    if cfg.get("request_timeout_s"):
+        out["request_timeout_s"] = _scaled(cfg["request_timeout_s"],
+                                           MIN_REQUEST_TIMEOUT_S)
+    if cfg.get("max_poll_s"):
+        out["max_poll_s"] = _scaled(cfg["max_poll_s"], MIN_MAX_POLL_S)
+        # Poll cadence sets the resolution of an ARS latency: a 10s interval
+        # against a compressed 120s cap quantizes every measurement to 10s.
+        # Shrink it alongside the cap, floored so a compressed run doesn't
+        # hammer the status endpoint far harder than the run it stands in for.
+        if cfg.get("poll_interval_s"):
+            out["poll_interval_s"] = _scaled(cfg["poll_interval_s"],
+                                             MIN_POLL_INTERVAL_S)
+        # Keep the sidecar's extra headroom proportional to the compressed cap,
+        # so on_test_stop's bounded drain shrinks with the run instead of adding
+        # the original 5 minutes back onto a 10-minute budget.
+        if cfg.get("completion_max_poll_s"):
+            ratio = cfg["completion_max_poll_s"] / cfg["max_poll_s"]
+            out["completion_max_poll_s"] = int(round(out["max_poll_s"] * ratio))
+    return out, scale

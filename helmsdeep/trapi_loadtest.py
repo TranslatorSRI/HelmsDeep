@@ -66,6 +66,17 @@ from trapi_corpus import corpus_for
 # Set by the helmsdeep CLI; defaults so `locust -f` works directly.
 TARGET = os.environ.get("LOADTEST_TARGET", config.DEFAULT_TARGET)
 _TGT = config.TARGETS[TARGET]
+
+# Optional wall-clock budget (--time-budget / --quick on the CLI). Compresses the
+# stage holds, cooldowns, and poll/timeout caps to fit; the ramp itself -- user
+# counts, SLOs, checkpoints -- is untouched. TIME_SCALE is 1.0 for a full run and
+# is stamped on the outputs, because a compressed run trades away the sample
+# count its percentiles and error rates rest on (see config.time_scaled).
+_BUDGET_S = os.environ.get("HELMSDEEP_TIME_BUDGET_S")
+TIME_SCALE = 1.0
+if _BUDGET_S:
+    _TGT, TIME_SCALE = config.time_scaled(_TGT, float(_BUDGET_S))
+
 ENDPOINT = _TGT["endpoint"]    # request path for this component
 CORPUS = corpus_for(_TGT["corpus"])   # query subset for this component
 STAGES = _TGT["stages"]               # per-target step-load ramp
@@ -742,6 +753,9 @@ def on_test_stop(environment, **_kw):
     summary = {
         "config": {
             "target": TARGET,
+            # < 1.0 means the run was compressed to a wall-clock budget: same
+            # ramp, far fewer samples per stage, tighter poll/timeout caps.
+            "time_scale": round(TIME_SCALE, 4),
             "component": _TGT["label"],
             "endpoint": ENDPOINT,
             "protocol": PROTOCOL,
@@ -768,6 +782,13 @@ def on_test_stop(environment, **_kw):
     print("\n" + "=" * 64)
     print("TRAPI LOAD TEST SUMMARY")
     print("=" * 64)
+    if TIME_SCALE < 1.0:
+        print(f"[!] COMPRESSED RUN (time scale {TIME_SCALE:.2f}). Stage holds and "
+              f"poll/timeout caps\n    were shortened to fit a wall-clock budget. "
+              f"Percentiles rest on far fewer\n    samples and the tighter caps "
+              f"turn slow queries into timeouts, so treat these\n    numbers -- and "
+              f"any checkpoint verdict -- as indicative, not a measurement.")
+        print("-" * 64)
     hdr = f"{'stg':>3} {'usr':>4} {'rps':>7} {'p50':>7} {'p95':>8} {'p99':>8} {'err%':>6} {'conc':>7}"
     print(hdr)
     for r in overall_rows:
