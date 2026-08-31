@@ -27,6 +27,9 @@ Outputs:
   - <prefix>_checkpoints.csv    targets with acceptance criteria: one row per
                                 checkpoint with its PASS/FAIL verdict
   - <prefix>_ars_health.csv     ARS only: per-stage health signals
+  - <prefix>_ars_queries.csv    ARS only: one row per logical query -- pk, the
+                                HTTP status of each step, terminal ARS status,
+                                and a URL to pull that query up for debugging
   - <prefix>_ars_completion.csv ARS only: per-query end-to-end response time +
                                 whether it eventually finished (polled past the
                                 max_poll_s failure threshold up to
@@ -44,6 +47,7 @@ The LoadTestShape drives users/duration, so you do NOT pass -u / -r / -t.
 Per-target load/SLO and the ARS poll knobs live in config.py.
 """
 
+import itertools
 import json
 import os
 import statistics
@@ -145,6 +149,19 @@ class StageCollector:
         # finish (polled up to COMPLETION_MAX_POLL_S, beyond the max_poll_s
         # failure threshold) and its true end-to-end response time.
         self.completions = []
+        # ARS per-query debug log: one row per logical query, carrying the pk and
+        # the status codes needed to pull that exact query up afterwards.
+        self.queries = []
+        # Ids are handed out at submit time and shared by both per-query files,
+        # so a row in one joins to its row in the other.
+        self._next_query_id = itertools.count()
+
+    def new_query_id(self):
+        return next(self._next_query_id)
+
+    def record_query(self, row):
+        """Append one ARS per-query debug row (pk + status codes + outcome)."""
+        self.queries.append(row)
 
     def mark_stage(self, idx):
         if idx != self.stage_idx:
@@ -182,14 +199,16 @@ class StageCollector:
             self.response_bytes[s][qtype].append(response_bytes)
             self.response_bytes[s]["__all__"].append(response_bytes)
 
-    def record_completion(self, *, stage, qtype, total_ms, finished, status,
-                          start_ts):
+    def record_completion(self, *, query_id, stage, qtype, total_ms, finished,
+                          status, start_ts):
         """Record one ARS completion-sidecar row. `finished` == the query reached
         a terminal status (Done or Error); the `status` column preserves which.
         Purely a sidecar -- never feeds the per-stage stats or the knee.
         """
         self.completions.append({
-            "query": len(self.completions),
+            # Same id as this query's row in the per-query debug log, so the two
+            # files join (a detached extended poll lands here out of order).
+            "query": query_id,
             "stage": stage,
             "qtype": qtype,
             "submit_start": time.strftime("%Y-%m-%dT%H:%M:%SZ",
@@ -387,15 +406,53 @@ class TRAPIUser(HttpUser):
             context={"qtype": qtype},
         )
 
-    def _record_completion(self, qtype, start, finished, status, stage):
+    def _record_completion(self, query_id, qtype, start, finished, status, stage):
         """Append one completion-sidecar row for a logical ARS query."""
         COLLECTOR.record_completion(
-            stage=stage, qtype=qtype,
+            query_id=query_id, stage=stage, qtype=qtype,
             total_ms=(time.time() - start) * 1000.0,
             finished=finished, status=status, start_ts=start,
         )
 
-    def _extended_poll(self, qtype, pk, start, stage):
+    def _message_url(self, pk):
+        """Full URL for pulling one ARS query up by hand (curl / browser)."""
+        return f"{self.host.rstrip('/')}{MESSAGES_PATH}/{pk}?trace=y" if pk else ""
+
+    def _record_query(self, query_id, qtype, pk, start, ars_status, *,
+                      failed, error=None, submit_http=None, poll_http=None,
+                      merge_http=None, polls=0, result_count=None,
+                      response_bytes=None, stage=None):
+        """Append one row to the ARS per-query debug log.
+
+        Written for EVERY logical query, terminal or not -- the failures are the
+        rows you actually want when debugging, and they are exactly the ones the
+        completion sidecar can be missing.
+        """
+        # Attributed to the stage active when the query REACHED ITS OUTCOME, the
+        # same rule the per-stage stats bucket by -- so a slow query's row lines
+        # up with the stage whose numbers it moved.
+        stage = COLLECTOR.stage_idx if stage is None else stage
+        COLLECTOR.record_query({
+            "query": query_id,
+            "pk": pk or "",
+            "stage": stage,
+            "users": STAGES[stage][0] if stage < len(STAGES) else "",
+            "qtype": qtype,
+            "submit_start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start)),
+            "latency_s": round(time.time() - start, 2),
+            "ars_status": ars_status,
+            "failed": failed,
+            "submit_http": submit_http if submit_http is not None else "",
+            "poll_http": poll_http if poll_http is not None else "",
+            "merge_http": merge_http if merge_http is not None else "",
+            "polls": polls,
+            "result_count": result_count if result_count is not None else "",
+            "response_bytes": response_bytes if response_bytes is not None else "",
+            "error": error or "",
+            "message_url": self._message_url(pk),
+        })
+
+    def _extended_poll(self, query_id, qtype, pk, start, stage):
         """Background greenlet: a query already blew MAX_POLL_S (and is already a
         Timeout failure in the main stats). Keep polling up to
         COMPLETION_MAX_POLL_S to record, in the sidecar only, whether it
@@ -423,7 +480,7 @@ class TRAPIUser(HttpUser):
                     continue   # transient; keep polling until the deadline
         finally:
             self._record_completion(
-                qtype, start,
+                query_id, qtype, start,
                 finished=(status in ("Done", "Error")),
                 status=(status if status in ("Done", "Error") else "Timeout"),
                 stage=stage,
@@ -439,6 +496,7 @@ class TRAPIUser(HttpUser):
         double-counted as the query time). A Done with 0 results is a failure.
         """
         start = time.time()
+        query_id = COLLECTOR.new_query_id()
 
         def _elapsed_ms():
             return (time.time() - start) * 1000.0
@@ -448,13 +506,17 @@ class TRAPIUser(HttpUser):
             ENDPOINT, json=payload, name="ars_submit",
             timeout=REQUEST_TIMEOUT, catch_response=True,
         ) as resp:
-            if resp.status_code != 201:
-                resp.failure(f"submit status {resp.status_code}")
+            submit_http = resp.status_code
+            if submit_http != 201:
+                resp.failure(f"submit status {submit_http}")
                 self._record_ars(qtype, _elapsed_ms(), True,
-                                 f"submit status {resp.status_code}",
+                                 f"submit status {submit_http}",
                                  status="SubmitError")
-                self._record_completion(qtype, start, False, "SubmitError",
-                                        COLLECTOR.stage_idx)
+                self._record_query(query_id, qtype, None, start, "SubmitError",
+                                   failed=True, submit_http=submit_http,
+                                   error=f"submit status {submit_http}")
+                self._record_completion(query_id, qtype, start, False,
+                                        "SubmitError", COLLECTOR.stage_idx)
                 return
             try:
                 pk = (resp.json() or {}).get("pk")
@@ -464,7 +526,10 @@ class TRAPIUser(HttpUser):
                 resp.failure("no pk in submit response")
                 self._record_ars(qtype, _elapsed_ms(), True,
                                  "no pk in submit response", status="NoPK")
-                self._record_completion(qtype, start, False, "NoPK",
+                self._record_query(query_id, qtype, None, start, "NoPK",
+                                   failed=True, submit_http=submit_http,
+                                   error="no pk in submit response")
+                self._record_completion(query_id, qtype, start, False, "NoPK",
                                         COLLECTOR.stage_idx)
                 return
             resp.success()
@@ -472,15 +537,19 @@ class TRAPIUser(HttpUser):
         # 2) Poll until Done/Error or the per-query cap.
         status = None
         merged_pk = None
+        poll_http = None      # last poll HTTP code seen -- for the debug log
+        polls = 0
         deadline = start + MAX_POLL_S
         while time.time() < deadline:
             gevent.sleep(POLL_INTERVAL_S)   # cooperative; never time.sleep
+            polls += 1
             with self.client.get(
                 f"{MESSAGES_PATH}/{pk}?trace=y", name="ars_poll",
                 timeout=REQUEST_TIMEOUT, catch_response=True,
             ) as resp:
-                if resp.status_code != 200:
-                    resp.failure(f"poll status {resp.status_code}")
+                poll_http = resp.status_code
+                if poll_http != 200:
+                    resp.failure(f"poll status {poll_http}")
                     continue   # transient; keep polling until the deadline
                 resp.success()
                 try:
@@ -496,17 +565,28 @@ class TRAPIUser(HttpUser):
         # is attributed to; the completion sidecar row uses the same stage.
         stage = COLLECTOR.stage_idx
         if status == "Done":
-            result_count, nbytes = self._fetch_merged(merged_pk)
+            result_count, nbytes, merge_http = self._fetch_merged(merged_pk)
+            zero = result_count == 0
             self._record_ars(
-                qtype, _elapsed_ms(), failed=(result_count == 0),
-                exc_msg=("Done with 0 results" if result_count == 0 else None),
+                qtype, _elapsed_ms(), failed=zero,
+                exc_msg=("Done with 0 results" if zero else None),
                 status="Done", result_count=result_count, response_bytes=nbytes,
             )
-            self._record_completion(qtype, start, True, "Done", stage)
+            self._record_query(query_id, qtype, pk, start, "Done",
+                               failed=zero,
+                               error=("Done with 0 results" if zero else None),
+                               submit_http=submit_http, poll_http=poll_http,
+                               merge_http=merge_http, polls=polls,
+                               result_count=result_count, response_bytes=nbytes,
+                               stage=stage)
+            self._record_completion(query_id, qtype, start, True, "Done", stage)
         elif status == "Error":
             self._record_ars(qtype, _elapsed_ms(), True, "ARS Error status",
                              status="Error")
-            self._record_completion(qtype, start, True, "Error", stage)
+            self._record_query(query_id, qtype, pk, start, "Error", failed=True,
+                               error="ARS Error status", submit_http=submit_http,
+                               poll_http=poll_http, polls=polls, stage=stage)
+            self._record_completion(query_id, qtype, start, True, "Error", stage)
         else:
             # Not terminal within MAX_POLL_S: fail the main measurement now
             # (unchanged). Then, if an extended cap is configured, keep polling in
@@ -515,16 +595,26 @@ class TRAPIUser(HttpUser):
             self._record_ars(qtype, _elapsed_ms(), True,
                              f"no terminal status within {MAX_POLL_S}s",
                              status="Timeout")
+            # The pk is the point of this row: a timed-out query is the one you
+            # most want to pull up by hand afterwards. `status` here is the last
+            # non-terminal status the ARS reported (e.g. Running), if any.
+            self._record_query(query_id, qtype, pk, start, "Timeout", failed=True,
+                               error=(f"no terminal status within {MAX_POLL_S}s"
+                                      + (f" (last: {status})" if status else "")),
+                               submit_http=submit_http, poll_http=poll_http,
+                               polls=polls, stage=stage)
             if COMPLETION_MAX_POLL_S > MAX_POLL_S:
-                g = gevent.spawn(self._extended_poll, qtype, pk, start, stage)
+                g = gevent.spawn(self._extended_poll, query_id, qtype, pk, start,
+                                 stage)
                 _COMPLETION_GREENLETS.append(g)
             else:
-                self._record_completion(qtype, start, False, "Timeout", stage)
+                self._record_completion(query_id, qtype, start, False, "Timeout",
+                                        stage)
 
     def _fetch_merged(self, merged_pk):
-        """Fetch the merged message; return (result_count, response_bytes)."""
+        """Fetch the merged message; return (result_count, response_bytes, http)."""
         if not merged_pk:
-            return 0, 0
+            return 0, 0, None
         with self.client.get(
             f"{MESSAGES_PATH}/{merged_pk}", name="ars_merge",
             timeout=REQUEST_TIMEOUT, catch_response=True,
@@ -532,15 +622,15 @@ class TRAPIUser(HttpUser):
             nbytes = len(resp.content or b"")
             if resp.status_code != 200:
                 resp.failure(f"merge status {resp.status_code}")
-                return 0, nbytes
+                return 0, nbytes, resp.status_code
             resp.success()
             try:
                 body = resp.json() or {}
                 results = (((body.get("fields") or {}).get("data") or {})
                            .get("message") or {}).get("results") or []
-                return len(results), nbytes
+                return len(results), nbytes, resp.status_code
             except Exception:
-                return 0, nbytes
+                return 0, nbytes, resp.status_code
 
 
 # When cooldown is enabled, stages ramp down to 0 users between holds. Set a
@@ -739,6 +829,22 @@ def on_test_stop(environment, **_kw):
             for r in ars_health:
                 f.write(",".join(str(r[k]) for k in hfields) + "\n")
 
+    # Write the ARS per-query debug log (async target only): one row per logical
+    # query with its pk, the HTTP status of each step, the terminal ARS status,
+    # and a ready-made URL -- so a specific query can be pulled up afterwards.
+    queries = COLLECTOR.queries
+    qlfields = ["query", "pk", "stage", "users", "qtype", "submit_start",
+                "latency_s", "ars_status", "failed", "submit_http", "poll_http",
+                "merge_http", "polls", "result_count", "response_bytes", "error",
+                "message_url"]
+    if queries:
+        with open(f"{CSV_PREFIX}_ars_queries.csv", "w") as f:
+            f.write(",".join(qlfields) + "\n")
+            for r in queries:
+                # `error` is free text; keep the naive writer's rows rectangular.
+                f.write(",".join(str(r[k]).replace(",", ";") for k in qlfields)
+                        + "\n")
+
     # Write ARS completion sidecar (async target only): one row per logical query
     # -- end-to-end response time + whether it eventually finished (polled up to
     # COMPLETION_MAX_POLL_S, beyond the max_poll_s failure threshold).
@@ -848,6 +954,18 @@ def on_test_stop(environment, **_kw):
                   f"{c['finished_after_slo']} after), "
                   f"{c['never_finished']} never finished, "
                   f"{c['submit_failed']} submit-failed")
+        failed_queries = [q for q in queries if q["failed"]]
+        if failed_queries:
+            print("-" * 64)
+            shown = failed_queries[:5]
+            print(f"FAILED QUERIES ({len(failed_queries)} of {len(queries)}; "
+                  f"first {len(shown)} shown, all in "
+                  f"{CSV_PREFIX}_ars_queries.csv)")
+            for q in shown:
+                print(f"  stage {q['stage']} {q['qtype']} [{q['ars_status']}] "
+                      f"pk={q['pk'] or '(none)'} -- {q['error']}")
+                if q["message_url"]:
+                    print(f"    {q['message_url']}")
         print("-" * 64)
         if red_flags:
             print(f"RED FLAGS ({len(red_flags)}):")
@@ -856,6 +974,8 @@ def on_test_stop(environment, **_kw):
         else:
             print("RED FLAGS: none detected.")
         wrote.append(f"{CSV_PREFIX}_ars_health.csv")
+        if queries:
+            wrote.append(f"{CSV_PREFIX}_ars_queries.csv")
         if completions:
             wrote.append(f"{CSV_PREFIX}_ars_completion.csv")
     wrote.append(f"{CSV_PREFIX}_summary.json")

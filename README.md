@@ -155,6 +155,9 @@ Written to the working directory by the standalone/master node:
 - `<prefix>_checkpoints.csv` — **targets with acceptance criteria** (`aras_mixed`
   / `ars_mixed`): one row per checkpoint with its `PASS` / `FAIL` verdict
 - `<prefix>_ars_health.csv` — **ARS only**: per-stage health signals (see below)
+- `<prefix>_ars_queries.csv` — **ARS only**: one row per logical query with its
+  **pk**, the HTTP status of each step, the terminal ARS status, and a ready-made
+  URL for pulling that query up (see below)
 - `<prefix>_ars_completion.csv` — **ARS only**: one row per logical query with its
   end-to-end response time and whether it *eventually* finished — polled past the
   `max_poll_s` failure threshold up to `completion_max_poll_s` (see below)
@@ -242,6 +245,59 @@ flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
 - **response size** (merged-message bytes, mean/max);
 - **result drop under load** — flagged when the mean result count falls sharply
   as concurrency rises across stages.
+
+### Per-query debug log (`ars_queries.csv`)
+
+The aggregate reports tell you *that* 3% of queries failed at 45 users. This file
+tells you **which ones**, and hands you what you need to go look at them: one row
+per logical ARS query, written for **every** query — successful, failed, or timed
+out.
+
+| Column | What it's for |
+|--------|---------------|
+| `query` | Query id. **Joins to `ars_completion.csv`** on the same column. |
+| `pk` | The ARS primary key. Empty only when the submit never returned one. |
+| `stage`, `users` | Which stage the query is attributed to (the stage active when it reached its outcome — the same rule the per-stage stats use). |
+| `qtype` | Which corpus query it was (`mvp1_heavy`, `pathfinder_drug_disease`, …). |
+| `submit_start` | When it was submitted (ISO 8601 UTC) — line it up against service logs. |
+| `latency_s` | Wall clock from submit to terminal status. |
+| `ars_status` | `Done` / `Error` / `Timeout` / `SubmitError` / `NoPK`. |
+| `failed` | Whether it counted against the error rate (note a **`Done` with 0 results is `failed=True`**). |
+| `submit_http`, `poll_http`, `merge_http` | HTTP status of the submit, the last poll, and the merged fetch. Separates "the ARS said no" from "the HTTP call broke". |
+| `polls` | How many status polls it took — a large number on a slow query says it was genuinely working, not stuck. |
+| `result_count`, `response_bytes` | Size of the merged answer. |
+| `error` | Why it failed, in words. |
+| `message_url` | Full URL to that query's message. Paste it into a browser or `curl` it. |
+
+The printed summary also points straight at the failures, so you don't have to
+open the file to start:
+
+```
+FAILED QUERIES (12 of 380; first 5 shown, all in run1_ars_queries.csv)
+  stage 2 pathfinder_drug_disease [Timeout] pk=8f3c… -- no terminal status within 600s (last: Running)
+    https://ars.ci.transltr.io/ars/api/messages/8f3c…?trace=y
+```
+
+Useful slices, once you have the file:
+
+```bash
+# Every failed query, as a table
+awk -F, 'NR==1 || $9=="True"' run1_ars_queries.csv | column -s, -t
+
+# The pks of everything that timed out at the top stage
+awk -F, '$8=="Timeout" && $4==60 {print $2}' run1_ars_queries.csv
+
+# Slowest queries, with their URLs
+sort -t, -k7 -gr run1_ars_queries.csv | head -5 | cut -d, -f2,7,8,17
+```
+
+**On the relationship to `ars_completion.csv`:** this file records what happened
+*within* the measurement window (a query not terminal by `max_poll_s` is a
+`Timeout` row here, which is exactly how the knee scores it). The completion
+sidecar separately answers whether that same query *eventually* finished. Join
+them on `query`. A timed-out query whose extended poll was still running at
+shutdown appears **here but not there** — which is precisely the query you most
+want the pk of.
 
 ### ARS completion tracking (`ars_completion.csv`)
 

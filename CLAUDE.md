@@ -168,7 +168,9 @@ Package `helmsdeep/`:
     `stop_timeout = REQUEST_TIMEOUT` so a slow in-flight query finishes rather than
     being killed when users ramp to 0.
   - `StageCollector` / `COLLECTOR` — buckets every completed request into the
-    stage active when it *finished* (per-stage, per-`qtype`). Records each stage's
+    stage active when it *finished* (per-stage, per-`qtype`). Also holds the two
+    per-query ARS lists (`queries`, `completions`) and hands out the shared
+    `new_query_id()` that joins them. Records each stage's
     wall-clock `stage_started` / `stage_ended` (the latter is `setdefault`, so a
     cooldown freeze isn't overwritten by the next `mark_stage`). `record()` also
     takes optional ARS signals: `status`, `result_count`, `response_bytes`.
@@ -177,7 +179,11 @@ Package `helmsdeep/`:
   - `TRAPIUser(HttpUser)` — dispatches on `PROTOCOL`: `_run_sync()` (KP/ARA: one
     blocking `POST`) or `_run_ars()` (submit → poll `/messages/{pk}` with
     `gevent.sleep` until `Done`/`Error`/timeout → `_fetch_merged()` counts
-    `fields.data.message.results`). One `COLLECTOR.record` per logical query. When a
+    `fields.data.message.results` and returns its HTTP status). One
+    `COLLECTOR.record` per logical query, plus one `COLLECTOR.record_query` debug
+    row (`_record_query`) carrying the `pk`, the submit/poll/merge HTTP codes, the
+    poll count, the terminal ARS status, and a `message_url` — written on every
+    terminal path including `SubmitError`/`NoPK`/`Timeout`. When a
     query blows `MAX_POLL_S` (already recorded as a Timeout failure — main stats
     unchanged), `_run_ars` spawns a detached `_extended_poll` greenlet that keeps
     polling to `COMPLETION_MAX_POLL_S` and appends one `COLLECTOR.record_completion`
@@ -193,8 +199,10 @@ Package `helmsdeep/`:
     `by_qtype.csv` / `summary.json`, (checkpointed targets only)
     `checkpoints.csv` + `checkpoints`/`checkpoints_passed` in the summary and a
     printed verdict block that sets `environment.process_exit_code = 1` on any
-    miss, and (async only) `ars_health.csv`, the `ars_completion.csv` sidecar,
-    plus `red_flags` + a `completion` roll-up in the summary + printed block.
+    miss, and (async only) `ars_health.csv`, the `ars_queries.csv` per-query
+    debug log + a printed "FAILED QUERIES" block naming the first few pks/URLs,
+    the `ars_completion.csv` sidecar, plus `red_flags` + a `completion` roll-up in
+    the summary + printed block.
 - **`trapi_corpus.py`** — the per-component query corpuses:
   - `_qg(nodes, edges, tier=None, bypass_cache=None)` — TRAPI envelope; adds
     scalar `parameters.tier` (KP-only) or top-level `bypass_cache` (ARA/ARS) only
@@ -311,9 +319,10 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io/ars/api --csv-p
 - Outputs (written by the master/standalone node only):
   `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json`
   (+ `<prefix>_checkpoints.csv` for checkpointed targets) (+
-  `<prefix>_ars_health.csv`, the `<prefix>_ars_completion.csv` sidecar, and a
-  `red_flags` list + `completion` roll-up for the `ars` target), plus a printed
-  summary table with the knee.
+  `<prefix>_ars_health.csv`, the `<prefix>_ars_queries.csv` per-query debug log,
+  the `<prefix>_ars_completion.csv` sidecar, and a `red_flags` list +
+  `completion` roll-up for the `ars` target), plus a printed summary table with
+  the knee.
 
 ## Conventions & gotchas
 
@@ -361,6 +370,13 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io/ars/api --csv-p
   `ars_merge` GET, which times just the final merge fetch, not the whole query).
   A `Done` that returns **0 results counts as a failure** (and raises a red
   flag); a non-terminal status past `max_poll_s` is a `Timeout` failure.
+- **The per-query debug log is the bridge from a number to a query.** The
+  aggregates say 3% failed; `<prefix>_ars_queries.csv` says which pks, with the
+  HTTP status of each step and a `message_url` to pull one up. One row per logical
+  query on every terminal path (including `SubmitError`/`NoPK`, which have no pk
+  at all), attributed to the stage active when it reached its outcome. It joins to
+  `ars_completion.csv` on `query`; a timed-out query whose extended poll was still
+  in flight at shutdown is in the debug log but *not* the sidecar.
 - **Completion tracking is a sidecar, not a metric change.** `max_poll_s` stays the
   failure threshold for the main stats and the knee — a query not terminal by then
   is a `Timeout` failure, exactly as before. Separately, `completion_max_poll_s`
