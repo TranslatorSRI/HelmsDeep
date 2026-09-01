@@ -120,7 +120,9 @@ Package `helmsdeep/`:
   `messages_endpoint`, `poll_interval_s`, `max_poll_s`, and an optional
   `completion_max_poll_s` (>= `max_poll_s`; the extended cap for the completion
   sidecar — how long a background poller keeps watching a timed-out query to see if
-  it *eventually* finishes; defaults to `max_poll_s` = off). The `*_pathfinder` targets
+  it *eventually* finishes; defaults to `max_poll_s` = off) and an optional
+  `zero_result_is_failure` (whether a terminal `Done` carrying 0 results scores
+  as a failure; defaults to `True`). The `*_pathfinder` targets
   reuse the ARA/ARS endpoints + protocols but point at the `pathfinder` corpus and
   ship a gentler ramp + looser SLO (pinned-two-endpoint path-finding is the
   heaviest query class). `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
@@ -294,8 +296,19 @@ helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --
   wall-clock, so Locust's native stats table shows the true per-query time
   (otherwise the only ARS rows would be the individual sub-calls — e.g. the
   `ars_merge` GET, which times just the final merge fetch, not the whole query).
-  A `Done` that returns **0 results counts as a failure** (and raises a red
-  flag); a non-terminal status past `max_poll_s` is a `Timeout` failure.
+  A `Done` that returns **0 results counts as a failure** by default (and raises
+  a red flag) — see `zero_result_is_failure` below; a non-terminal status past
+  `max_poll_s` is a `Timeout` failure.
+- **`zero_result_is_failure` decides what a 0-result `Done` means.** Default
+  `True`: an empty answer set under load usually means a downstream agent silently
+  dropped out, so it scores as a failure and counts against the knee. Set it
+  `False` on a target to score only transport/protocol outcomes (submit error,
+  `Error` status, `Timeout`) as failures — the zero-result query's latency then
+  also joins the percentile pool instead of being discarded (failed requests
+  contribute no latency samples), so it shifts mean/p99/concurrency, not just the
+  error rate. Either way the query is still tallied in `ars_health`
+  (`zero_result_done`) and still raises a red flag, and the summary JSON + printed
+  ARS health block record which policy was in force.
 - **Completion tracking is a sidecar, not a metric change.** `max_poll_s` stays the
   failure threshold for the main stats and the knee — a query not terminal by then
   is a `Timeout` failure, exactly as before. Separately, `completion_max_poll_s`
