@@ -29,7 +29,9 @@ Outputs:
   - <prefix>_ars_health.csv     ARS only: per-stage health signals
   - <prefix>_ars_queries.csv    ARS only: one row per logical query -- pk, the
                                 HTTP status of each step, terminal ARS status,
-                                and a URL to pull that query up for debugging
+                                any intermediate (retried, non-fatal) errors hit
+                                along the way, and a URL to pull that query up
+                                for debugging
   - <prefix>_ars_completion.csv ARS only: per-query end-to-end response time +
                                 whether it eventually finished (polled past the
                                 max_poll_s failure threshold up to
@@ -129,6 +131,37 @@ import random
 _FLAT = []
 for qtype, builder, weight in CORPUS:
     _FLAT.extend([(qtype, builder)] * weight)
+
+
+# ----------------------------------------------------------------------------
+# Per-query intermediate errors (ARS only).
+# ----------------------------------------------------------------------------
+class QueryIssues:
+    """Ordered tally of the SURVIVABLE problems hit while running one logical ARS
+    query: polls that came back non-200 (or with a body we could not parse) and
+    a merge fetch that misbehaved. The poll loop retries through all of these, so
+    none of them decide the query's outcome -- but a "Done" that needed thirty
+    retried 502s along the way is not the same measurement as a clean one, and
+    the per-query debug log is where you want to see that.
+    """
+
+    def __init__(self):
+        self._counts = {}   # label -> times seen, in first-seen order
+
+    def add(self, label):
+        self._counts[label] = self._counts.get(label, 0) + 1
+
+    @property
+    def count(self):
+        """Total intermediate-error events (0 == the query ran clean)."""
+        return sum(self._counts.values())
+
+    def summary(self):
+        """Compact one-cell rendering, e.g. 'poll HTTP 502 x3; merge HTTP 500'."""
+        return "; ".join(
+            label if n == 1 else f"{label} x{n}"
+            for label, n in self._counts.items()
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -428,7 +461,7 @@ class TRAPIUser(HttpUser):
     def _record_query(self, query_id, qtype, pk, start, ars_status, *,
                       failed, error=None, submit_http=None, poll_http=None,
                       merge_http=None, polls=0, result_count=None,
-                      response_bytes=None, stage=None):
+                      response_bytes=None, stage=None, issues=None):
         """Append one row to the ARS per-query debug log.
 
         Written for EVERY logical query, terminal or not -- the failures are the
@@ -453,8 +486,14 @@ class TRAPIUser(HttpUser):
             "poll_http": poll_http if poll_http is not None else "",
             "merge_http": merge_http if merge_http is not None else "",
             "polls": polls,
+            # Intermediate = non-fatal and retried past: the query still reached
+            # whatever `ars_status` says. `error` is the terminal reason (empty on
+            # success); these two are the trouble on the way there, so a clean
+            # Done and a Done that fought through poll 502s are distinguishable.
+            "intermediate_error_count": issues.count if issues else 0,
             "result_count": result_count if result_count is not None else "",
             "response_bytes": response_bytes if response_bytes is not None else "",
+            "intermediate_errors": issues.summary() if issues else "",
             "error": error or "",
             "message_url": self._message_url(pk),
         })
@@ -505,6 +544,7 @@ class TRAPIUser(HttpUser):
         """
         start = time.time()
         query_id = COLLECTOR.new_query_id()
+        issues = QueryIssues()   # non-fatal trouble on the way to the outcome
 
         def _elapsed_ms():
             return (time.time() - start) * 1000.0
@@ -558,11 +598,16 @@ class TRAPIUser(HttpUser):
                 poll_http = resp.status_code
                 if poll_http != 200:
                     resp.failure(f"poll status {poll_http}")
+                    # status_code 0 == locust caught a connection error/timeout,
+                    # i.e. no HTTP response at all.
+                    issues.add(f"poll HTTP {poll_http}" if poll_http
+                               else "poll request failed")
                     continue   # transient; keep polling until the deadline
                 resp.success()
                 try:
                     body = resp.json() or {}
                 except Exception:
+                    issues.add("poll body not JSON")
                     continue
                 status = body.get("status")
                 merged_pk = body.get("merged_version") or merged_pk
@@ -573,7 +618,7 @@ class TRAPIUser(HttpUser):
         # is attributed to; the completion sidecar row uses the same stage.
         stage = COLLECTOR.stage_idx
         if status == "Done":
-            result_count, nbytes, merge_http = self._fetch_merged(merged_pk)
+            result_count, nbytes, merge_http = self._fetch_merged(merged_pk, issues)
             zero_result = result_count == 0
             # Whether an empty answer set scores against the error rate (and so
             # the knee) is a per-target policy -- see ZERO_RESULT_IS_FAILURE.
@@ -593,14 +638,15 @@ class TRAPIUser(HttpUser):
                                submit_http=submit_http, poll_http=poll_http,
                                merge_http=merge_http, polls=polls,
                                result_count=result_count, response_bytes=nbytes,
-                               stage=stage)
+                               stage=stage, issues=issues)
             self._record_completion(query_id, qtype, start, True, "Done", stage)
         elif status == "Error":
             self._record_ars(qtype, _elapsed_ms(), True, "ARS Error status",
                              status="Error")
             self._record_query(query_id, qtype, pk, start, "Error", failed=True,
                                error="ARS Error status", submit_http=submit_http,
-                               poll_http=poll_http, polls=polls, stage=stage)
+                               poll_http=poll_http, polls=polls, stage=stage,
+                               issues=issues)
             self._record_completion(query_id, qtype, start, True, "Error", stage)
         else:
             # Not terminal within MAX_POLL_S: fail the main measurement now
@@ -617,7 +663,7 @@ class TRAPIUser(HttpUser):
                                error=(f"no terminal status within {MAX_POLL_S}s"
                                       + (f" (last: {status})" if status else "")),
                                submit_http=submit_http, poll_http=poll_http,
-                               polls=polls, stage=stage)
+                               polls=polls, stage=stage, issues=issues)
             if COMPLETION_MAX_POLL_S > MAX_POLL_S:
                 g = gevent.spawn(self._extended_poll, query_id, qtype, pk, start,
                                  stage)
@@ -626,9 +672,17 @@ class TRAPIUser(HttpUser):
                 self._record_completion(query_id, qtype, start, False, "Timeout",
                                         stage)
 
-    def _fetch_merged(self, merged_pk):
-        """Fetch the merged message; return (result_count, response_bytes, http)."""
+    def _fetch_merged(self, merged_pk, issues=None):
+        """Fetch the merged message; return (result_count, response_bytes, http).
+
+        Anything that goes wrong here is recorded in `issues` (the per-query
+        intermediate-error log) rather than raised: a merged message we could not
+        fetch or parse still leaves the query itself terminal, it just makes the
+        0 we report for result_count mean something different.
+        """
         if not merged_pk:
+            if issues is not None:
+                issues.add("Done without merged_version")
             return 0, 0, None
         with self.client.get(
             f"{MESSAGES_PATH}/{merged_pk}", name="ars_merge",
@@ -637,6 +691,9 @@ class TRAPIUser(HttpUser):
             nbytes = len(resp.content or b"")
             if resp.status_code != 200:
                 resp.failure(f"merge status {resp.status_code}")
+                if issues is not None:
+                    issues.add(f"merge HTTP {resp.status_code}"
+                               if resp.status_code else "merge request failed")
                 return 0, nbytes, resp.status_code
             resp.success()
             try:
@@ -645,6 +702,8 @@ class TRAPIUser(HttpUser):
                            .get("message") or {}).get("results") or []
                 return len(results), nbytes, resp.status_code
             except Exception:
+                if issues is not None:
+                    issues.add("merged message not parseable")
                 return 0, nbytes, resp.status_code
 
 
@@ -852,13 +911,15 @@ def on_test_stop(environment, **_kw):
     queries = COLLECTOR.queries
     qlfields = ["query", "pk", "stage", "users", "qtype", "submit_start",
                 "latency_s", "ars_status", "failed", "submit_http", "poll_http",
-                "merge_http", "polls", "result_count", "response_bytes", "error",
+                "merge_http", "polls", "intermediate_error_count",
+                "result_count", "response_bytes", "intermediate_errors", "error",
                 "message_url"]
     if queries:
         with open(f"{CSV_PREFIX}_ars_queries.csv", "w") as f:
             f.write(",".join(qlfields) + "\n")
             for r in queries:
-                # `error` is free text; keep the naive writer's rows rectangular.
+                # `error`/`intermediate_errors` are free text; keep the naive
+                # writer's rows rectangular.
                 f.write(",".join(str(r[k]).replace(",", ";") for k in qlfields)
                         + "\n")
 
@@ -987,6 +1048,19 @@ def on_test_stop(environment, **_kw):
                       f"pk={q['pk'] or '(none)'} -- {q['error']}")
                 if q["message_url"]:
                     print(f"    {q['message_url']}")
+        # Intermediate errors are non-fatal, so most of the queries carrying them
+        # are SUCCESSES -- they never show in the failed block above. Flag the
+        # count here so a run that only limped to green doesn't read as clean.
+        rough = [q for q in queries if q["intermediate_error_count"]]
+        if rough:
+            print("-" * 64)
+            print(f"INTERMEDIATE ERRORS: {len(rough)} of {len(queries)} queries "
+                  f"hit retried, non-fatal errors "
+                  f"(intermediate_errors column in "
+                  f"{CSV_PREFIX}_ars_queries.csv)")
+            for q in rough[:5]:
+                print(f"  stage {q['stage']} {q['qtype']} [{q['ars_status']}] "
+                      f"pk={q['pk'] or '(none)'} -- {q['intermediate_errors']}")
         print("-" * 64)
         if red_flags:
             print(f"RED FLAGS ({len(red_flags)}):")

@@ -184,8 +184,10 @@ Package `helmsdeep/`:
     `fields.data.message.results` and returns its HTTP status). One
     `COLLECTOR.record` per logical query, plus one `COLLECTOR.record_query` debug
     row (`_record_query`) carrying the `pk`, the submit/poll/merge HTTP codes, the
-    poll count, the terminal ARS status, and a `message_url` — written on every
-    terminal path including `SubmitError`/`NoPK`/`Timeout`. When a
+    poll count, the terminal ARS status, a `QueryIssues` tally of the
+    intermediate (retried, non-fatal) errors hit along the way
+    (`intermediate_error_count` + `intermediate_errors`), and a `message_url` —
+    written on every terminal path including `SubmitError`/`NoPK`/`Timeout`. When a
     query blows `MAX_POLL_S` (already recorded as a Timeout failure — main stats
     unchanged), `_run_ars` spawns a detached `_extended_poll` greenlet that keeps
     polling to `COMPLETION_MAX_POLL_S` and appends one `COLLECTOR.record_completion`
@@ -384,6 +386,13 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io/ars/api --csv-p
   (`zero_result_done`) and still raises a red flag, the per-query debug log still
   carries the `Done with 0 results` note (its `failed` column follows the policy),
   and the summary JSON + printed ARS health block record which policy was in force.
+- **Intermediate errors are the trouble a query survived.** The poll loop retries
+  through non-200 polls, unparseable poll bodies and a bad merge fetch, so none of
+  them change `ars_status` — which means a query that fought through thirty 502s
+  lands in the log as a clean `Done`. `QueryIssues` tallies them per query into
+  `intermediate_error_count` (0 = clean) + `intermediate_errors` (`poll HTTP 502
+  x3; merge HTTP 500`), and `on_test_stop` prints a roll-up separate from the
+  FAILED QUERIES block precisely because most queries carrying them succeeded.
 - **The per-query debug log is the bridge from a number to a query.** The
   aggregates say 3% failed; `<prefix>_ars_queries.csv` says which pks, with the
   HTTP status of each step and a `message_url` to pull one up. One row per logical

@@ -156,8 +156,9 @@ Written to the working directory by the standalone/master node:
   / `ars_mixed`): one row per checkpoint with its `PASS` / `FAIL` verdict
 - `<prefix>_ars_health.csv` — **ARS only**: per-stage health signals (see below)
 - `<prefix>_ars_queries.csv` — **ARS only**: one row per logical query with its
-  **pk**, the HTTP status of each step, the terminal ARS status, and a ready-made
-  URL for pulling that query up (see below)
+  **pk**, the HTTP status of each step, the terminal ARS status, any intermediate
+  (retried, non-fatal) errors it hit along the way, and a ready-made URL for
+  pulling that query up (see below)
 - `<prefix>_ars_completion.csv` — **ARS only**: one row per logical query with its
   end-to-end response time and whether it *eventually* finished — polled past the
   `max_poll_s` failure threshold up to `completion_max_poll_s` (see below)
@@ -299,8 +300,10 @@ out.
 | `failed` | Whether it counted against the error rate. A **`Done` with 0 results is `failed=True`** under the default `zero_result_is_failure` policy — see [below](#is-an-empty-answer-a-failure). |
 | `submit_http`, `poll_http`, `merge_http` | HTTP status of the submit, the last poll, and the merged fetch. Separates "the ARS said no" from "the HTTP call broke". |
 | `polls` | How many status polls it took — a large number on a slow query says it was genuinely working, not stuck. |
+| `intermediate_error_count` | How many **non-fatal** errors the query hit on the way to its outcome (`0` = it ran clean). The poll loop retries through these, so they never decide `ars_status` — but they say a query only limped to `Done`. |
 | `result_count`, `response_bytes` | Size of the merged answer. |
-| `error` | Why it failed, in words. Also carries `Done with 0 results` when a target scores that as a success — the note is what makes the pk worth opening either way. |
+| `intermediate_errors` | Those same errors in words, tallied: `poll HTTP 502 x3; merge HTTP 500`. Covers polls that came back non-200 (`poll request failed` when there was no HTTP response at all), poll bodies that wouldn't parse, and a merged fetch that 500'd, went missing (`Done without merged_version`) or wouldn't parse. Empty on a clean query. |
+| `error` | Why it failed, in words — the **terminal** reason, empty on success (as opposed to `intermediate_errors`, which is the trouble on the way there). Also carries `Done with 0 results` when a target scores that as a success — the note is what makes the pk worth opening either way. |
 | `message_url` | Full URL to that query's message. Paste it into a browser or `curl` it. |
 
 The printed summary also points straight at the failures, so you don't have to
@@ -310,6 +313,15 @@ open the file to start:
 FAILED QUERIES (12 of 380; first 5 shown, all in run1_ars_queries.csv)
   stage 2 pathfinder_drug_disease [Timeout] pk=8f3c… -- no terminal status within 600s (last: Running)
     https://ars.ci.transltr.io/ars/api/messages/8f3c…?trace=y
+```
+
+Intermediate errors get their own line, because most of the queries carrying them
+**succeeded** — they never appear in the failed block, and a run that only limped
+to green otherwise reads as clean:
+
+```
+INTERMEDIATE ERRORS: 34 of 380 queries hit retried, non-fatal errors (intermediate_errors column in run1_ars_queries.csv)
+  stage 4 mvp1_heavy [Done] pk=a01f… -- poll HTTP 502 x3
 ```
 
 Useful slices, once you have the file:
@@ -322,7 +334,10 @@ awk -F, 'NR==1 || $9=="True"' run1_ars_queries.csv | column -s, -t
 awk -F, '$8=="Timeout" && $4==60 {print $2}' run1_ars_queries.csv
 
 # Slowest queries, with their URLs
-sort -t, -k7 -gr run1_ars_queries.csv | head -5 | cut -d, -f2,7,8,17
+sort -t, -k7 -gr run1_ars_queries.csv | head -5 | cut -d, -f2,7,8,19
+
+# Queries that succeeded but hit non-fatal errors on the way
+awk -F, 'NR==1 || ($14+0 > 0 && $9=="False")' run1_ars_queries.csv | column -s, -t
 ```
 
 **On the relationship to `ars_completion.csv`:** this file records what happened
