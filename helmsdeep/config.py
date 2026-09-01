@@ -57,6 +57,18 @@ Async (``ars``) targets add:
                           up to this many seconds to record whether it
                           *eventually* finishes and its true end-to-end time.
                           Defaults to max_poll_s (no extended tracking).
+  zero_result_is_failure  whether a terminal "Done" that carries 0 results counts
+                          as a failure in the per-stage error rate (and therefore
+                          against the knee). Defaults to True: a Done with no
+                          answers usually means a downstream agent silently
+                          dropped out, which is exactly what we want the knee to
+                          catch. Set it False to score only transport/protocol
+                          outcomes (submit errors, Error status, Timeout) as
+                          failures and treat an empty answer set as a legitimate
+                          response -- the query's latency then also joins the
+                          percentile pool instead of being discarded. Either way
+                          zero-result Dones are still counted in ars_health and
+                          still raise a red flag.
 """
 
 # Shared across all targets: a stage also needs error_rate <= this to be a knee.
@@ -111,6 +123,9 @@ TARGETS = {
         "max_poll_s": 360,                # 6-min cap; exceeding it = Timeout
         "completion_max_poll_s": 600,     # keep polling (sidecar) up to 10 min to
                                           # see if a timed-out query ever finishes
+        # A "Done" with 0 results is a silent downstream break -> counts against
+        # the knee. Flip to False to score only transport failures.
+        "zero_result_is_failure": True,
         # Runs take minutes -- very low concurrency, long holds.
         "stages": [
             (2,  1, 300),  # 5 mins
@@ -195,6 +210,7 @@ TARGETS = {
         # timeout.
         "max_poll_s": 600,                # 10-min cap; exceeding it = Timeout
         "completion_max_poll_s": 900,     # sidecar: poll to 15 min for eventual finish
+        "zero_result_is_failure": True,   # 0-result Done = silent downstream break
         "stages": [
             (10,  2, 600),  # 10 mins -- baseline
             (30,  5, 900),  # 15 mins -- target peak load
@@ -222,6 +238,7 @@ TARGETS = {
         "poll_interval_s": 10,
         "max_poll_s": 360,               # 6-min cap
         "completion_max_poll_s": 600,    # sidecar: poll up to 10 min for eventual finish
+        "zero_result_is_failure": True,  # 0-result Done = silent downstream break
         "stages": [
             (2,  1, 300),  # 5 mins
             (3,  1, 300),  # 5 mins

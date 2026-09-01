@@ -240,11 +240,45 @@ flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
 
 - **result-count variation** (min/mean/max + coefficient of variation) across
   identical queries;
-- **zero-result `Done`** count — a `Done` with 0 results is treated as a
-  **failure** (counts against the error rate and the knee) and flagged;
+- **zero-result `Done`** count — by default a `Done` with 0 results is treated
+  as a **failure** (counts against the error rate and the knee) and flagged; the
+  per-target `zero_result_is_failure` flag can score it as a success instead (see
+  ["Is an empty answer a failure?"](#is-an-empty-answer-a-failure));
 - **response size** (merged-message bytes, mean/max);
 - **result drop under load** — flagged when the mean result count falls sharply
   as concurrency rises across stages.
+
+### Is an empty answer a failure?
+
+A terminal `Done` that carries **0 results** is scored as a **failure** by
+default: under load an empty answer set usually means a downstream agent silently
+dropped out, which is exactly what the knee should catch. But that conflates a
+silent break with a query whose answer set is legitimately empty, so it is a
+per-target switch in `config.py`:
+
+```python
+"zero_result_is_failure": True,   # the default; set False to score only
+                                  # transport/protocol outcomes as failures
+```
+
+With `False`, only submit errors, an `Error` status, and `Timeout` count as
+failures. Note this shifts **more than the error rate**: a failed request
+contributes no latency sample, so a zero-result query that stops being a failure
+starts feeding the percentile pool — mean, p99, and therefore the Little's-Law
+concurrency all move too. The two policies give two different knees, which is the
+point: run both to see how much of your ceiling is empty answers versus broken
+transport.
+
+Whichever policy is in force, the zero-result query is still counted in
+`ars_health.csv` (`zero_result_done`), still raises a red flag, and still carries
+the `Done with 0 results` note in the per-query debug log. The policy itself is
+recorded in `summary.json` (`config.zero_result_is_failure`) and printed above the
+ARS health table, so a run's numbers can't be read under the wrong assumption:
+
+```
+ARS HEALTH (per stage)
+  0-result 'Done' scored as: FAILURE (zero_result_is_failure=True)
+```
 
 ### Per-query debug log (`ars_queries.csv`)
 
@@ -262,11 +296,11 @@ out.
 | `submit_start` | When it was submitted (ISO 8601 UTC) — line it up against service logs. |
 | `latency_s` | Wall clock from submit to terminal status. |
 | `ars_status` | `Done` / `Error` / `Timeout` / `SubmitError` / `NoPK`. |
-| `failed` | Whether it counted against the error rate (note a **`Done` with 0 results is `failed=True`**). |
+| `failed` | Whether it counted against the error rate. A **`Done` with 0 results is `failed=True`** under the default `zero_result_is_failure` policy — see [below](#is-an-empty-answer-a-failure). |
 | `submit_http`, `poll_http`, `merge_http` | HTTP status of the submit, the last poll, and the merged fetch. Separates "the ARS said no" from "the HTTP call broke". |
 | `polls` | How many status polls it took — a large number on a slow query says it was genuinely working, not stuck. |
 | `result_count`, `response_bytes` | Size of the merged answer. |
-| `error` | Why it failed, in words. |
+| `error` | Why it failed, in words. Also carries `Done with 0 results` when a target scores that as a success — the note is what makes the pk worth opening either way. |
 | `message_url` | Full URL to that query's message. Paste it into a browser or `curl` it. |
 
 The printed summary also points straight at the failures, so you don't have to
@@ -346,7 +380,7 @@ without the jargon:
 | **RPS** | Requests Per Second — how many queries the service actually completed each second during that stage. Higher is faster. |
 | **Latency** | How long one query took, in **milliseconds** (1000 ms = 1 second). |
 | **mean / p50 / p95 / p99** | Different ways to summarize latency. *mean* is the average. *p50* (median) is the typical query. *p95* / *p99* are the slow tail: "95% (or 99%) of queries were at least this fast." p99 is the one we hold to a standard, because it captures the bad experiences, not just the average. |
-| **Error rate** | The fraction of queries that failed (e.g. `0.02` = 2%). For the ARS, a query that finishes but returns **zero answers** also counts as a failure. |
+| **Error rate** | The fraction of queries that failed (e.g. `0.02` = 2%). For the ARS, a query that finishes but returns **zero answers** also counts as a failure by default — a per-target flag can change that, and the run says which policy applied. |
 | **SLO** | Service Level Objective — the line in the sand for "acceptable." Here it's a p99 latency cap (e.g. `60000` ms = 60 s) plus a max error rate (default **1%**). A stage "passes" only if it stays under both. |
 | **Checkpoint** | A pass/fail question asked of one specific load level ("does 30 simultaneous users still work?"), with its own latency/error bars. Only the mixed capacity profile defines these; other runs just report the knee. |
 | **Knee** | The highest-load stage that still passes the SLO. It's the headline result: the most simultaneous users the service handled while staying fast enough and reliable enough. Past the knee, things fall apart. |
@@ -481,7 +515,7 @@ quick visual feel and for sharing a screenshot.
   `edges`); the `(chemical, disease)` pair varies per request from a curated
   `CHEM_DISEASE_PAIRS` list — **swap these** for pairs your service knows, and keep
   them plausibly connected so paths come back non-empty (on ARS a zero-result
-  `Done` is a failure). It's the heaviest query class, so its targets ship the
+  `Done` is a failure by default). It's the heaviest query class, so its targets ship the
   gentlest ramps and loosest SLOs (and, for `ars_pathfinder`, the longest
   `max_poll_s`); tune them in `config.py`.
 - **The mixed profile blends the two ARA/ARS classes** (`aras_mixed` /

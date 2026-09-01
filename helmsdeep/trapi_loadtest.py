@@ -106,6 +106,13 @@ MAX_POLL_S = _TGT.get("max_poll_s", 900)
 # keeps polling up to here to record whether it *eventually* finishes. Defaults
 # to MAX_POLL_S, i.e. no extended tracking.
 COMPLETION_MAX_POLL_S = max(_TGT.get("completion_max_poll_s", MAX_POLL_S), MAX_POLL_S)
+# Whether a terminal "Done" carrying 0 results scores as a failure (and so counts
+# against the knee). Defaults True: an empty answer set under load usually means a
+# downstream agent silently dropped out. When False, only transport/protocol
+# outcomes (submit error, Error status, Timeout) fail, and the zero-result query's
+# latency joins the percentile pool instead of being discarded -- but it is still
+# tallied in ars_health and still raises a red flag.
+ZERO_RESULT_IS_FAILURE = _TGT.get("zero_result_is_failure", True)
 
 # Detached greenlets still polling timed-out queries for the completion sidecar;
 # on_test_stop drains them (bounded) so their rows make it into the file.
@@ -493,7 +500,8 @@ class TRAPIUser(HttpUser):
         query, plus one synthetic 'ars_query' Locust request event carrying that
         same full wall-clock (the submit/poll/merge HTTP calls also show
         separately in Locust's own table for diagnostics, but are not
-        double-counted as the query time). A Done with 0 results is a failure.
+        double-counted as the query time). A Done with 0 results is a failure
+        unless the target sets zero_result_is_failure=False.
         """
         start = time.time()
         query_id = COLLECTOR.new_query_id()
@@ -566,15 +574,22 @@ class TRAPIUser(HttpUser):
         stage = COLLECTOR.stage_idx
         if status == "Done":
             result_count, nbytes, merge_http = self._fetch_merged(merged_pk)
-            zero = result_count == 0
+            zero_result = result_count == 0
+            # Whether an empty answer set scores against the error rate (and so
+            # the knee) is a per-target policy -- see ZERO_RESULT_IS_FAILURE.
+            failed = zero_result and ZERO_RESULT_IS_FAILURE
             self._record_ars(
-                qtype, _elapsed_ms(), failed=zero,
-                exc_msg=("Done with 0 results" if zero else None),
+                qtype, _elapsed_ms(), failed=failed,
+                exc_msg=("Done with 0 results" if zero_result else None),
                 status="Done", result_count=result_count, response_bytes=nbytes,
             )
             self._record_query(query_id, qtype, pk, start, "Done",
-                               failed=zero,
-                               error=("Done with 0 results" if zero else None),
+                               # `failed` follows the policy, so the debug log
+                               # agrees with how the query was actually scored;
+                               # the note is recorded either way, since an empty
+                               # answer set is still why you'd open this pk.
+                               failed=failed,
+                               error=("Done with 0 results" if zero_result else None),
                                submit_http=submit_http, poll_http=poll_http,
                                merge_http=merge_http, polls=polls,
                                result_count=result_count, response_bytes=nbytes,
@@ -751,9 +766,11 @@ def on_test_stop(environment, **_kw):
         for h in ars_health:
             i = h["stage"]
             if h["zero_result_done"]:
+                scored = ("counted as failures" if ZERO_RESULT_IS_FAILURE
+                          else "NOT counted as failures per zero_result_is_failure=False")
                 red_flags.append(
                     f"Stage {i}: {h['zero_result_done']} 'Done' response(s) returned "
-                    f"0 results (counted as failures; possible silent downstream break).")
+                    f"0 results ({scored}; possible silent downstream break).")
             if h["errored"]:
                 red_flags.append(f"Stage {i}: {h['errored']} query/queries returned Error status.")
             if h["timed_out"]:
@@ -879,6 +896,7 @@ def on_test_stop(environment, **_kw):
         summary["checkpoints"] = checkpoints
         summary["checkpoints_passed"] = all(c["verdict"] == "PASS" for c in checkpoints)
     if PROTOCOL == "async":
+        summary["config"]["zero_result_is_failure"] = ZERO_RESULT_IS_FAILURE
         summary["ars_health"] = ars_health
         summary["completion"] = completion_summary
         summary["red_flags"] = red_flags
@@ -937,6 +955,9 @@ def on_test_stop(environment, **_kw):
     if ars_health:
         print("-" * 64)
         print("ARS HEALTH (per stage)")
+        print(f"  0-result 'Done' scored as: "
+              f"{'FAILURE' if ZERO_RESULT_IS_FAILURE else 'success'} "
+              f"(zero_result_is_failure={ZERO_RESULT_IS_FAILURE})")
         hh = (f"{'stg':>3} {'req':>4} {'done':>5} {'err':>4} {'t/o':>4} "
               f"{'0res':>5} {'res_mean':>9} {'res_cv':>7} {'bytes_max':>10}")
         print(hh)
