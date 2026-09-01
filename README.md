@@ -51,15 +51,29 @@ helmsdeep --targets aras_pathfinder \
 helmsdeep --targets ars_pathfinder \
     --host https://ars.ci.transltr.io/ars/api \
     --csv-prefix pf1
+
+# Mixed capacity profile (ARA/ARS only) — 2/3 inferred MVP1+MVP2, 1/3 Pathfinder
+# in one blended workload, ramped to 30 → 45 → 60 concurrent users and judged
+# against pass/fail acceptance checkpoints.
+helmsdeep --targets aras_mixed \
+    --host https://your-ara-service.example.org \
+    --csv-prefix mix1
+helmsdeep --targets ars_mixed \
+    --host https://ars.ci.transltr.io/ars/api \
+    --csv-prefix mix1
 ```
 
-- `--targets` selects the layer: `kps` (Retriever), `aras` (Shepherd), `ars`, or
-  the Pathfinder run types `aras_pathfinder` / `ars_pathfinder` (ARA/ARS only).
+- `--targets` selects the layer: `kps` (Retriever), `aras` (Shepherd), `ars`, the
+  Pathfinder run types `aras_pathfinder` / `ars_pathfinder` (ARA/ARS only), or the
+  mixed capacity profile `aras_mixed` / `ars_mixed` (ARA/ARS only — see
+  ["Mixed capacity profile"](#mixed-capacity-profile-aras_mixed--ars_mixed)).
 - `--host` is **required** — the base URL of the target service. For `kps`/`aras`
   the `/query` path is appended; for `ars` the host is the API base and the tool
   uses `/submit` then `/messages/{pk}`.
 - `--csv-prefix` is optional; it falls back to the `LOCUST_CSV_PREFIX` env var,
   then to `trapi_run`.
+- `--time-budget` / `--quick` compress a run to fit a wall clock — see
+  ["Shorter runs"](#shorter-runs---time-budget----quick) below.
 
 The load profile (users, spawn rate, duration) is driven by the `StepLoad` shape,
 **not** by CLI flags — so there is intentionally no `-u/-r/-t`. The ramp and knee
@@ -72,6 +86,62 @@ them) before the next stage starts clean, instead of bleeding into it. It defaul
 to 0 (cheap KP lookups don't bleed) and is set on the expensive ARA/ARS/Pathfinder
 targets.
 
+## Shorter runs (`--time-budget` / `--quick`)
+
+A full run is long on purpose: slow queries need long holds to accumulate enough
+samples for a trustworthy percentile (`ars_mixed` takes ~70 minutes). When you
+don't need that — checking a host, corpus, or config change end to end, or taking
+a rough read — compress it:
+
+```bash
+# Smoke run: the whole ramp in about 10 minutes.
+helmsdeep --targets ars_mixed --host https://ars.ci.transltr.io/ars/api --quick
+
+# Or name your own budget: 30m, 1h, 90s, or plain seconds.
+helmsdeep --targets aras_mixed --host https://your-ara.example.org --time-budget 30m
+```
+
+`--quick` is shorthand for `--time-budget 10m`. Both scale the **durations** —
+stage holds, cooldowns, and the poll/timeout caps that gate how long one query may
+run — by a single factor. The **shape is untouched**: same user counts, same
+stages, same SLOs, same checkpoints. So `--targets ars_mixed --time-budget 30m`
+still ramps 10 → 30 → 45 → 60 users and still judges all three checkpoints; each
+stage just gets ~6 minutes instead of ~15.
+
+The CLI prints the compressed plan before it starts, so you know what you're
+committing to:
+
+```
+Compressed run: 1h10m -> 30m02s (time scale 0.43), budget 30m00s
+  Stages: 10u x 4m17s -> 30u x 6m26s -> 45u x 6m26s -> 60u x 6m26s, 2m09s cooldown between
+  Per-query cap cut to 4m17s -- a query slower than that is recorded as a
+  timeout failure, so error rates are not comparable to a full run's.
+```
+
+**What you give up.** Two things, and they matter:
+
+1. **Sample count, and with it the tail.** A p99 over a handful of queries is
+   noise. The mean and p50 hold up far better than p95/p99.
+2. **What counts as a failure.** The per-query caps shrink with everything else,
+   so a query that would have finished in 4 minutes is a *timeout* when the cap is
+   2. Error rates — and therefore checkpoint verdicts — are not comparable to a
+   full run's.
+
+Every output is stamped with `config.time_scale` (1.0 = a full run), and the
+printed summary leads with a warning banner. **Don't quote a compressed run's knee
+as a capacity result, and don't gate CI on its checkpoints.**
+
+Compression only ever speeds a run up: a budget above the target's natural
+duration is ignored (`kps` already runs in 7 minutes, so `--quick` leaves it
+alone). Stages won't shrink below a 30-second floor, so a budget too small to fit
+them simply overruns — the CLI says so and prints the real projected duration.
+
+> **Want each stage to get a specific amount of time?** The budget is for the
+> whole run, including cooldowns, so divide accordingly — or edit the per-target
+> `stages` in `config.py` directly, which is the only way to change the *shape*
+> (dropping the baseline stage from a mixed run, say, to give the three
+> checkpoints 10 minutes each).
+
 ## Outputs
 
 Written to the working directory by the standalone/master node:
@@ -79,9 +149,15 @@ Written to the working directory by the standalone/master node:
 - `<prefix>_stages.csv` — one row per stage (overall metrics), including a
   `stage_start` column with the stage's wall-clock start time (ISO 8601 UTC)
 - `<prefix>_by_qtype.csv` — one row per (stage, query type)
-- `<prefix>_summary.json` — config (including which `target` was measured), all
-  stages, and the chosen knee
+- `<prefix>_summary.json` — config (including which `target` was measured and the
+  `time_scale` it ran at), all stages, and the chosen knee (plus `checkpoints` for
+  targets that define them)
+- `<prefix>_checkpoints.csv` — **targets with acceptance criteria** (`aras_mixed`
+  / `ars_mixed`): one row per checkpoint with its `PASS` / `FAIL` verdict
 - `<prefix>_ars_health.csv` — **ARS only**: per-stage health signals (see below)
+- `<prefix>_ars_queries.csv` — **ARS only**: one row per logical query with its
+  **pk**, the HTTP status of each step, the terminal ARS status, and a ready-made
+  URL for pulling that query up (see below)
 - `<prefix>_ars_completion.csv` — **ARS only**: one row per logical query with its
   end-to-end response time and whether it *eventually* finished — polled past the
   `max_poll_s` failure threshold up to `completion_max_poll_s` (see below)
@@ -94,6 +170,57 @@ Written to the working directory by the standalone/master node:
 
 For a guide to interpreting every one of these — written for non-specialists —
 see ["How to read the results"](#how-to-read-the-results) below.
+
+### Mixed capacity profile (`aras_mixed` / `ars_mixed`)
+
+Every other target characterizes **one** query class in isolation to *find* the
+knee. The mixed profile answers a different, operational question: **can the
+system hold a target concurrency when both query classes arrive together, the way
+they do in production?**
+
+- **Corpus** — one blended workload: **2/3 inferred MVP1+MVP2** creative queries
+  and **1/3 Pathfinder**. MVP1/MVP2 keep their relative `SHEPHERD_CORPUS` weights
+  (so retuning that mix carries over); only the 2:1 split is imposed.
+  `by_qtype.csv` still breaks the two classes out separately, so you can see
+  which one drives the tail.
+- **Ramp** — a short low-load baseline stage, then the three concurrency levels
+  the profile exists to judge: **30 → 45 → 60** simultaneous users. The baseline
+  exists so a failure at 30 can be read against a healthy reference (is 30 slow,
+  or is *everything* slow?).
+- **Verdict** — each level carries pass/fail **acceptance checkpoints** instead of
+  only feeding the knee:
+
+  | Users | Goal | Criteria |
+  |-------|------|----------|
+  | **30** | sustain peak load | p99 ≤ 300 000 ms **and** errors ≤ 1% |
+  | **45** | headroom above peak | p99 ≤ 300 000 ms **and** errors ≤ 1% |
+  | **60** | no substantial failures under overload | errors ≤ 5% (latency **not** judged — slowdown is expected here, failures are not) |
+
+The verdicts land in `<prefix>_checkpoints.csv`, in `summary.json` (`checkpoints`
+plus a single `checkpoints_passed` boolean), and in the printed report:
+
+```
+ACCEPTANCE CHECKPOINTS
+ usr      p99      bar   err%    bar  verdict  goal
+  30   184203   300000    0.4    1.0     PASS  sustain peak load
+  45   291560   300000    0.9    1.0     PASS  headroom above peak
+  60   402118      n/a    3.1    5.0     PASS  no substantial failures under overload
+RESULT: all 3 checkpoints met.
+```
+
+A missed checkpoint prints why (`-> p99 331402ms > 300000ms`) and makes the run
+**exit non-zero**, so it can gate a CI/acceptance job. A checkpoint whose stage
+recorded no completed requests is reported as `NO DATA` rather than a silent pass.
+The knee is still computed and reported alongside, unchanged.
+
+Checkpoints are a generic per-target feature (`checkpoints` in `config.py`), not
+special-cased to this profile: any target can define them, and targets that don't
+behave exactly as before. Edit the users, goals, and bars there — the ARA and ARS
+variants carry the same three checkpoints so the two layers are directly
+comparable.
+
+> **Layering still applies:** `ars_mixed` fans out to the ARAs, so run one or the
+> other — never both at once.
 
 ### ARS async workflow and health signals
 
@@ -113,11 +240,98 @@ flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
 
 - **result-count variation** (min/mean/max + coefficient of variation) across
   identical queries;
-- **zero-result `Done`** count — a `Done` with 0 results is treated as a
-  **failure** (counts against the error rate and the knee) and flagged;
+- **zero-result `Done`** count — by default a `Done` with 0 results is treated
+  as a **failure** (counts against the error rate and the knee) and flagged; the
+  per-target `zero_result_is_failure` flag can score it as a success instead (see
+  ["Is an empty answer a failure?"](#is-an-empty-answer-a-failure));
 - **response size** (merged-message bytes, mean/max);
 - **result drop under load** — flagged when the mean result count falls sharply
   as concurrency rises across stages.
+
+### Is an empty answer a failure?
+
+A terminal `Done` that carries **0 results** is scored as a **failure** by
+default: under load an empty answer set usually means a downstream agent silently
+dropped out, which is exactly what the knee should catch. But that conflates a
+silent break with a query whose answer set is legitimately empty, so it is a
+per-target switch in `config.py`:
+
+```python
+"zero_result_is_failure": True,   # the default; set False to score only
+                                  # transport/protocol outcomes as failures
+```
+
+With `False`, only submit errors, an `Error` status, and `Timeout` count as
+failures. Note this shifts **more than the error rate**: a failed request
+contributes no latency sample, so a zero-result query that stops being a failure
+starts feeding the percentile pool — mean, p99, and therefore the Little's-Law
+concurrency all move too. The two policies give two different knees, which is the
+point: run both to see how much of your ceiling is empty answers versus broken
+transport.
+
+Whichever policy is in force, the zero-result query is still counted in
+`ars_health.csv` (`zero_result_done`), still raises a red flag, and still carries
+the `Done with 0 results` note in the per-query debug log. The policy itself is
+recorded in `summary.json` (`config.zero_result_is_failure`) and printed above the
+ARS health table, so a run's numbers can't be read under the wrong assumption:
+
+```
+ARS HEALTH (per stage)
+  0-result 'Done' scored as: FAILURE (zero_result_is_failure=True)
+```
+
+### Per-query debug log (`ars_queries.csv`)
+
+The aggregate reports tell you *that* 3% of queries failed at 45 users. This file
+tells you **which ones**, and hands you what you need to go look at them: one row
+per logical ARS query, written for **every** query — successful, failed, or timed
+out.
+
+| Column | What it's for |
+|--------|---------------|
+| `query` | Query id. **Joins to `ars_completion.csv`** on the same column. |
+| `pk` | The ARS primary key. Empty only when the submit never returned one. |
+| `stage`, `users` | Which stage the query is attributed to (the stage active when it reached its outcome — the same rule the per-stage stats use). |
+| `qtype` | Which corpus query it was (`mvp1_heavy`, `pathfinder_drug_disease`, …). |
+| `submit_start` | When it was submitted (ISO 8601 UTC) — line it up against service logs. |
+| `latency_s` | Wall clock from submit to terminal status. |
+| `ars_status` | `Done` / `Error` / `Timeout` / `SubmitError` / `NoPK`. |
+| `failed` | Whether it counted against the error rate. A **`Done` with 0 results is `failed=True`** under the default `zero_result_is_failure` policy — see [below](#is-an-empty-answer-a-failure). |
+| `submit_http`, `poll_http`, `merge_http` | HTTP status of the submit, the last poll, and the merged fetch. Separates "the ARS said no" from "the HTTP call broke". |
+| `polls` | How many status polls it took — a large number on a slow query says it was genuinely working, not stuck. |
+| `result_count`, `response_bytes` | Size of the merged answer. |
+| `error` | Why it failed, in words. Also carries `Done with 0 results` when a target scores that as a success — the note is what makes the pk worth opening either way. |
+| `message_url` | Full URL to that query's message. Paste it into a browser or `curl` it. |
+
+The printed summary also points straight at the failures, so you don't have to
+open the file to start:
+
+```
+FAILED QUERIES (12 of 380; first 5 shown, all in run1_ars_queries.csv)
+  stage 2 pathfinder_drug_disease [Timeout] pk=8f3c… -- no terminal status within 600s (last: Running)
+    https://ars.ci.transltr.io/ars/api/messages/8f3c…?trace=y
+```
+
+Useful slices, once you have the file:
+
+```bash
+# Every failed query, as a table
+awk -F, 'NR==1 || $9=="True"' run1_ars_queries.csv | column -s, -t
+
+# The pks of everything that timed out at the top stage
+awk -F, '$8=="Timeout" && $4==60 {print $2}' run1_ars_queries.csv
+
+# Slowest queries, with their URLs
+sort -t, -k7 -gr run1_ars_queries.csv | head -5 | cut -d, -f2,7,8,17
+```
+
+**On the relationship to `ars_completion.csv`:** this file records what happened
+*within* the measurement window (a query not terminal by `max_poll_s` is a
+`Timeout` row here, which is exactly how the knee scores it). The completion
+sidecar separately answers whether that same query *eventually* finished. Join
+them on `query`. A timed-out query whose extended poll was still running at
+shutdown appears **here but not there** — which is precisely the query you most
+want the pk of.
 
 ### ARS completion tracking (`ars_completion.csv`)
 
@@ -166,8 +380,9 @@ without the jargon:
 | **RPS** | Requests Per Second — how many queries the service actually completed each second during that stage. Higher is faster. |
 | **Latency** | How long one query took, in **milliseconds** (1000 ms = 1 second). |
 | **mean / p50 / p95 / p99** | Different ways to summarize latency. *mean* is the average. *p50* (median) is the typical query. *p95* / *p99* are the slow tail: "95% (or 99%) of queries were at least this fast." p99 is the one we hold to a standard, because it captures the bad experiences, not just the average. |
-| **Error rate** | The fraction of queries that failed (e.g. `0.02` = 2%). For the ARS, a query that finishes but returns **zero answers** also counts as a failure. |
+| **Error rate** | The fraction of queries that failed (e.g. `0.02` = 2%). For the ARS, a query that finishes but returns **zero answers** also counts as a failure by default — a per-target flag can change that, and the run says which policy applied. |
 | **SLO** | Service Level Objective — the line in the sand for "acceptable." Here it's a p99 latency cap (e.g. `60000` ms = 60 s) plus a max error rate (default **1%**). A stage "passes" only if it stays under both. |
+| **Checkpoint** | A pass/fail question asked of one specific load level ("does 30 simultaneous users still work?"), with its own latency/error bars. Only the mixed capacity profile defines these; other runs just report the knee. |
 | **Knee** | The highest-load stage that still passes the SLO. It's the headline result: the most simultaneous users the service handled while staying fast enough and reliable enough. Past the knee, things fall apart. |
 
 ### Start here: `summary.json`
@@ -186,6 +401,11 @@ set tighter than the service can ever meet).
 
 The same file also echoes the **`config`** that produced the run (which target,
 which endpoint, the SLO, the ramp stages) so a result is self-documenting.
+
+On a run with acceptance criteria (`aras_mixed` / `ars_mixed`), two more fields
+answer the pass/fail question directly: **`checkpoints_passed`** (one boolean for
+the whole run) and **`checkpoints`** (per-level verdicts and why). See
+["Mixed capacity profile"](#mixed-capacity-profile-aras_mixed--ars_mixed).
 
 ### Reading `stages.csv` — the story of the ramp
 
@@ -295,9 +515,19 @@ quick visual feel and for sharing a screenshot.
   `edges`); the `(chemical, disease)` pair varies per request from a curated
   `CHEM_DISEASE_PAIRS` list — **swap these** for pairs your service knows, and keep
   them plausibly connected so paths come back non-empty (on ARS a zero-result
-  `Done` is a failure). It's the heaviest query class, so its targets ship the
+  `Done` is a failure by default). It's the heaviest query class, so its targets ship the
   gentlest ramps and loosest SLOs (and, for `ars_pathfinder`, the longest
   `max_poll_s`); tune them in `config.py`.
+- **The mixed profile blends the two ARA/ARS classes** (`aras_mixed` /
+  `ars_mixed`). `MIXED_CORPUS` is *computed* from `SHEPHERD_CORPUS` +
+  `PATHFINDER_CORPUS` at the `INFERRED_PATHFINDER_RATIO` (2:1), so it tracks any
+  retuning of the inferred mix. Change the blend by editing that ratio; change
+  what counts as a pass by editing the per-target `checkpoints` in `config.py`.
+  Because 1/3 of the mix is Pathfinder — the heaviest class — and p99 is a tail
+  statistic, both mixed targets inherit the looser Pathfinder SLO. `aras_mixed`
+  also raises `request_timeout_s` above the default 210 s: a sync target whose p99
+  SLO sits near the HTTP timeout records slow queries as client timeouts (errors)
+  instead of latencies.
 - **Adjust corpus weights** in `RETRIEVER_CORPUS` / `SHEPHERD_CORPUS` to match
   your traffic mix.
 

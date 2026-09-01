@@ -16,16 +16,26 @@ Sync targets (KP/ARA) POST once; the async ARS target submits then polls
 capturing health signals (result-count variation, zero-result "Done" responses,
 response size, result-drop-under-load) and surfacing them as red flags.
 
+A target may also configure acceptance ``checkpoints`` (config.py): pass/fail
+criteria at named concurrency levels, judged against the stage that ran them.
+That turns a run from "find the knee" into "does the system hold N concurrent
+queries?" -- the knee is still computed. A missed checkpoint exits non-zero.
+
 Outputs:
   - <prefix>_stages.csv         one row per stage (overall)
   - <prefix>_by_qtype.csv       one row per (stage, qtype)
+  - <prefix>_checkpoints.csv    targets with acceptance criteria: one row per
+                                checkpoint with its PASS/FAIL verdict
   - <prefix>_ars_health.csv     ARS only: per-stage health signals
+  - <prefix>_ars_queries.csv    ARS only: one row per logical query -- pk, the
+                                HTTP status of each step, terminal ARS status,
+                                and a URL to pull that query up for debugging
   - <prefix>_ars_completion.csv ARS only: per-query end-to-end response time +
                                 whether it eventually finished (polled past the
                                 max_poll_s failure threshold up to
                                 completion_max_poll_s)
-  - <prefix>_summary.json       config, all stages, the knee (+ ars_health/
-                                completion/red_flags)
+  - <prefix>_summary.json       config, all stages, the knee (+ checkpoints,
+                                ars_health/completion/red_flags)
 
 Usage (headless, recommended for reproducible numbers):
 
@@ -37,6 +47,7 @@ The LoadTestShape drives users/duration, so you do NOT pass -u / -r / -t.
 Per-target load/SLO and the ARS poll knobs live in config.py.
 """
 
+import itertools
 import json
 import os
 import statistics
@@ -59,12 +70,30 @@ from trapi_corpus import corpus_for
 # Set by the helmsdeep CLI; defaults so `locust -f` works directly.
 TARGET = os.environ.get("LOADTEST_TARGET", config.DEFAULT_TARGET)
 _TGT = config.TARGETS[TARGET]
+
+# Optional wall-clock budget (--time-budget / --quick on the CLI). Compresses the
+# stage holds, cooldowns, and poll/timeout caps to fit; the ramp itself -- user
+# counts, SLOs, checkpoints -- is untouched. TIME_SCALE is 1.0 for a full run and
+# is stamped on the outputs, because a compressed run trades away the sample
+# count its percentiles and error rates rest on (see config.time_scaled).
+_BUDGET_S = os.environ.get("HELMSDEEP_TIME_BUDGET_S")
+TIME_SCALE = 1.0
+if _BUDGET_S:
+    _TGT, TIME_SCALE = config.time_scaled(_TGT, float(_BUDGET_S))
+
 ENDPOINT = _TGT["endpoint"]    # request path for this component
 CORPUS = corpus_for(_TGT["corpus"])   # query subset for this component
 STAGES = _TGT["stages"]               # per-target step-load ramp
 P99_SLO_MS = _TGT["p99_slo_ms"]       # per-target knee threshold
 MAX_ERROR_RATE = config.MAX_ERROR_RATE   # shared error-rate cap
-REQUEST_TIMEOUT = 210           # seconds; per individual HTTP call
+# Per individual HTTP call. Default 210s; a target whose p99 SLO sits near or
+# above that raises it (otherwise slow queries land as client timeouts, i.e.
+# errors, and the latency they would have reported is never measured).
+REQUEST_TIMEOUT = _TGT.get("request_timeout_s", 210)
+
+# Optional pass/fail acceptance criteria at named concurrency levels (see
+# config.py). Empty for the plain find-the-knee targets.
+CHECKPOINTS = _TGT.get("checkpoints", [])
 
 # ARS is asynchronous (submit -> poll /messages/{pk} -> fetch merged). These are
 # unused by the sync (KP/ARA) path.
@@ -77,6 +106,13 @@ MAX_POLL_S = _TGT.get("max_poll_s", 900)
 # keeps polling up to here to record whether it *eventually* finishes. Defaults
 # to MAX_POLL_S, i.e. no extended tracking.
 COMPLETION_MAX_POLL_S = max(_TGT.get("completion_max_poll_s", MAX_POLL_S), MAX_POLL_S)
+# Whether a terminal "Done" carrying 0 results scores as a failure (and so counts
+# against the knee). Defaults True: an empty answer set under load usually means a
+# downstream agent silently dropped out. When False, only transport/protocol
+# outcomes (submit error, Error status, Timeout) fail, and the zero-result query's
+# latency joins the percentile pool instead of being discarded -- but it is still
+# tallied in ars_health and still raises a red flag.
+ZERO_RESULT_IS_FAILURE = _TGT.get("zero_result_is_failure", True)
 
 # Detached greenlets still polling timed-out queries for the completion sidecar;
 # on_test_stop drains them (bounded) so their rows make it into the file.
@@ -120,6 +156,19 @@ class StageCollector:
         # finish (polled up to COMPLETION_MAX_POLL_S, beyond the max_poll_s
         # failure threshold) and its true end-to-end response time.
         self.completions = []
+        # ARS per-query debug log: one row per logical query, carrying the pk and
+        # the status codes needed to pull that exact query up afterwards.
+        self.queries = []
+        # Ids are handed out at submit time and shared by both per-query files,
+        # so a row in one joins to its row in the other.
+        self._next_query_id = itertools.count()
+
+    def new_query_id(self):
+        return next(self._next_query_id)
+
+    def record_query(self, row):
+        """Append one ARS per-query debug row (pk + status codes + outcome)."""
+        self.queries.append(row)
 
     def mark_stage(self, idx):
         if idx != self.stage_idx:
@@ -157,14 +206,16 @@ class StageCollector:
             self.response_bytes[s][qtype].append(response_bytes)
             self.response_bytes[s]["__all__"].append(response_bytes)
 
-    def record_completion(self, *, stage, qtype, total_ms, finished, status,
-                          start_ts):
+    def record_completion(self, *, query_id, stage, qtype, total_ms, finished,
+                          status, start_ts):
         """Record one ARS completion-sidecar row. `finished` == the query reached
         a terminal status (Done or Error); the `status` column preserves which.
         Purely a sidecar -- never feeds the per-stage stats or the knee.
         """
         self.completions.append({
-            "query": len(self.completions),
+            # Same id as this query's row in the per-query debug log, so the two
+            # files join (a detached extended poll lands here out of order).
+            "query": query_id,
             "stage": stage,
             "qtype": qtype,
             "submit_start": time.strftime("%Y-%m-%dT%H:%M:%SZ",
@@ -253,6 +304,55 @@ def _ars_stage_health(idx, qtype="__all__"):
     }
 
 
+def _evaluate_checkpoints(overall_rows):
+    """Judge each configured checkpoint against the stage that ran its user count.
+
+    A checkpoint asks a pass/fail question ("does 30 concurrent hold?") rather
+    than the knee's open one ("how far can we go?"), so each one carries its own
+    bars: ``p99_slo_ms`` (omitted = the target's, ``None`` = latency not judged,
+    for an overload probe where slowdown is expected but failures are not) and
+    ``max_error_rate`` (omitted = the shared cap).
+    """
+    # Match on user count; if two stages ran the same count, the later one wins.
+    by_users = {r["users"]: r for r in overall_rows if r["users"] is not None}
+    results = []
+    for cp in CHECKPOINTS:
+        users = cp["users"]
+        p99_bar = cp.get("p99_slo_ms", P99_SLO_MS)
+        err_bar = cp.get("max_error_rate", MAX_ERROR_RATE)
+        row = by_users.get(users)
+        base = {
+            "users": users,
+            "goal": cp.get("goal", ""),
+            "p99_slo_ms": p99_bar,
+            "max_error_rate": err_bar,
+        }
+        if row is None or not row["requests"]:
+            results.append({**base, "stage": row["stage"] if row else None,
+                            "requests": row["requests"] if row else 0,
+                            "p99_ms": None, "error_rate": None, "concurrency": None,
+                            "verdict": "NO DATA",
+                            "detail": f"no completed requests at {users} users"})
+            continue
+        misses = []
+        if p99_bar is not None and row["p99_ms"] > p99_bar:
+            misses.append(f"p99 {row['p99_ms']:.0f}ms > {p99_bar}ms")
+        if row["error_rate"] > err_bar:
+            misses.append(f"errors {row['error_rate'] * 100:.2f}% > "
+                          f"{err_bar * 100:.2f}%")
+        results.append({
+            **base,
+            "stage": row["stage"],
+            "requests": row["requests"],
+            "p99_ms": row["p99_ms"],
+            "error_rate": row["error_rate"],
+            "concurrency": row["concurrency"],
+            "verdict": "FAIL" if misses else "PASS",
+            "detail": "; ".join(misses) if misses else "within limits",
+        })
+    return results
+
+
 # ----------------------------------------------------------------------------
 # The user: picks a weighted TRAPI query, POSTs it, records by qtype.
 # Sync targets (KP/ARA) POST once; the ARS target submits then polls/merges.
@@ -313,15 +413,53 @@ class TRAPIUser(HttpUser):
             context={"qtype": qtype},
         )
 
-    def _record_completion(self, qtype, start, finished, status, stage):
+    def _record_completion(self, query_id, qtype, start, finished, status, stage):
         """Append one completion-sidecar row for a logical ARS query."""
         COLLECTOR.record_completion(
-            stage=stage, qtype=qtype,
+            query_id=query_id, stage=stage, qtype=qtype,
             total_ms=(time.time() - start) * 1000.0,
             finished=finished, status=status, start_ts=start,
         )
 
-    def _extended_poll(self, qtype, pk, start, stage):
+    def _message_url(self, pk):
+        """Full URL for pulling one ARS query up by hand (curl / browser)."""
+        return f"{self.host.rstrip('/')}{MESSAGES_PATH}/{pk}?trace=y" if pk else ""
+
+    def _record_query(self, query_id, qtype, pk, start, ars_status, *,
+                      failed, error=None, submit_http=None, poll_http=None,
+                      merge_http=None, polls=0, result_count=None,
+                      response_bytes=None, stage=None):
+        """Append one row to the ARS per-query debug log.
+
+        Written for EVERY logical query, terminal or not -- the failures are the
+        rows you actually want when debugging, and they are exactly the ones the
+        completion sidecar can be missing.
+        """
+        # Attributed to the stage active when the query REACHED ITS OUTCOME, the
+        # same rule the per-stage stats bucket by -- so a slow query's row lines
+        # up with the stage whose numbers it moved.
+        stage = COLLECTOR.stage_idx if stage is None else stage
+        COLLECTOR.record_query({
+            "query": query_id,
+            "pk": pk or "",
+            "stage": stage,
+            "users": STAGES[stage][0] if stage < len(STAGES) else "",
+            "qtype": qtype,
+            "submit_start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start)),
+            "latency_s": round(time.time() - start, 2),
+            "ars_status": ars_status,
+            "failed": failed,
+            "submit_http": submit_http if submit_http is not None else "",
+            "poll_http": poll_http if poll_http is not None else "",
+            "merge_http": merge_http if merge_http is not None else "",
+            "polls": polls,
+            "result_count": result_count if result_count is not None else "",
+            "response_bytes": response_bytes if response_bytes is not None else "",
+            "error": error or "",
+            "message_url": self._message_url(pk),
+        })
+
+    def _extended_poll(self, query_id, qtype, pk, start, stage):
         """Background greenlet: a query already blew MAX_POLL_S (and is already a
         Timeout failure in the main stats). Keep polling up to
         COMPLETION_MAX_POLL_S to record, in the sidecar only, whether it
@@ -349,7 +487,7 @@ class TRAPIUser(HttpUser):
                     continue   # transient; keep polling until the deadline
         finally:
             self._record_completion(
-                qtype, start,
+                query_id, qtype, start,
                 finished=(status in ("Done", "Error")),
                 status=(status if status in ("Done", "Error") else "Timeout"),
                 stage=stage,
@@ -362,9 +500,11 @@ class TRAPIUser(HttpUser):
         query, plus one synthetic 'ars_query' Locust request event carrying that
         same full wall-clock (the submit/poll/merge HTTP calls also show
         separately in Locust's own table for diagnostics, but are not
-        double-counted as the query time). A Done with 0 results is a failure.
+        double-counted as the query time). A Done with 0 results is a failure
+        unless the target sets zero_result_is_failure=False.
         """
         start = time.time()
+        query_id = COLLECTOR.new_query_id()
 
         def _elapsed_ms():
             return (time.time() - start) * 1000.0
@@ -374,13 +514,17 @@ class TRAPIUser(HttpUser):
             ENDPOINT, json=payload, name="ars_submit",
             timeout=REQUEST_TIMEOUT, catch_response=True,
         ) as resp:
-            if resp.status_code != 201:
-                resp.failure(f"submit status {resp.status_code}")
+            submit_http = resp.status_code
+            if submit_http != 201:
+                resp.failure(f"submit status {submit_http}")
                 self._record_ars(qtype, _elapsed_ms(), True,
-                                 f"submit status {resp.status_code}",
+                                 f"submit status {submit_http}",
                                  status="SubmitError")
-                self._record_completion(qtype, start, False, "SubmitError",
-                                        COLLECTOR.stage_idx)
+                self._record_query(query_id, qtype, None, start, "SubmitError",
+                                   failed=True, submit_http=submit_http,
+                                   error=f"submit status {submit_http}")
+                self._record_completion(query_id, qtype, start, False,
+                                        "SubmitError", COLLECTOR.stage_idx)
                 return
             try:
                 pk = (resp.json() or {}).get("pk")
@@ -390,7 +534,10 @@ class TRAPIUser(HttpUser):
                 resp.failure("no pk in submit response")
                 self._record_ars(qtype, _elapsed_ms(), True,
                                  "no pk in submit response", status="NoPK")
-                self._record_completion(qtype, start, False, "NoPK",
+                self._record_query(query_id, qtype, None, start, "NoPK",
+                                   failed=True, submit_http=submit_http,
+                                   error="no pk in submit response")
+                self._record_completion(query_id, qtype, start, False, "NoPK",
                                         COLLECTOR.stage_idx)
                 return
             resp.success()
@@ -398,15 +545,19 @@ class TRAPIUser(HttpUser):
         # 2) Poll until Done/Error or the per-query cap.
         status = None
         merged_pk = None
+        poll_http = None      # last poll HTTP code seen -- for the debug log
+        polls = 0
         deadline = start + MAX_POLL_S
         while time.time() < deadline:
             gevent.sleep(POLL_INTERVAL_S)   # cooperative; never time.sleep
+            polls += 1
             with self.client.get(
                 f"{MESSAGES_PATH}/{pk}?trace=y", name="ars_poll",
                 timeout=REQUEST_TIMEOUT, catch_response=True,
             ) as resp:
-                if resp.status_code != 200:
-                    resp.failure(f"poll status {resp.status_code}")
+                poll_http = resp.status_code
+                if poll_http != 200:
+                    resp.failure(f"poll status {poll_http}")
                     continue   # transient; keep polling until the deadline
                 resp.success()
                 try:
@@ -422,17 +573,35 @@ class TRAPIUser(HttpUser):
         # is attributed to; the completion sidecar row uses the same stage.
         stage = COLLECTOR.stage_idx
         if status == "Done":
-            result_count, nbytes = self._fetch_merged(merged_pk)
+            result_count, nbytes, merge_http = self._fetch_merged(merged_pk)
+            zero_result = result_count == 0
+            # Whether an empty answer set scores against the error rate (and so
+            # the knee) is a per-target policy -- see ZERO_RESULT_IS_FAILURE.
+            failed = zero_result and ZERO_RESULT_IS_FAILURE
             self._record_ars(
-                qtype, _elapsed_ms(), failed=(result_count == 0),
-                exc_msg=("Done with 0 results" if result_count == 0 else None),
+                qtype, _elapsed_ms(), failed=failed,
+                exc_msg=("Done with 0 results" if zero_result else None),
                 status="Done", result_count=result_count, response_bytes=nbytes,
             )
-            self._record_completion(qtype, start, True, "Done", stage)
+            self._record_query(query_id, qtype, pk, start, "Done",
+                               # `failed` follows the policy, so the debug log
+                               # agrees with how the query was actually scored;
+                               # the note is recorded either way, since an empty
+                               # answer set is still why you'd open this pk.
+                               failed=failed,
+                               error=("Done with 0 results" if zero_result else None),
+                               submit_http=submit_http, poll_http=poll_http,
+                               merge_http=merge_http, polls=polls,
+                               result_count=result_count, response_bytes=nbytes,
+                               stage=stage)
+            self._record_completion(query_id, qtype, start, True, "Done", stage)
         elif status == "Error":
             self._record_ars(qtype, _elapsed_ms(), True, "ARS Error status",
                              status="Error")
-            self._record_completion(qtype, start, True, "Error", stage)
+            self._record_query(query_id, qtype, pk, start, "Error", failed=True,
+                               error="ARS Error status", submit_http=submit_http,
+                               poll_http=poll_http, polls=polls, stage=stage)
+            self._record_completion(query_id, qtype, start, True, "Error", stage)
         else:
             # Not terminal within MAX_POLL_S: fail the main measurement now
             # (unchanged). Then, if an extended cap is configured, keep polling in
@@ -441,16 +610,26 @@ class TRAPIUser(HttpUser):
             self._record_ars(qtype, _elapsed_ms(), True,
                              f"no terminal status within {MAX_POLL_S}s",
                              status="Timeout")
+            # The pk is the point of this row: a timed-out query is the one you
+            # most want to pull up by hand afterwards. `status` here is the last
+            # non-terminal status the ARS reported (e.g. Running), if any.
+            self._record_query(query_id, qtype, pk, start, "Timeout", failed=True,
+                               error=(f"no terminal status within {MAX_POLL_S}s"
+                                      + (f" (last: {status})" if status else "")),
+                               submit_http=submit_http, poll_http=poll_http,
+                               polls=polls, stage=stage)
             if COMPLETION_MAX_POLL_S > MAX_POLL_S:
-                g = gevent.spawn(self._extended_poll, qtype, pk, start, stage)
+                g = gevent.spawn(self._extended_poll, query_id, qtype, pk, start,
+                                 stage)
                 _COMPLETION_GREENLETS.append(g)
             else:
-                self._record_completion(qtype, start, False, "Timeout", stage)
+                self._record_completion(query_id, qtype, start, False, "Timeout",
+                                        stage)
 
     def _fetch_merged(self, merged_pk):
-        """Fetch the merged message; return (result_count, response_bytes)."""
+        """Fetch the merged message; return (result_count, response_bytes, http)."""
         if not merged_pk:
-            return 0, 0
+            return 0, 0, None
         with self.client.get(
             f"{MESSAGES_PATH}/{merged_pk}", name="ars_merge",
             timeout=REQUEST_TIMEOUT, catch_response=True,
@@ -458,15 +637,15 @@ class TRAPIUser(HttpUser):
             nbytes = len(resp.content or b"")
             if resp.status_code != 200:
                 resp.failure(f"merge status {resp.status_code}")
-                return 0, nbytes
+                return 0, nbytes, resp.status_code
             resp.success()
             try:
                 body = resp.json() or {}
                 results = (((body.get("fields") or {}).get("data") or {})
                            .get("message") or {}).get("results") or []
-                return len(results), nbytes
+                return len(results), nbytes, resp.status_code
             except Exception:
-                return 0, nbytes
+                return 0, nbytes, resp.status_code
 
 
 # When cooldown is enabled, stages ramp down to 0 users between holds. Set a
@@ -556,6 +735,9 @@ def on_test_stop(environment, **_kw):
             if knee is None or row["concurrency"] > knee["concurrency"]:
                 knee = row
 
+    # Pass/fail acceptance checkpoints (targets that configure them).
+    checkpoints = _evaluate_checkpoints(overall_rows)
+
     # ARS health signals + red flags (async target only).
     ars_health = []
     red_flags = []
@@ -584,9 +766,11 @@ def on_test_stop(environment, **_kw):
         for h in ars_health:
             i = h["stage"]
             if h["zero_result_done"]:
+                scored = ("counted as failures" if ZERO_RESULT_IS_FAILURE
+                          else "NOT counted as failures per zero_result_is_failure=False")
                 red_flags.append(
                     f"Stage {i}: {h['zero_result_done']} 'Done' response(s) returned "
-                    f"0 results (counted as failures; possible silent downstream break).")
+                    f"0 results ({scored}; possible silent downstream break).")
             if h["errored"]:
                 red_flags.append(f"Stage {i}: {h['errored']} query/queries returned Error status.")
             if h["timed_out"]:
@@ -640,6 +824,17 @@ def on_test_stop(environment, **_kw):
         for r in qtype_rows:
             f.write(",".join(str(r[k]) for k in qfields) + "\n")
 
+    # Write the checkpoints CSV (targets that configure acceptance criteria).
+    kfields = ["users", "goal", "stage", "requests", "p99_ms", "p99_slo_ms",
+               "error_rate", "max_error_rate", "concurrency", "verdict", "detail"]
+    if checkpoints:
+        with open(f"{CSV_PREFIX}_checkpoints.csv", "w") as f:
+            f.write(",".join(kfields) + "\n")
+            for r in checkpoints:
+                # Free-text columns are semicolon-separated; strip stray commas
+                # so the naive CSV writer can't produce a ragged row.
+                f.write(",".join(str(r[k]).replace(",", ";") for k in kfields) + "\n")
+
     # Write ARS health CSV (async target only).
     hfields = ["stage", "requests", "done", "errored", "timed_out",
                "submit_failed", "zero_result_done", "results_min",
@@ -650,6 +845,22 @@ def on_test_stop(environment, **_kw):
             f.write(",".join(hfields) + "\n")
             for r in ars_health:
                 f.write(",".join(str(r[k]) for k in hfields) + "\n")
+
+    # Write the ARS per-query debug log (async target only): one row per logical
+    # query with its pk, the HTTP status of each step, the terminal ARS status,
+    # and a ready-made URL -- so a specific query can be pulled up afterwards.
+    queries = COLLECTOR.queries
+    qlfields = ["query", "pk", "stage", "users", "qtype", "submit_start",
+                "latency_s", "ars_status", "failed", "submit_http", "poll_http",
+                "merge_http", "polls", "result_count", "response_bytes", "error",
+                "message_url"]
+    if queries:
+        with open(f"{CSV_PREFIX}_ars_queries.csv", "w") as f:
+            f.write(",".join(qlfields) + "\n")
+            for r in queries:
+                # `error` is free text; keep the naive writer's rows rectangular.
+                f.write(",".join(str(r[k]).replace(",", ";") for k in qlfields)
+                        + "\n")
 
     # Write ARS completion sidecar (async target only): one row per logical query
     # -- end-to-end response time + whether it eventually finished (polled up to
@@ -665,6 +876,9 @@ def on_test_stop(environment, **_kw):
     summary = {
         "config": {
             "target": TARGET,
+            # < 1.0 means the run was compressed to a wall-clock budget: same
+            # ramp, far fewer samples per stage, tighter poll/timeout caps.
+            "time_scale": round(TIME_SCALE, 4),
             "component": _TGT["label"],
             "endpoint": ENDPOINT,
             "protocol": PROTOCOL,
@@ -677,7 +891,12 @@ def on_test_stop(environment, **_kw):
         "knee": knee,
         "max_sustainable_concurrency": knee["concurrency"] if knee else None,
     }
+    if checkpoints:
+        summary["config"]["checkpoints"] = CHECKPOINTS
+        summary["checkpoints"] = checkpoints
+        summary["checkpoints_passed"] = all(c["verdict"] == "PASS" for c in checkpoints)
     if PROTOCOL == "async":
+        summary["config"]["zero_result_is_failure"] = ZERO_RESULT_IS_FAILURE
         summary["ars_health"] = ars_health
         summary["completion"] = completion_summary
         summary["red_flags"] = red_flags
@@ -687,6 +906,13 @@ def on_test_stop(environment, **_kw):
     print("\n" + "=" * 64)
     print("TRAPI LOAD TEST SUMMARY")
     print("=" * 64)
+    if TIME_SCALE < 1.0:
+        print(f"[!] COMPRESSED RUN (time scale {TIME_SCALE:.2f}). Stage holds and "
+              f"poll/timeout caps\n    were shortened to fit a wall-clock budget. "
+              f"Percentiles rest on far fewer\n    samples and the tighter caps "
+              f"turn slow queries into timeouts, so treat these\n    numbers -- and "
+              f"any checkpoint verdict -- as indicative, not a measurement.")
+        print("-" * 64)
     hdr = f"{'stg':>3} {'usr':>4} {'rps':>7} {'p50':>7} {'p95':>8} {'p99':>8} {'err%':>6} {'conc':>7}"
     print(hdr)
     for r in overall_rows:
@@ -702,10 +928,36 @@ def on_test_stop(environment, **_kw):
         print("No stage met the SLO -- service saturated below the first stage, "
               "or SLO is too strict. Lower the first stage or relax P99_SLO_MS.")
 
+    if checkpoints:
+        print("-" * 64)
+        print("ACCEPTANCE CHECKPOINTS")
+        print(f"{'usr':>4} {'p99':>8} {'bar':>8} {'err%':>6} {'bar':>6} "
+              f"{'verdict':>8}  goal")
+        for c in checkpoints:
+            p99 = f"{c['p99_ms']:.0f}" if c["p99_ms"] is not None else "-"
+            bar = f"{c['p99_slo_ms']:.0f}" if c["p99_slo_ms"] is not None else "n/a"
+            err = f"{c['error_rate'] * 100:.1f}" if c["error_rate"] is not None else "-"
+            print(f"{c['users']:>4} {p99:>8} {bar:>8} {err:>6} "
+                  f"{c['max_error_rate'] * 100:>6.1f} {c['verdict']:>8}  {c['goal']}")
+            if c["verdict"] != "PASS":
+                print(f"     -> {c['detail']}")
+        failed = [c for c in checkpoints if c["verdict"] != "PASS"]
+        if failed:
+            print(f"RESULT: {len(failed)} of {len(checkpoints)} checkpoint(s) not met.")
+            # Non-zero exit so a CI/acceptance run fails on its own criteria.
+            environment.process_exit_code = 1
+        else:
+            print(f"RESULT: all {len(checkpoints)} checkpoints met.")
+
     wrote = [f"{CSV_PREFIX}_stages.csv", f"{CSV_PREFIX}_by_qtype.csv"]
+    if checkpoints:
+        wrote.append(f"{CSV_PREFIX}_checkpoints.csv")
     if ars_health:
         print("-" * 64)
         print("ARS HEALTH (per stage)")
+        print(f"  0-result 'Done' scored as: "
+              f"{'FAILURE' if ZERO_RESULT_IS_FAILURE else 'success'} "
+              f"(zero_result_is_failure={ZERO_RESULT_IS_FAILURE})")
         hh = (f"{'stg':>3} {'req':>4} {'done':>5} {'err':>4} {'t/o':>4} "
               f"{'0res':>5} {'res_mean':>9} {'res_cv':>7} {'bytes_max':>10}")
         print(hh)
@@ -723,6 +975,18 @@ def on_test_stop(environment, **_kw):
                   f"{c['finished_after_slo']} after), "
                   f"{c['never_finished']} never finished, "
                   f"{c['submit_failed']} submit-failed")
+        failed_queries = [q for q in queries if q["failed"]]
+        if failed_queries:
+            print("-" * 64)
+            shown = failed_queries[:5]
+            print(f"FAILED QUERIES ({len(failed_queries)} of {len(queries)}; "
+                  f"first {len(shown)} shown, all in "
+                  f"{CSV_PREFIX}_ars_queries.csv)")
+            for q in shown:
+                print(f"  stage {q['stage']} {q['qtype']} [{q['ars_status']}] "
+                      f"pk={q['pk'] or '(none)'} -- {q['error']}")
+                if q["message_url"]:
+                    print(f"    {q['message_url']}")
         print("-" * 64)
         if red_flags:
             print(f"RED FLAGS ({len(red_flags)}):")
@@ -731,6 +995,8 @@ def on_test_stop(environment, **_kw):
         else:
             print("RED FLAGS: none detected.")
         wrote.append(f"{CSV_PREFIX}_ars_health.csv")
+        if queries:
+            wrote.append(f"{CSV_PREFIX}_ars_queries.csv")
         if completions:
             wrote.append(f"{CSV_PREFIX}_ars_completion.csv")
     wrote.append(f"{CSV_PREFIX}_summary.json")

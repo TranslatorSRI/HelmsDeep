@@ -54,9 +54,14 @@ subset. The tool must route the correct corpus + protocol per target.
 only** (never KPs). It pins **two** endpoint entities and asks for connecting
 paths via a `paths` map in the query_graph (not `edges`; no `knowledge_type`). It
 gets its **own run types** — `aras_pathfinder` (sync, via the ARA `/query`) and
-`ars_pathfinder` (async, via the ARS submit/poll/merge) — so it's never mixed into
-the inferred corpus. Same protocols/endpoints as `aras`/`ars`, just a different
-corpus + a gentler ramp / looser SLO.
+`ars_pathfinder` (async, via the ARS submit/poll/merge) — so the single-class
+targets never mix it into the inferred corpus. Same protocols/endpoints as
+`aras`/`ars`, just a different corpus + a gentler ramp / looser SLO.
+
+The one place the classes *are* combined is the **mixed capacity profile**
+(`aras_mixed`/`ars_mixed`): a deliberate 2/3 inferred + 1/3 Pathfinder blend that
+asks whether the system holds a target concurrency under the workload mix
+production actually sends, rather than characterizing one class in isolation.
 
 ### Retriever and the `tier` parameter
 
@@ -110,8 +115,9 @@ sent (`lookup` for KPs, `inferred` for ARAs/ARS) — both selected from
 Package `helmsdeep/`:
 
 - **`config.py`** — the target registry. `TARGETS` maps each `--targets` value
-  (`kps`/`aras`/`ars` plus the Pathfinder run types `aras_pathfinder`/
-  `ars_pathfinder`) to a component config: `label`, `endpoint`, `corpus`
+  (`kps`/`aras`/`ars`, the Pathfinder run types `aras_pathfinder`/
+  `ars_pathfinder`, and the mixed capacity profile `aras_mixed`/`ars_mixed`) to a
+  component config: `label`, `endpoint`, `corpus`
   (key into the corpus module), `protocol` (`sync`/`async`), `implemented`, and
   per-target `stages` + `p99_slo_ms` + an optional `cooldown_s` (a quiet gap
   between stages — users ramp to 0 so slow in-flight queries drain into the stage
@@ -120,18 +126,40 @@ Package `helmsdeep/`:
   `messages_endpoint`, `poll_interval_s`, `max_poll_s`, and an optional
   `completion_max_poll_s` (>= `max_poll_s`; the extended cap for the completion
   sidecar — how long a background poller keeps watching a timed-out query to see if
-  it *eventually* finishes; defaults to `max_poll_s` = off). The `*_pathfinder` targets
+  it *eventually* finishes; defaults to `max_poll_s` = off) and an optional
+  `zero_result_is_failure` (whether a terminal `Done` carrying 0 results scores
+  as a failure; defaults to `True`). The `*_pathfinder` targets
   reuse the ARA/ARS endpoints + protocols but point at the `pathfinder` corpus and
   ship a gentler ramp + looser SLO (pinned-two-endpoint path-finding is the
-  heaviest query class). `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
+  heaviest query class). The `*_mixed` targets add two more optional fields:
+  `request_timeout_s` (per-HTTP-call timeout, default 210; raised on `aras_mixed`
+  so its 5-min p99 SLO is measurable instead of landing as client timeouts) and
+  `checkpoints` — a list of pass/fail acceptance criteria (`users`, `goal`,
+  `p99_slo_ms`, `max_error_rate`) evaluated against the stage that ran that many
+  users. `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
   Per-target ramps/SLOs live here because cost profiles differ wildly by layer.
+  `natural_duration_s()` and `time_scaled(cfg, budget_s)` implement
+  `--time-budget`/`--quick`: `time_scaled` returns a `(compressed_cfg, scale)`
+  pair whose *durations* (stage holds, `cooldown_s`, `request_timeout_s`,
+  `max_poll_s`/`completion_max_poll_s`/`poll_interval_s`) are scaled to fit the
+  budget, with per-knob floors (`MIN_HOLD_S` etc.) and spawn rates raised so a
+  short stage still spends its time at load rather than climbing to it. The
+  *shape* — users, SLOs, checkpoints — is never touched, and a budget above the
+  natural duration is a no-op (scale 1.0): it only ever speeds a run up.
 - **`cli.py`** — the `helmsdeep` entry point (registered in
   `setup.py` `console_scripts`). Parses `--targets` (required, one layer),
-  `--host` (required), `--csv-prefix`; rejects not-yet-`implemented` targets;
-  sets `LOADTEST_TARGET` (+ `LOCUST_CSV_PREFIX`) and launches
-  `python -m locust -f trapi_loadtest.py --headless --host …`.
+  `--host` (required), `--csv-prefix`, and the mutually exclusive
+  `--time-budget DURATION` / `--quick` (= `--time-budget 10m`); rejects
+  not-yet-`implemented` targets; sets `LOADTEST_TARGET` (+ `LOCUST_CSV_PREFIX`,
+  + `HELMSDEEP_TIME_BUDGET_S` when a budget is given) and launches
+  `python -m locust -f trapi_loadtest.py --headless --host …`. `_print_plan()`
+  shows the (possibly compressed) ramp and what was traded away before the run
+  starts; `_duration()` parses `600`/`90s`/`10m`/`1h30m`.
 - **`trapi_loadtest.py`** — the measurement engine (Locust). The component under
-  test is chosen by `LOADTEST_TARGET`; `ENDPOINT`, `CORPUS`, `STAGES`,
+  test is chosen by `LOADTEST_TARGET`, and when `HELMSDEEP_TIME_BUDGET_S` is set
+  the target config is passed through `config.time_scaled` at import (module-level
+  `TIME_SCALE`, stamped into `summary.json` as `config.time_scale` and printed as
+  a warning banner) so everything downstream reads the compressed values; `ENDPOINT`, `CORPUS`, `STAGES`,
   `P99_SLO_MS`, and the async knobs (`PROTOCOL`, `MESSAGES_PATH`,
   `POLL_INTERVAL_S`, `MAX_POLL_S`) plus `COOLDOWN_S` are all derived from
   `config.TARGETS[...]`.
@@ -142,7 +170,9 @@ Package `helmsdeep/`:
     `stop_timeout = REQUEST_TIMEOUT` so a slow in-flight query finishes rather than
     being killed when users ramp to 0.
   - `StageCollector` / `COLLECTOR` — buckets every completed request into the
-    stage active when it *finished* (per-stage, per-`qtype`). Records each stage's
+    stage active when it *finished* (per-stage, per-`qtype`). Also holds the two
+    per-query ARS lists (`queries`, `completions`) and hands out the shared
+    `new_query_id()` that joins them. Records each stage's
     wall-clock `stage_started` / `stage_ended` (the latter is `setdefault`, so a
     cooldown freeze isn't overwritten by the next `mark_stage`). `record()` also
     takes optional ARS signals: `status`, `result_count`, `response_bytes`.
@@ -151,17 +181,30 @@ Package `helmsdeep/`:
   - `TRAPIUser(HttpUser)` — dispatches on `PROTOCOL`: `_run_sync()` (KP/ARA: one
     blocking `POST`) or `_run_ars()` (submit → poll `/messages/{pk}` with
     `gevent.sleep` until `Done`/`Error`/timeout → `_fetch_merged()` counts
-    `fields.data.message.results`). One `COLLECTOR.record` per logical query. When a
+    `fields.data.message.results` and returns its HTTP status). One
+    `COLLECTOR.record` per logical query, plus one `COLLECTOR.record_query` debug
+    row (`_record_query`) carrying the `pk`, the submit/poll/merge HTTP codes, the
+    poll count, the terminal ARS status, and a `message_url` — written on every
+    terminal path including `SubmitError`/`NoPK`/`Timeout`. When a
     query blows `MAX_POLL_S` (already recorded as a Timeout failure — main stats
     unchanged), `_run_ars` spawns a detached `_extended_poll` greenlet that keeps
     polling to `COMPLETION_MAX_POLL_S` and appends one `COLLECTOR.record_completion`
     row (end-to-end time + whether it `finished`); queries that finish within
     `MAX_POLL_S` record their completion row inline.
+  - `_evaluate_checkpoints()` — for targets that configure `checkpoints`, judges
+    each one against the stage matching its user count and returns a
+    `PASS`/`FAIL`/`NO DATA` verdict (a checkpoint's `p99_slo_ms` defaults to the
+    target's; explicit `None` means latency isn't judged — an overload probe where
+    slowdown is expected but failures aren't).
   - `on_test_stop()` — drains any in-flight completion greenlets (bounded), finds
     the knee, writes `stages.csv` (incl. a `stage_start` ISO-8601-UTC column) /
-    `by_qtype.csv` / `summary.json`, and (async only) `ars_health.csv`, the
-    `ars_completion.csv` sidecar, plus `red_flags` + a `completion` roll-up in the
-    summary + printed block.
+    `by_qtype.csv` / `summary.json`, (checkpointed targets only)
+    `checkpoints.csv` + `checkpoints`/`checkpoints_passed` in the summary and a
+    printed verdict block that sets `environment.process_exit_code = 1` on any
+    miss, and (async only) `ars_health.csv`, the `ars_queries.csv` per-query
+    debug log + a printed "FAILED QUERIES" block naming the first few pks/URLs,
+    the `ars_completion.csv` sidecar, plus `red_flags` + a `completion` roll-up in
+    the summary + printed block.
 - **`trapi_corpus.py`** — the per-component query corpuses:
   - `_qg(nodes, edges, tier=None, bypass_cache=None)` — TRAPI envelope; adds
     scalar `parameters.tier` (KP-only) or top-level `bypass_cache` (ARA/ARS) only
@@ -189,6 +232,11 @@ Package `helmsdeep/`:
     and asks for connecting paths via a `paths` map in the query_graph — built by
     `_pathfinder_qg(nodes, paths)` (`nodes` + empty `edges` + `paths`; no
     `knowledge_type`, no `tier`; `bypass_cache=True`). Most intensive query class.
+  - **`MIXED_CORPUS`** — the mixed capacity profile (`aras_mixed`/`ars_mixed`).
+    Not hand-written: `_mixed_corpus()` blends `SHEPHERD_CORPUS` and
+    `PATHFINDER_CORPUS` at `INFERRED_PATHFINDER_RATIO = (2, 1)` — 2/3 inferred
+    MVP1+MVP2, 1/3 Pathfinder — preserving each corpus's internal weights, so
+    retuning the MVP1/MVP2 mix propagates here automatically.
   - Entity pools: `HEAVY_DISEASES` (curated hubs) + `LONG_TAIL_DISEASES` from
     **`curie_list.json`** (~1000 real MONDO CURIEs, shipped via `package_data`),
     a curated `GENES` pool (NCBIGene), and curated drug↔disease `CHEM_DISEASE_PAIRS`.
@@ -202,8 +250,9 @@ batch, predicate). For ARA/ARS creative queries, the dominant cost driver is the
 
 Implemented: component awareness, the `helmsdeep` CLI + entry point,
 per-target stages/SLO, segmented corpuses, scalar `parameters.tier` per KP query,
-the ARS async submit/poll/merge user, ARS health metrics + red flags, and the
-tiered inferred disease mix.
+the ARS async submit/poll/merge user, ARS health metrics + red flags, the
+tiered inferred disease mix, and the mixed capacity profile (2:1
+inferred/Pathfinder blend + pass/fail acceptance checkpoints, ARA and ARS).
 
 Remaining refinements (not yet done — don't assume these exist):
 
@@ -249,6 +298,11 @@ helmsdeep --targets ars  --host https://ars.ci.transltr.io/ars/api --csv-prefix 
 # Pathfinder is its own (heavier) run type, ARA/ARS only:
 helmsdeep --targets aras_pathfinder --host https://your-ara.example.org --csv-prefix pf1
 helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --csv-prefix pf1
+
+# Mixed capacity profile (ARA/ARS only): 2/3 inferred MVP1+MVP2 + 1/3 Pathfinder,
+# ramped to 30 -> 45 -> 60 concurrent and judged pass/fail per checkpoint.
+helmsdeep --targets aras_mixed --host https://your-ara.example.org --csv-prefix mix1
+helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io/ars/api --csv-prefix mix1
 ```
 
 - The `LoadTestShape` (`StepLoad`) **drives users, spawn rate, and duration**, so
@@ -260,30 +314,52 @@ helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --
   trapi_loadtest.py --headless --host …`), selecting the layer with the
   `LOADTEST_TARGET` env var (defaults to `kps`). Note locust has no
   `--csv-prefix` flag — set `LOCUST_CSV_PREFIX` instead.
+- A checkpointed run (`*_mixed`) **exits non-zero** when a checkpoint is missed,
+  so it can gate a CI/acceptance job.
+- `--quick` (= `--time-budget 10m`) or `--time-budget 30m` compresses any target
+  to a wall clock; see the conventions note below for what that costs.
 - Outputs (written by the master/standalone node only):
-  `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json` (+
-  `<prefix>_ars_health.csv`, the `<prefix>_ars_completion.csv` sidecar, and a
-  `red_flags` list + `completion` roll-up for the `ars` target), plus a printed
-  summary table with the knee.
+  `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json`
+  (+ `<prefix>_checkpoints.csv` for checkpointed targets) (+
+  `<prefix>_ars_health.csv`, the `<prefix>_ars_queries.csv` per-query debug log,
+  the `<prefix>_ars_completion.csv` sidecar, and a `red_flags` list +
+  `completion` roll-up for the `ars` target), plus a printed summary table with
+  the knee.
 
 ## Conventions & gotchas
 
 - **The shape owns concurrency.** Tune load by editing the per-target `stages`
   in `config.py`, not CLI flags.
+- **Two kinds of run: knee-finding vs acceptance.** Every target reports the knee
+  ("how far can we go?"). A target that also defines `checkpoints` answers a
+  pass/fail question at named concurrency levels ("does 30 hold?") and exits
+  non-zero on a miss. `aras_mixed`/`ars_mixed` are the acceptance profile: a 2:1
+  inferred/Pathfinder blend checked at 30 (peak) / 45 (headroom) / 60 (overload,
+  error-rate only). Checkpoints are generic, not special-cased to that profile --
+  a target without them behaves exactly as before.
 - **Cooldown drains, it doesn't bleed.** With `cooldown_s` set, the gap between
   stages ramps users to 0; the just-finished stage's end time is frozen so its
   `duration_s`/RPS reflect the active window, and a slow query still running
   drains into *that* stage (via `stop_timeout`), keeping the next stage clean.
 - **Closed-loop load.** `TRAPIUser.wait_time = constant(0)` — no think time; users
   hammer the endpoint as fast as responses return.
+- **A compressed run is not a measurement.** `--time-budget`/`--quick` scale
+  durations only (holds, cooldowns, poll/timeout caps) — the ramp, SLOs, and
+  checkpoints are identical, so the run asks the same questions of the same load
+  levels. But it answers them from far fewer samples (a p99 over a handful of
+  queries is noise), and the shrunken per-query caps *change what counts as a
+  failure*: a query that would finish in 4 minutes is a timeout when the cap is 2.
+  Compressed runs are for exercising a host/corpus/config end to end, not for
+  quoting a knee or gating CI. `config.time_scale` in `summary.json` (< 1.0) is
+  how you tell after the fact.
 - **Don't trust Locust's blended aggregate during a ramp.** We bucket per stage in
   `StageCollector` precisely because an aggregate p99 would mix easy early stages
   with saturated late ones.
 - **`malformed_query` 4xx is success.** A 4xx on the malformed query is treated as
   a valid measurement of the error path; only 5xx counts as a failure. See the
   `TRAPIUser.query` handling.
-- **Long timeouts on purpose.** `REQUEST_TIMEOUT = 210` s because TRAPI queries are
-  slow; ARS runs are far longer still (minutes–~1 hr) and need the async model.
+- **Long timeouts on purpose.** `REQUEST_TIMEOUT` defaults to 210 s (per-target
+  override: `request_timeout_s`) because TRAPI queries are slow; ARS runs are far longer still (minutes–~1 hr) and need the async model.
 - **gevent concurrency.** Locust uses gevent green-threads; avoid blocking calls in
   the user path. The ARS poll loop uses `gevent.sleep`, **never** `time.sleep`.
 - **ARS submit/poll/merge is one logical measurement.** `_run_ars` issues several
@@ -294,8 +370,27 @@ helmsdeep --targets ars_pathfinder  --host https://ars.ci.transltr.io/ars/api --
   wall-clock, so Locust's native stats table shows the true per-query time
   (otherwise the only ARS rows would be the individual sub-calls — e.g. the
   `ars_merge` GET, which times just the final merge fetch, not the whole query).
-  A `Done` that returns **0 results counts as a failure** (and raises a red
-  flag); a non-terminal status past `max_poll_s` is a `Timeout` failure.
+  A `Done` that returns **0 results counts as a failure** by default (and raises
+  a red flag) — see `zero_result_is_failure` below; a non-terminal status past
+  `max_poll_s` is a `Timeout` failure.
+- **`zero_result_is_failure` decides what a 0-result `Done` means.** Default
+  `True`: an empty answer set under load usually means a downstream agent silently
+  dropped out, so it scores as a failure and counts against the knee. Set it
+  `False` on a target to score only transport/protocol outcomes (submit error,
+  `Error` status, `Timeout`) as failures — the zero-result query's latency then
+  also joins the percentile pool instead of being discarded (failed requests
+  contribute no latency samples), so it shifts mean/p99/concurrency, not just the
+  error rate. Either way the query is still tallied in `ars_health`
+  (`zero_result_done`) and still raises a red flag, the per-query debug log still
+  carries the `Done with 0 results` note (its `failed` column follows the policy),
+  and the summary JSON + printed ARS health block record which policy was in force.
+- **The per-query debug log is the bridge from a number to a query.** The
+  aggregates say 3% failed; `<prefix>_ars_queries.csv` says which pks, with the
+  HTTP status of each step and a `message_url` to pull one up. One row per logical
+  query on every terminal path (including `SubmitError`/`NoPK`, which have no pk
+  at all), attributed to the stage active when it reached its outcome. It joins to
+  `ars_completion.csv` on `query`; a timed-out query whose extended poll was still
+  in flight at shutdown is in the debug log but *not* the sidecar.
 - **Completion tracking is a sidecar, not a metric change.** `max_poll_s` stays the
   failure threshold for the main stats and the knee — a query not terminal by then
   is a `Timeout` failure, exactly as before. Separately, `completion_max_poll_s`
