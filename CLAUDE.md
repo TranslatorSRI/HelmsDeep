@@ -139,9 +139,10 @@ Package `helmsdeep/`:
   users. `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
   Per-target ramps/SLOs live here because cost profiles differ wildly by layer.
   `build_timeline(stages, cooldown_s)` lays the ramp out on a wall clock as
-  `(start, end, stage_idx_or_None)` windows (`None` = a cooldown gap); both the
-  `StepLoad` shape and the live console read it, so the users being driven and
-  the stage being reported can't disagree.
+  `(start, end, stage_idx_or_None)` windows (`None` = a cooldown gap); the
+  `StepLoad` shape drives users from it, and the live console uses it only for
+  the run's total duration (its stage identity comes from the collector -- see
+  `console.Dashboard._phase`).
   `natural_duration_s()` and `time_scaled(cfg, budget_s)` implement
   `--time-budget`/`--quick`: `time_scaled` returns a `(compressed_cfg, scale)`
   pair whose *durations* (stage holds, `cooldown_s`, `request_timeout_s`,
@@ -167,15 +168,19 @@ Package `helmsdeep/`:
   read-only: every number comes from the run's `StageCollector` and its
   `_stage_stats`, so the screen can't drift from `stages.csv`, and an exception
   in the render loop is caught and logged rather than failing the run.
-  - `Dashboard` — spawns a gevent greenlet that redraws twice a second. `_phase()`
-    maps elapsed time onto `config.build_timeline` to answer "stage N, holding or
-    draining, how far in"; `_footer_lines()` renders the block (run progress,
-    stage progress, live load/latency vs the SLO, plus an `ars` line for async
-    targets); `_announce()`/`_recap()` write the scrolling record — a header when
-    a stage starts, a `✓`/`✗` verdict line (the knee test on one stage) when it
-    ends. `_flush_recap()` holds that verdict until the collector has frozen the
-    stage's end time, so the line and the CSV row are computed from identical
-    inputs.
+  - `Dashboard` — spawns a gevent greenlet that redraws twice a second.
+    `_phase()` answers "stage N, holding or draining, how far in" **from the
+    collector's `stage_idx`/`stage_started`/`stage_ended`**, never from elapsed
+    time: the shape ticks off Locust's runner clock and the display off
+    `test_start`, so a clock-derived stage disagreed with the measurements for a
+    second or so at every boundary — exactly when the display has something to
+    say. `_footer_lines()` renders the block (run progress, stage progress, live
+    load/latency vs the SLO, plus an `ars` line for async targets);
+    `_announce()`/`_recap()` write the scrolling record — a header when a stage
+    starts, a `✓`/`✗` verdict line (the knee test on one stage) when it ends.
+    Since a new stage can only appear after `mark_stage` closed the previous one,
+    the previous stage's verdict is always final and always printed immediately
+    before the next header: the transcript order is fixed, not a race.
   - `StickyFooter` — the bottom-of-screen block. `install()` wraps stdout/stderr
     (and re-points the logging handlers that captured them at setup time) in a
     proxy that erases the block before any other write, so prints and log lines
@@ -398,6 +403,13 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io/ars/api --csv-p
   `StageCollector` and `_stage_stats()` the CSVs are written from; it owns no
   tally of its own, and its greenlet swallows its own exceptions. Changing what
   the footer says is a rendering change, never a measurement change.
+- **The collector owns "which stage are we on" -- for the display too.** The
+  display derives the stage, its progress, and its verdict from
+  `COLLECTOR.stage_idx`/`stage_started`/`stage_ended`, not from its own elapsed
+  clock. Two clocks meant the screen and the CSV could name different stages at a
+  boundary, and stage verdicts landed on either side of the next stage's header
+  depending on which won the race. If you add anything that reports where a run
+  is, read it from the collector.
 - **Don't trust Locust's blended aggregate during a ramp.** We bucket per stage in
   `StageCollector` precisely because an aggregate p99 would mix easy early stages
   with saturated late ones.

@@ -121,7 +121,10 @@ and a verdict line when it ends:
 ```
 
 That verdict line is the knee test applied to one stage: a `✓` means the stage
-met **both** the p99 SLO and the error cap, so it is a knee candidate.
+met **both** the p99 SLO and the error cap, so it is a knee candidate. It always
+appears directly under the header of the stage it describes (after the cooldown
+note, where there is one), and it always carries that stage's final numbers —
+the ones its row in `stages.csv` will carry.
 
 The end-of-run summary table adds two **shape rows** — one character per stage,
 scaled against that metric's bar and painted red where a stage went over it — so

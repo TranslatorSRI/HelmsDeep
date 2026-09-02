@@ -351,14 +351,15 @@ class Dashboard:
         self.paint = _Painter(color_enabled(self.stream))
         self.footer = StickyFooter(self.stream)
 
-        # The ramp on a wall clock -- the same layout the load shape drives from.
-        self.windows, self.total_s = config.build_timeline(stages, cooldown_s)
+        # Only the run's total wall clock, for the overall progress bar and the
+        # finish estimate. Which stage is current, and how far into it, comes
+        # from the collector instead -- see _phase().
+        _windows, self.total_s = config.build_timeline(stages, cooldown_s)
 
         self.started_at = None
         self._greenlet = None
         self._stopped = False
         self._announced_stage = -1
-        self._pending_recap = None
         self._recapped = set()
         self._draining = False
         self._last_plain = 0.0
@@ -404,9 +405,8 @@ class Dashboard:
 
     def tick(self):
         elapsed = (time.time() - self.started_at) if self.started_at else 0.0
-        idx, phase, frac, left = self._phase(elapsed)
+        idx, phase, frac, left = self._phase()
         self._announce(idx, phase)
-        self._flush_recap()
         if self.live:
             self.footer.draw(self._footer_lines(elapsed, idx, phase, frac, left))
         elif time.time() - self._last_plain >= self.plain_every_s:
@@ -414,38 +414,62 @@ class Dashboard:
             self.log(self._status_line(elapsed, idx, phase, frac, left))
 
     # -- where in the ramp are we -------------------------------------------
-    def _phase(self, elapsed):
+    def _phase(self):
         """(stage_idx, phase, fraction_through_phase, seconds_left_in_phase).
 
         ``phase`` is ``hold`` (under load), ``drain`` (cooldown gap between
         stages, users at 0 while slow queries finish) or ``done``.
-        """
-        for start, end, idx in self.windows:
-            if start <= elapsed < end:
-                span = max(end - start, 1e-9)
-                if idx is None:
-                    # Cooldown: attribute it to the stage that just finished, as
-                    # the collector does -- drained queries land in that stage.
-                    return (self._stage_before(start), "drain",
-                            (elapsed - start) / span, end - elapsed)
-                return idx, "hold", (elapsed - start) / span, end - elapsed
-        return len(self.stages) - 1, "done", 1.0, 0.0
 
-    def _stage_before(self, cooldown_start):
-        prev = 0
-        for start, end, idx in self.windows:
-            if idx is not None and end <= cooldown_start:
-                prev = idx
-        return prev
+        Which stage this is comes from the COLLECTOR's marker, not from the
+        clock. The load shape and the display are two different clocks (the
+        shape ticks off Locust's runner start, the display off test_start), so
+        deriving the stage from elapsed time meant the screen and the
+        measurements could disagree for a second or so at every boundary --
+        which is exactly when the display has something to say. The collector's
+        marker is the same one every request is bucketed by, so "stage 3" on
+        screen is now, by construction, the stage whose row lands in stages.csv.
+
+        Progress within the stage is measured from the collector's own
+        ``stage_started`` / ``stage_ended`` timestamps for the same reason.
+        """
+        now = time.time()
+        c = self.collector
+        idx = min(c.stage_idx, len(self.stages) - 1)
+        hold = self.stages[idx][2]
+        started = c.stage_started.get(idx)
+        ended = c.stage_ended.get(idx)
+        last = idx >= len(self.stages) - 1
+
+        if started is None:            # the shape hasn't marked a stage yet
+            return idx, "hold", 0.0, hold
+        if ended is None:
+            span = now - started
+            if last and span >= hold:
+                # Final stage's hold is over; users are finishing their last
+                # queries while Locust shuts the run down.
+                return idx, "done", 1.0, 0.0
+            frac = min(span / hold, 1.0) if hold else 1.0
+            return idx, "hold", frac, max(hold - span, 0.0)
+
+        # The collector has closed this stage but not moved on: either the
+        # cooldown gap draining into it, or the tail end of the run.
+        if self.cooldown_s and not last:
+            span = now - ended
+            return (idx, "drain", min(span / self.cooldown_s, 1.0),
+                    max(self.cooldown_s - span, 0.0))
+        return idx, "done", 1.0, 0.0
 
     def _announce(self, idx, phase):
-        """Emit the scrolling record: a header per stage, a verdict per stage."""
-        if phase == "hold" and idx != self._announced_stage:
+        """Emit the scrolling record: a header per stage, a verdict per stage.
+
+        Because `idx` follows the collector, a new stage can only appear here
+        after ``mark_stage`` closed the previous one out -- so the previous
+        stage's verdict is always final, and always printed immediately before
+        the next stage's header. The transcript order is fixed, not a race.
+        """
+        if idx != self._announced_stage:
             if self._announced_stage >= 0:
-                # Queued, not printed: the numbers only settle once the
-                # collector has closed that stage out (see _flush_recap).
-                self._pending_recap = self._announced_stage
-                self._flush_recap()
+                self._recap(self._announced_stage)
             users, rate, hold = self.stages[idx]
             self.log("")
             self.log(self.paint(
@@ -464,20 +488,6 @@ class Dashboard:
                 f"  … cooldown {fmt_duration(self.cooldown_s)}: draining "
                 f"{inflight} in-flight quer{'y' if inflight == 1 else 'ies'} "
                 f"into stage {idx + 1}", "grey"))
-
-    def _flush_recap(self):
-        """Print a queued verdict line once its stage's window is closed.
-
-        The collector freezes ``stage_ended`` when the stage changes; recapping
-        before that would divide by a still-running clock and report a duration
-        and RPS that disagree with the row eventually written to stages.csv.
-        """
-        idx = self._pending_recap
-        if idx is None:
-            return
-        if idx in self.collector.stage_ended or self.collector.stage_idx > idx:
-            self._pending_recap = None
-            self._recap(idx)
 
     def _recap(self, idx):
         """One verdict line for a finished stage: the knee test, per criterion."""
@@ -506,9 +516,6 @@ class Dashboard:
 
     def recap_final(self):
         """Called at the end so the last stage gets its verdict line too."""
-        if self._pending_recap is not None:
-            self._recap(self._pending_recap)
-            self._pending_recap = None
         if self._announced_stage >= 0:
             self._recap(self._announced_stage)
 
