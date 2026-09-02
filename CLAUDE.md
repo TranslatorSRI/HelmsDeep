@@ -138,6 +138,10 @@ Package `helmsdeep/`:
   `p99_slo_ms`, `max_error_rate`) evaluated against the stage that ran that many
   users. `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
   Per-target ramps/SLOs live here because cost profiles differ wildly by layer.
+  `build_timeline(stages, cooldown_s)` lays the ramp out on a wall clock as
+  `(start, end, stage_idx_or_None)` windows (`None` = a cooldown gap); both the
+  `StepLoad` shape and the live console read it, so the users being driven and
+  the stage being reported can't disagree.
   `natural_duration_s()` and `time_scaled(cfg, budget_s)` implement
   `--time-budget`/`--quick`: `time_scaled` returns a `(compressed_cfg, scale)`
   pair whose *durations* (stage holds, `cooldown_s`, `request_timeout_s`,
@@ -148,13 +152,40 @@ Package `helmsdeep/`:
   natural duration is a no-op (scale 1.0): it only ever speeds a run up.
 - **`cli.py`** — the `helmsdeep` entry point (registered in
   `setup.py` `console_scripts`). Parses `--targets` (required, one layer),
-  `--host` (required), `--csv-prefix`, and the mutually exclusive
-  `--time-budget DURATION` / `--quick` (= `--time-budget 10m`); rejects
+  `--host` (required), `--csv-prefix`, the mutually exclusive
+  `--time-budget DURATION` / `--quick` (= `--time-budget 10m`), and the two
+  output flags `--no-live` (sets `HELMSDEEP_LIVE=0`) / `--verbose`; rejects
   not-yet-`implemented` targets; sets `LOADTEST_TARGET` (+ `LOCUST_CSV_PREFIX`,
   + `HELMSDEEP_TIME_BUDGET_S` when a budget is given) and launches
-  `python -m locust -f trapi_loadtest.py --headless --host …`. `_print_plan()`
+  `python -m locust -f trapi_loadtest.py --headless --host …`. Unless
+  `--verbose`, it adds `--only-summary --loglevel WARNING`: Locust's 2-second
+  request table and its ramp narration are exactly the noise the live display
+  replaces (Locust still prints its final tables at shutdown). `_print_plan()`
   shows the (possibly compressed) ramp and what was traded away before the run
   starts; `_duration()` parses `600`/`90s`/`10m`/`1h30m`.
+- **`console.py`** — the live terminal display. Purely cosmetic and strictly
+  read-only: every number comes from the run's `StageCollector` and its
+  `_stage_stats`, so the screen can't drift from `stages.csv`, and an exception
+  in the render loop is caught and logged rather than failing the run.
+  - `Dashboard` — spawns a gevent greenlet that redraws twice a second. `_phase()`
+    maps elapsed time onto `config.build_timeline` to answer "stage N, holding or
+    draining, how far in"; `_footer_lines()` renders the block (run progress,
+    stage progress, live load/latency vs the SLO, plus an `ars` line for async
+    targets); `_announce()`/`_recap()` write the scrolling record — a header when
+    a stage starts, a `✓`/`✗` verdict line (the knee test on one stage) when it
+    ends. `_flush_recap()` holds that verdict until the collector has frozen the
+    stage's end time, so the line and the CSV row are computed from identical
+    inputs.
+  - `StickyFooter` — the bottom-of-screen block. `install()` wraps stdout/stderr
+    (and re-points the logging handlers that captured them at setup time) in a
+    proxy that erases the block before any other write, so prints and log lines
+    scroll above it instead of colliding with it.
+  - `sparkline(values, threshold, paint)` — the shape of a metric across the ramp,
+    one character per stage, red where the stage broke `threshold`; the summary
+    prints one for p99 and one for the error rate.
+  - `live_enabled()` / `color_enabled()` — a non-TTY stdout (CI, a pipe) or
+    `HELMSDEEP_LIVE=0` drops to plain mode: the same content as one status line
+    every `PLAIN_EVERY_S`. `NO_COLOR` drops colour only.
 - **`trapi_loadtest.py`** — the measurement engine (Locust). The component under
   test is chosen by `LOADTEST_TARGET`, and when `HELMSDEEP_TIME_BUDGET_S` is set
   the target config is passed through `config.time_scaled` at import (module-level
@@ -176,6 +207,8 @@ Package `helmsdeep/`:
     wall-clock `stage_started` / `stage_ended` (the latter is `setdefault`, so a
     cooldown freeze isn't overwritten by the next `mark_stage`). `record()` also
     takes optional ARS signals: `status`, `result_count`, `response_bytes`.
+    `begin_inflight()`/`end_inflight()` track logical queries currently running,
+    for the live display only -- no report reads them.
   - `_stage_stats()` — per-stage RPS, percentiles, error rate, Little's-Law
     concurrency. `_ars_stage_health()` — per-stage ARS health row.
   - `TRAPIUser(HttpUser)` — dispatches on `PROTOCOL`: `_run_sync()` (KP/ARA: one
@@ -198,12 +231,19 @@ Package `helmsdeep/`:
     `PASS`/`FAIL`/`NO DATA` verdict (a checkpoint's `p99_slo_ms` defaults to the
     target's; explicit `None` means latency isn't judged — an overload probe where
     slowdown is expected but failures aren't).
+  - `_start_dashboard()` (`@events.test_start`) / `DASHBOARD` — starts the
+    `console.Dashboard` on the master/standalone node; `on_test_stop` recaps the
+    final stage and lifts the footer before printing the summary.
+    `_stash_headline()` + `_print_headline()` (`@events.quit`) repeat the knee
+    (or the missed checkpoints) *after* Locust's own end-of-run tables, so the
+    number the run exists to produce is the last thing on screen.
   - `on_test_stop()` — drains any in-flight completion greenlets (bounded), finds
     the knee, writes `stages.csv` (incl. a `stage_start` ISO-8601-UTC column) /
     `by_qtype.csv` / `summary.json`, (checkpointed targets only)
     `checkpoints.csv` + `checkpoints`/`checkpoints_passed` in the summary and a
     printed verdict block that sets `environment.process_exit_code = 1` on any
-    miss, and (async only) `ars_health.csv`, the `ars_queries.csv` per-query
+    miss, prints the stage table plus two `console.sparkline` shape rows (p99 and
+    error rate across the ramp, red where a stage broke its bar), and (async only) `ars_health.csv`, the `ars_queries.csv` per-query
     debug log + a printed "FAILED QUERIES" block naming the first few pks/URLs,
     the `ars_completion.csv` sidecar, plus `red_flags` + a `completion` roll-up in
     the summary + printed block.
@@ -354,6 +394,10 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io/ars/api --csv-p
   Compressed runs are for exercising a host/corpus/config end to end, not for
   quoting a knee or gating CI. `config.time_scale` in `summary.json` (< 1.0) is
   how you tell after the fact.
+- **The live display never measures anything.** `console.py` reads the same
+  `StageCollector` and `_stage_stats()` the CSVs are written from; it owns no
+  tally of its own, and its greenlet swallows its own exceptions. Changing what
+  the footer says is a rendering change, never a measurement change.
 - **Don't trust Locust's blended aggregate during a ramp.** We bucket per stage in
   `StageCollector` precisely because an aggregate p99 would mix easy early stages
   with saturated late ones.

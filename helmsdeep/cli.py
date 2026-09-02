@@ -21,6 +21,7 @@ import subprocess
 import sys
 
 from . import config
+from . import console
 
 _LOCUSTFILE = os.path.join(os.path.dirname(__file__), "trapi_loadtest.py")
 
@@ -45,14 +46,8 @@ def _duration(text):
     return seconds
 
 
-def _fmt_duration(seconds):
-    """Human-readable duration for the printed run plan."""
-    seconds = int(round(seconds))
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m{seconds % 60:02d}s"
-    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+# One duration format across the CLI banner, the live display, and the summary.
+_fmt_duration = console.fmt_duration
 
 
 def _parse_args(argv=None):
@@ -93,6 +88,21 @@ def _parse_args(argv=None):
              f"to end in a coffee break.",
     )
     parser.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Disable the live status footer. The same stage/progress/metrics "
+             "line is printed periodically instead -- the default when stdout "
+             "is not a terminal (CI, a pipe, a log file).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Restore Locust's own output: its request table every 2s and its "
+             "INFO log. Off by default -- the table scrolls the live status out "
+             "of view and blends the ramp into one aggregate this tool will not "
+             "quote, and the log narrates ramps the stage display already shows.",
+    )
+    parser.add_argument(
         "--csv-prefix",
         default=None,
         help="Prefix for output files (<prefix>_stages.csv, etc.). "
@@ -103,36 +113,59 @@ def _parse_args(argv=None):
 
 def _print_plan(plan, natural_s, budget_s, scale):
     """Print the ramp about to run, and what a time budget did to it."""
+    paint = console.painter()
     planned_s = config.natural_duration_s(plan)
-    stages = " -> ".join(f"{users}u x {_fmt_duration(hold)}"
-                         for users, _rate, hold in plan["stages"])
-    if scale < 1.0:
-        print(f"Compressed run: {_fmt_duration(natural_s)} -> "
-              f"{_fmt_duration(planned_s)} (time scale {scale:.2f}), "
-              f"budget {_fmt_duration(budget_s)}")
-        if planned_s > budget_s * 1.05:
-            # Compression stops at the floors rather than shrinking a stage to
-            # where it exercises nothing; be honest about the resulting overrun.
-            print(f"  Budget undershoots the floors "
-                  f"({config.MIN_HOLD_S}s minimum per stage), so the run takes "
-                  f"{_fmt_duration(planned_s)} instead.")
-        print(f"  Stages: {stages}"
-              + (f", {_fmt_duration(plan['cooldown_s'])} cooldown between"
-                 if plan.get("cooldown_s") else ""))
-        # Whichever cap gates a single query on this protocol got cut too, and
-        # that changes what counts as a failure -- say so explicitly.
-        cap = plan.get("max_poll_s") or plan.get("request_timeout_s")
-        if cap:
-            print(f"  Per-query cap cut to {_fmt_duration(cap)} -- a query "
-                  f"slower than that is recorded as a\n  timeout failure, so "
-                  f"error rates are not comparable to a full run's.")
-        print("  Far fewer samples per stage: treat the percentiles, error rates, "
-              "and any\n  checkpoint verdict as indicative, not a measurement.")
-    else:
+    steps = [f"{users}u x {_fmt_duration(hold)}"
+             for users, _rate, hold in plan["stages"]]
+    if plan.get("cooldown_s"):
+        steps[-1] += f"  (+{_fmt_duration(plan['cooldown_s'])} cooldown between)"
+    # A long ramp (the KP target has seven stages) wraps rather than running off
+    # the edge; continuation lines line up under the first stage.
+    lead = f"plan: {_fmt_duration(planned_s)} -- "
+    indent = "           ·  "
+    width = console.terminal_width()
+    line, out = indent + lead, []
+    for i, step in enumerate(steps):
+        piece = ("" if line.endswith(lead) else " -> ") + step
+        if len(line) + len(piece) > width and not line.endswith(lead):
+            out.append(line + " ->")
+            line = " " * len(indent + lead) + step
+        else:
+            line += piece
+    out.append(line)
+    for row in out:
+        print(paint(indent, "grey") + row[len(indent):]
+              if row.startswith(indent) else row)
+
+    if scale >= 1.0:
         if budget_s:
-            print(f"Time budget {_fmt_duration(budget_s)} is already above this "
-                  f"target's natural duration -- running in full.")
-        print(f"Run plan: {_fmt_duration(planned_s)} -- {stages}")
+            print(paint(f"           ·  time budget {_fmt_duration(budget_s)} "
+                        f"is already above this target's natural duration -- "
+                        f"running in full.", "grey"))
+        return
+
+    # A compressed run answers the same questions from far fewer samples, and
+    # with tighter per-query caps. Say what was traded away, in full.
+    warn = paint("  [!] ", "yellow")
+    print(warn + paint(f"COMPRESSED: {_fmt_duration(natural_s)} -> "
+                       f"{_fmt_duration(planned_s)} (time scale {scale:.2f}), "
+                       f"budget {_fmt_duration(budget_s)}", "yellow"))
+    if planned_s > budget_s * 1.05:
+        # Compression stops at the floors rather than shrinking a stage to
+        # where it exercises nothing; be honest about the resulting overrun.
+        print(f"      Budget undershoots the floors "
+              f"({config.MIN_HOLD_S}s minimum per stage), so the run takes "
+              f"{_fmt_duration(planned_s)} instead.")
+    # Whichever cap gates a single query on this protocol got cut too, and
+    # that changes what counts as a failure -- say so explicitly.
+    cap = plan.get("max_poll_s") or plan.get("request_timeout_s")
+    if cap:
+        print(f"      Per-query cap cut to {_fmt_duration(cap)} -- a query "
+              f"slower than that is recorded as a\n      timeout failure, so "
+              f"error rates are not comparable to a full run's.")
+    print("      Far fewer samples per stage: treat the percentiles, error "
+          "rates, and any\n      checkpoint verdict as indicative, not a "
+          "measurement.")
 
 
 def main(argv=None):
@@ -171,6 +204,12 @@ def main(argv=None):
     prefix = args.csv_prefix or os.environ.get("LOCUST_CSV_PREFIX") or "trapi_run"
     html_report = f"{prefix}_report.html"
 
+    # The live footer owns the terminal; --no-live (or a non-TTY stdout) falls
+    # back to a periodic status line. The locustfile reads this the same way it
+    # reads every other knob -- through the environment.
+    if args.no_live:
+        env["HELMSDEEP_LIVE"] = "0"
+
     cmd = [
         sys.executable, "-m", "locust",
         "-f", _LOCUSTFILE,
@@ -181,10 +220,25 @@ def main(argv=None):
         # lives in <prefix>_summary.json (see README "How to read the results").
         "--html", html_report,
     ]
+    if not args.verbose:
+        # Two sources of the noise this CLI is trying to cut:
+        #  - Locust reprints its whole request table every 2s. Over a run that is
+        #    thousands of lines burying the stage you are on -- and it blends the
+        #    ramp into one aggregate, which is exactly the number this tool
+        #    refuses to quote. Locust still prints its final tables at shutdown.
+        #  - Its INFO log narrates every ramp ("Ramping to 20 users..."), which
+        #    the live display already says, in place, with the stage number.
+        # WARNING and above still print, and still scroll above the live footer.
+        cmd += ["--only-summary", "--loglevel", "WARNING"]
 
-    print(f"Load-testing {tgt['label']} ({args.targets}) at {args.host}{tgt['endpoint']}")
+    paint = console.painter()
+    print()
+    print(paint(f"HelmsDeep  ·  {tgt['label']} ({args.targets})", "bold"))
+    print(paint(f"           ·  {args.host}{tgt['endpoint']}", "grey"))
     _print_plan(plan, natural_s, budget_s, scale)
-    print(f"Locust HTML report will be written to {html_report}")
+    print(paint(f"           ·  reports: {prefix}_summary.json, "
+                f"{prefix}_stages.csv, {html_report}", "grey"))
+    print()
     return subprocess.run(cmd, env=env).returncode
 
 

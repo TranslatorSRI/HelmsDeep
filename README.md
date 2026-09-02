@@ -74,6 +74,8 @@ helmsdeep --targets ars_mixed \
   then to `trapi_run`.
 - `--time-budget` / `--quick` compress a run to fit a wall clock — see
   ["Shorter runs"](#shorter-runs---time-budget----quick) below.
+- `--no-live` / `--verbose` control the terminal output — see
+  ["Watching a run"](#watching-a-run) below.
 
 The load profile (users, spawn rate, duration) is driven by the `StepLoad` shape,
 **not** by CLI flags — so there is intentionally no `-u/-r/-t`. The ramp and knee
@@ -85,6 +87,72 @@ ramp to 0 so slow in-flight queries drain (counted under the stage that launched
 them) before the next stage starts clean, instead of bleeding into it. It defaults
 to 0 (cheap KP lookups don't bleed) and is set on the expensive ARA/ARS/Pathfinder
 targets.
+
+## Watching a run
+
+A run takes minutes to hours, so the terminal is the instrument panel. While it
+works, HelmsDeep pins a live status block to the bottom of the screen:
+
+```
+── HelmsDeep · ARS (ars) ─────────────────────────────────────────────────
+ run    ━━━━━━━━────────────────  33%  11m20s in · 22m40s left · ends ~18:19
+ stage  2/4  30u  HOLD  ━━━━━━━━━━────  72%  1m40s left
+ load   143 done · 20 in flight · 2 failed (1.4%) · 0.71 rps · conc 46.3
+ latency p50 64.8s · p95 96.0s · p99 98.8s / SLO 240.0s
+ ars    Done 139 · Error 1 · Timeout 1 · 0-result 1 · oldest 3m20s
+──────────────────────────────────────────────────────────────────────────
+```
+
+- **run** — progress through the whole ramp, and when it ends.
+- **stage** — which stage you are on, its user count, and whether it is holding
+  under load (`HOLD`) or in a cooldown gap draining slow queries (`DRAIN`).
+- **load / latency** — the *current stage's* numbers, live: throughput, errors
+  against the shared 1% cap, and p99 against this target's SLO. These are the
+  same figures the stage's row in `stages.csv` will carry.
+- **ars** — async runs only: terminal statuses so far, zero-result `Done`s, and
+  how long the oldest in-flight query has been polling.
+
+Everything else scrolls above the block, including a header when a stage starts
+and a verdict line when it ends:
+
+```
+▶ stage 3/4  45 users  7m00s hold  (spawn 5/s)
+  ✓ stage 2 · 30u · 6m00s · n=216 · 0.71 rps · p99 98.8s ✓ · err 0.40% ✓ · conc 21.3
+```
+
+That verdict line is the knee test applied to one stage: a `✓` means the stage
+met **both** the p99 SLO and the error cap, so it is a knee candidate.
+
+The end-of-run summary table adds two **shape rows** — one character per stage,
+scaled against that metric's bar and painted red where a stage went over it — so
+you can see where the latency curve turns up and where errors start without
+reading the numbers:
+
+```
+    p99  ▁▁▁▂▄█   (SLO 60.0s; red = over)
+    err  ▁▁▁▁▂█   (cap 1.0%; red = over)
+```
+
+Because the bars are measured against the SLO (not against the tallest stage), a
+run that stayed comfortably inside its budget stays visibly low rather than being
+stretched to full height.
+
+And the headline number is repeated one final time *after* Locust's own
+end-of-run tables, so the answer is the last thing on screen rather than the
+middle of the scrollback.
+
+Two flags adjust this:
+
+- `--no-live` — no redrawn block; the same status is printed as a single line
+  every 30 seconds. This is also the automatic behavior when stdout is not a
+  terminal (CI, a pipe, `tee` to a log file), so piped output stays readable.
+  `HELMSDEEP_LIVE=0` does the same thing via the environment; `NO_COLOR` keeps
+  the layout but drops the ANSI colors.
+- `--verbose` — restores Locust's own output: its full request table every two
+  seconds plus its INFO log. It is off by default because the table scrolls the
+  status out of view within seconds, and its totals are *blended across the whole
+  ramp* — the one number this tool deliberately refuses to quote. Locust's final
+  tables print at the end either way.
 
 ## Shorter runs (`--time-budget` / `--quick`)
 
@@ -168,6 +236,8 @@ Written to the working directory by the standalone/master node:
   totals are *blended across the whole run*, so the authoritative ceiling is the
   knee in `summary.json`, not the HTML aggregate.
 - a printed summary table ending in the headline **max sustainable concurrency**
+  (repeated once more after Locust's own end-of-run tables, so it is the last
+  thing in the terminal)
 
 For a guide to interpreting every one of these — written for non-specialists —
 see ["How to read the results"](#how-to-read-the-results) below.

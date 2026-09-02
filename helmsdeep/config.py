@@ -283,6 +283,27 @@ MIN_POLL_INTERVAL_S = 5    # ARS status polls; the floor keeps the extra polling
                            # load on a real service modest
 
 
+def build_timeline(stages, cooldown_s=0):
+    """Lay the ramp out on a wall clock, shared by the load shape and the console.
+
+    Returns ``(windows, total_s)`` where each window is
+    ``(start_s, end_s, stage_idx_or_None)`` -- ``stage_idx`` is ``None`` for a
+    cooldown gap. Both the ``StepLoad`` shape (which drives users) and the live
+    terminal display (which reports where the run is) read the ramp from here,
+    so "what stage are we in?" can never disagree between them.
+    """
+    windows = []
+    t = 0
+    n = len(stages)
+    for i, (_users, _rate, hold) in enumerate(stages):
+        windows.append((t, t + hold, i))
+        t += hold
+        if cooldown_s and i < n - 1:   # gap BETWEEN stages, not after the last
+            windows.append((t, t + cooldown_s, None))
+            t += cooldown_s
+    return windows, t
+
+
 def natural_duration_s(cfg):
     """Wall-clock seconds the target's stages + cooldowns take as configured."""
     stages = cfg["stages"]

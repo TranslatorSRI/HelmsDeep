@@ -62,6 +62,7 @@ from locust import LoadTestShape
 from locust.runners import MasterRunner, WorkerRunner
 
 import config
+import console
 from trapi_corpus import corpus_for
 
 # ----------------------------------------------------------------------------
@@ -195,6 +196,19 @@ class StageCollector:
         # Ids are handed out at submit time and shared by both per-query files,
         # so a row in one joins to its row in the other.
         self._next_query_id = itertools.count()
+        # Logical queries currently in flight: token -> (start_ts, qtype). Read
+        # only by the live terminal display ("20 in flight, oldest 3m20s"); no
+        # report or metric depends on it.
+        self.inflight = {}
+        self._next_inflight = itertools.count()
+
+    def begin_inflight(self, qtype):
+        token = next(self._next_inflight)
+        self.inflight[token] = (time.time(), qtype)
+        return token
+
+    def end_inflight(self, token):
+        self.inflight.pop(token, None)
 
     def new_query_id(self):
         return next(self._next_query_id)
@@ -397,10 +411,14 @@ class TRAPIUser(HttpUser):
     def query(self):
         qtype, builder = random.choice(_FLAT)
         payload = builder()
-        if PROTOCOL == "async":
-            self._run_ars(qtype, payload)
-        else:
-            self._run_sync(qtype, payload)
+        token = COLLECTOR.begin_inflight(qtype)
+        try:
+            if PROTOCOL == "async":
+                self._run_ars(qtype, payload)
+            else:
+                self._run_sync(qtype, payload)
+        finally:
+            COLLECTOR.end_inflight(token)
 
     def _run_sync(self, qtype, payload):
         """KP/ARA: a single blocking POST; success == HTTP 200."""
@@ -707,6 +725,31 @@ class TRAPIUser(HttpUser):
                 return 0, nbytes, resp.status_code
 
 
+# ----------------------------------------------------------------------------
+# Live terminal display (console.py). A sticky footer carries the one thing that
+# used to scroll away -- which stage we are on and how it is doing -- while stage
+# headers/verdicts and everything else scroll above it. Purely cosmetic: it reads
+# the same COLLECTOR and _stage_stats the reports are written from, and a failure
+# inside it can never fail the run.
+# ----------------------------------------------------------------------------
+DASHBOARD = None
+
+
+@events.test_start.add_listener
+def _start_dashboard(environment, **_kw):
+    global DASHBOARD
+    if isinstance(environment.runner, WorkerRunner):
+        return   # workers have no console of their own
+    DASHBOARD = console.Dashboard(
+        label=_TGT["label"], target=TARGET,
+        host=(environment.host or ""), endpoint=ENDPOINT,
+        stages=STAGES, cooldown_s=COOLDOWN_S,
+        p99_slo_ms=P99_SLO_MS, max_error_rate=MAX_ERROR_RATE,
+        protocol=PROTOCOL, time_scale=TIME_SCALE,
+        collector=COLLECTOR, stage_stats=_stage_stats,
+    ).start()
+
+
 # When cooldown is enabled, stages ramp down to 0 users between holds. Set a
 # stop_timeout so a user finishing its (possibly very slow) current query is
 # allowed to complete and be counted, rather than killed mid-request.
@@ -723,17 +766,11 @@ def _set_stop_timeout(environment, **_kw):
 class StepLoad(LoadTestShape):
     def __init__(self):
         super().__init__()
-        self._bounds = []      # (start, end, idx) active-load windows
-        self._cooldowns = []   # (start, end) drain gaps between stages
-        t = 0
-        n = len(STAGES)
-        for i, (_users, _rate, hold) in enumerate(STAGES):
-            self._bounds.append((t, t + hold, i))
-            t += hold
-            if COOLDOWN_S and i < n - 1:   # gap BETWEEN stages, not after the last
-                self._cooldowns.append((t, t + COOLDOWN_S))
-                t += COOLDOWN_S
-        self._total = t
+        # One layout, shared with the live display, so the users being driven
+        # and the stage being reported can never disagree.
+        windows, self._total = config.build_timeline(STAGES, COOLDOWN_S)
+        self._bounds = [w for w in windows if w[2] is not None]
+        self._cooldowns = [(s, e) for s, e, idx in windows if idx is None]
 
     def tick(self):
         run_time = self.get_run_time()
@@ -764,6 +801,13 @@ def on_test_stop(environment, **_kw):
         return
 
     COLLECTOR.stage_ended.setdefault(COLLECTOR.stage_idx, time.time())
+
+    # Close out the live display: the final stage gets the same verdict line the
+    # earlier ones got, then the footer is lifted so the summary below prints
+    # into a clean terminal.
+    if DASHBOARD is not None:
+        DASHBOARD.recap_final()
+        DASHBOARD.stop()
 
     # Drain any in-flight completion-sidecar polls (queries that blew MAX_POLL_S
     # and are still being watched for eventual completion), bounded by the extra
@@ -980,6 +1024,18 @@ def on_test_stop(environment, **_kw):
         print(f"{r['stage']:>3} {str(r['users']):>4} {r['rps']:>7.1f} "
               f"{r['p50_ms']:>7.0f} {r['p95_ms']:>8.0f} {r['p99_ms']:>8.0f} "
               f"{r['error_rate']*100:>5.1f}% {r['concurrency']:>7.1f}")
+    # The table has the numbers; these two rows have the shape -- where the
+    # latency curve turns up and where errors start, in one glance.
+    if len(overall_rows) > 1:
+        paint = console.painter()
+        p99_spark = console.sparkline(
+            [r["p99_ms"] for r in overall_rows], P99_SLO_MS, paint)
+        err_spark = console.sparkline(
+            [r["error_rate"] for r in overall_rows], MAX_ERROR_RATE, paint)
+        print(f"    p99  {p99_spark}   "
+              f"(SLO {console.fmt_ms(P99_SLO_MS)}; red = over)")
+        print(f"    err  {err_spark}   "
+              f"(cap {MAX_ERROR_RATE * 100:.1f}%; red = over)")
     print("-" * 64)
     if knee:
         print(f"Max sustainable concurrency: {knee['concurrency']} "
@@ -1076,3 +1132,59 @@ def on_test_stop(environment, **_kw):
     wrote.append(f"{CSV_PREFIX}_summary.json")
     print(f"Wrote: {', '.join(wrote)}")
     print("=" * 64 + "\n")
+
+    # Locust prints its own (long) request/percentile/error tables AFTER this
+    # listener returns, which would bury the number the run exists to produce.
+    # Stash the headline and repeat it on quit, so it is the last thing on screen.
+    _stash_headline(knee, checkpoints, red_flags if PROTOCOL == "async" else [])
+
+
+# ----------------------------------------------------------------------------
+# Final headline: printed after Locust's own end-of-run tables, so the answer is
+# the last line in the terminal rather than the middle of the scrollback.
+# ----------------------------------------------------------------------------
+_HEADLINE = []
+
+
+def _stash_headline(knee, checkpoints, red_flags):
+    paint = console.painter()
+    lines = [paint("─" * 64, "grey")]
+    if knee:
+        lines.append(
+            paint("MAX SUSTAINABLE CONCURRENCY: ", "bold")
+            + paint(f"{knee['concurrency']}", "bold", "green")
+            + paint(f"   ({_TGT['label']}, stage {knee['stage']}, "
+                    f"{knee['users']} users)", "grey"))
+    else:
+        lines.append(paint("NO STAGE MET THE SLO", "bold", "red")
+                     + paint(f"   ({_TGT['label']}: saturated below the first "
+                             f"stage, or the SLO is too strict)", "grey"))
+    if checkpoints:
+        missed = [c for c in checkpoints if c["verdict"] != "PASS"]
+        if missed:
+            lines.append(paint(f"CHECKPOINTS: {len(missed)} of "
+                               f"{len(checkpoints)} not met", "bold", "red"))
+            for c in missed:
+                lines.append(paint(f"  {c['verdict']} at {c['users']} users -- "
+                                   f"{c['detail']}", "red"))
+        else:
+            lines.append(paint(f"CHECKPOINTS: all {len(checkpoints)} met",
+                               "bold", "green"))
+    if red_flags:
+        lines.append(paint(f"RED FLAGS: {len(red_flags)} "
+                           f"(see the ARS block above)", "yellow"))
+    lines.append(paint(f"Reports: {CSV_PREFIX}_summary.json "
+                       f"and {CSV_PREFIX}_stages.csv", "grey"))
+    lines.append(paint("─" * 64, "grey"))
+    _HEADLINE.extend(lines)
+
+
+@events.quit.add_listener
+def _print_headline(**_kw):
+    # Belt and braces: on an abnormal exit (Ctrl-C before a stage completed, a
+    # startup failure) on_test_stop may never have run, so the footer and the
+    # stream proxies would still be installed. stop() is idempotent.
+    if DASHBOARD is not None:
+        DASHBOARD.stop()
+    for line in _HEADLINE:
+        print(line)
