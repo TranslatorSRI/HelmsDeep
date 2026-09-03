@@ -81,17 +81,30 @@ TARGETS = {
         "corpus": "retriever",
         "protocol": "sync",
         "implemented": True,
-        # Cheap lookups -- ramp high to find saturation.
+        # Ramp high to find saturation. The holds are 5 minutes, not the 60s
+        # this target carried when the KP layer was ~40 independent services
+        # answering in milliseconds: Retriever answers a lookup in seconds to
+        # tens of seconds, and a 60s hold at that latency yielded 15-100
+        # completed requests per stage -- too few to put a p99 on (the printed
+        # value was one of the two slowest requests) and short enough that most
+        # queries were still in flight when the stage ended, landing in the next
+        # stage's bucket and making a later stage look faster than an earlier
+        # one. Five minutes gives the low stages ~75-150 samples and the high
+        # ones several hundred.
         "stages": [
-            (5,   5, 60),
-            (10,  5, 60),
-            (20,  5, 60),
-            (40, 10, 60),
-            (80, 10, 60),
-            (120, 20, 60),
-            (160, 20, 60),
+            (5,   5, 300),
+            (10,  5, 300),
+            (20,  5, 300),
+            (40, 10, 300),
+            (80, 10, 300),
+            (120, 20, 300),
+            (160, 20, 300),
         ],
         "p99_slo_ms": 60000,
+        # Matches the p99 SLO: a query that finishes inside its latency budget
+        # drains into the stage that launched it rather than contaminating the
+        # next one. (Cheap lookups didn't bleed; Retriever does.)
+        "cooldown_s": 60,
     },
     "aras": {
         "label": "Shepherd",
@@ -281,6 +294,27 @@ MIN_MAX_POLL_S = 120       # ARS per-query poll cap
 MIN_REQUEST_TIMEOUT_S = 60  # per HTTP call
 MIN_POLL_INTERVAL_S = 5    # ARS status polls; the floor keeps the extra polling
                            # load on a real service modest
+
+
+def build_timeline(stages, cooldown_s=0):
+    """Lay the ramp out on a wall clock, shared by the load shape and the console.
+
+    Returns ``(windows, total_s)`` where each window is
+    ``(start_s, end_s, stage_idx_or_None)`` -- ``stage_idx`` is ``None`` for a
+    cooldown gap. Both the ``StepLoad`` shape (which drives users) and the live
+    terminal display (which reports where the run is) read the ramp from here,
+    so "what stage are we in?" can never disagree between them.
+    """
+    windows = []
+    t = 0
+    n = len(stages)
+    for i, (_users, _rate, hold) in enumerate(stages):
+        windows.append((t, t + hold, i))
+        t += hold
+        if cooldown_s and i < n - 1:   # gap BETWEEN stages, not after the last
+            windows.append((t, t + cooldown_s, None))
+            t += cooldown_s
+    return windows, t
 
 
 def natural_duration_s(cfg):

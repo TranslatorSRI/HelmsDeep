@@ -74,6 +74,8 @@ helmsdeep --targets ars_mixed \
   then to `trapi_run`.
 - `--time-budget` / `--quick` compress a run to fit a wall clock — see
   ["Shorter runs"](#shorter-runs---time-budget----quick) below.
+- `--no-live` / `--verbose` control the terminal output — see
+  ["Watching a run"](#watching-a-run) below.
 
 The load profile (users, spawn rate, duration) is driven by the `StepLoad` shape,
 **not** by CLI flags — so there is intentionally no `-u/-r/-t`. The ramp and knee
@@ -85,6 +87,75 @@ ramp to 0 so slow in-flight queries drain (counted under the stage that launched
 them) before the next stage starts clean, instead of bleeding into it. It defaults
 to 0 (cheap KP lookups don't bleed) and is set on the expensive ARA/ARS/Pathfinder
 targets.
+
+## Watching a run
+
+A run takes minutes to hours, so the terminal is the instrument panel. While it
+works, HelmsDeep pins a live status block to the bottom of the screen:
+
+```
+── HelmsDeep · ARS (ars) ─────────────────────────────────────────────────
+ run    ━━━━━━━━────────────────  33%  11m20s in · 22m40s left · ends ~18:19
+ stage  2/4  30u  HOLD  ━━━━━━━━━━────  72%  1m40s left
+ load   143 done · 20 in flight · 2 failed (1.4%) · 0.71 rps · conc 46.3
+ latency p50 64.8s · p95 96.0s · p99 98.8s / SLO 240.0s
+ ars    Done 139 · Error 1 · Timeout 1 · 0-result 1 · oldest 3m20s
+──────────────────────────────────────────────────────────────────────────
+```
+
+- **run** — progress through the whole ramp, and when it ends.
+- **stage** — which stage you are on, its user count, and whether it is holding
+  under load (`HOLD`) or in a cooldown gap draining slow queries (`DRAIN`).
+- **load / latency** — the *current stage's* numbers, live: throughput, errors
+  against the shared 1% cap, and p99 against this target's SLO. These are the
+  same figures the stage's row in `stages.csv` will carry.
+- **ars** — async runs only: terminal statuses so far, zero-result `Done`s, and
+  how long the oldest in-flight query has been polling.
+
+Everything else scrolls above the block, including a header when a stage starts
+and a verdict line when it ends:
+
+```
+▶ stage 3/4  45 users  7m00s hold  (spawn 5/s)
+  ✓ stage 2 · 30u · 6m00s · n=216 · 0.71 rps · p99 98.8s ✓ · err 0.40% ✓ · conc 21.3
+```
+
+That verdict line is the knee test applied to one stage: a `✓` means the stage
+met **both** the p99 SLO and the error cap, so it is a knee candidate. It always
+appears directly under the header of the stage it describes (after the cooldown
+note, where there is one), and it always carries that stage's final numbers —
+the ones its row in `stages.csv` will carry.
+
+The end-of-run summary table adds two **shape rows** — one character per stage,
+scaled against that metric's bar and painted red where a stage went over it — so
+you can see where the latency curve turns up and where errors start without
+reading the numbers:
+
+```
+    p99  ▁▁▁▂▄█   (SLO 60.0s; red = over)
+    err  ▁▁▁▁▂█   (cap 1.0%; red = over)
+```
+
+Because the bars are measured against the SLO (not against the tallest stage), a
+run that stayed comfortably inside its budget stays visibly low rather than being
+stretched to full height.
+
+And the headline number is repeated one final time *after* Locust's own
+end-of-run tables, so the answer is the last thing on screen rather than the
+middle of the scrollback.
+
+Two flags adjust this:
+
+- `--no-live` — no redrawn block; the same status is printed as a single line
+  every 30 seconds. This is also the automatic behavior when stdout is not a
+  terminal (CI, a pipe, `tee` to a log file), so piped output stays readable.
+  `HELMSDEEP_LIVE=0` does the same thing via the environment; `NO_COLOR` keeps
+  the layout but drops the ANSI colors.
+- `--verbose` — restores Locust's own output: its full request table every two
+  seconds plus its INFO log. It is off by default because the table scrolls the
+  status out of view within seconds, and its totals are *blended across the whole
+  ramp* — the one number this tool deliberately refuses to quote. Locust's final
+  tables print at the end either way.
 
 ## Shorter runs (`--time-budget` / `--quick`)
 
@@ -132,8 +203,8 @@ printed summary leads with a warning banner. **Don't quote a compressed run's kn
 as a capacity result, and don't gate CI on its checkpoints.**
 
 Compression only ever speeds a run up: a budget above the target's natural
-duration is ignored (`kps` already runs in 7 minutes, so `--quick` leaves it
-alone). Stages won't shrink below a 30-second floor, so a budget too small to fit
+duration is ignored (a 2-hour budget leaves every target alone). Stages won't
+shrink below a 30-second floor, so a budget too small to fit
 them simply overruns — the CLI says so and prints the real projected duration.
 
 > **Want each stage to get a specific amount of time?** The budget is for the
@@ -150,8 +221,10 @@ Written to the working directory by the standalone/master node:
   `stage_start` column with the stage's wall-clock start time (ISO 8601 UTC)
 - `<prefix>_by_qtype.csv` — one row per (stage, query type)
 - `<prefix>_summary.json` — config (including which `target` was measured and the
-  `time_scale` it ran at), all stages, and the chosen knee (plus `checkpoints` for
-  targets that define them)
+  `time_scale` it ran at), all stages, the chosen knee, and `stage_warnings` /
+  `knee_unsupported` (see
+  ["Measurement quality warnings"](#measurement-quality-warnings)) (plus
+  `checkpoints` for targets that define them)
 - `<prefix>_checkpoints.csv` — **targets with acceptance criteria** (`aras_mixed`
   / `ars_mixed`): one row per checkpoint with its `PASS` / `FAIL` verdict
 - `<prefix>_ars_health.csv` — **ARS only**: per-stage health signals (see below)
@@ -168,6 +241,8 @@ Written to the working directory by the standalone/master node:
   totals are *blended across the whole run*, so the authoritative ceiling is the
   knee in `summary.json`, not the HTML aggregate.
 - a printed summary table ending in the headline **max sustainable concurrency**
+  (repeated once more after Locust's own end-of-run tables, so it is the last
+  thing in the terminal)
 
 For a guide to interpreting every one of these — written for non-specialists —
 see ["How to read the results"](#how-to-read-the-results) below.
@@ -479,6 +554,46 @@ catch exactly this. In plain terms they flag things like:
 
 If `red_flags` is non-empty, the service may be degrading in a way the raw
 latency/error numbers alone wouldn't reveal — read those flags.
+
+### Measurement quality warnings
+
+A stage's row can be arithmetically correct and still not mean what it looks
+like. The summary flags two conditions the table itself cannot show, and repeats
+the flag on the headline when the knee rests on a flagged stage:
+
+```
+MEASUREMENT QUALITY (3 of 7 stage(s) flagged)
+  stage 0 (5u, n=15): p99 rests on the 2 slowest of 15 request(s)
+                      effective concurrency 0.9 is only 18% of 5 users -- most
+                      queries did not finish inside the stage, so they landed in
+                      the next one
+```
+
+- **Too few requests for the percentile.** At `n` samples the p99 interpolates
+  around index `(n-1) * 0.99`, so below ~100 completed requests it rests on the
+  two slowest requests in the stage and moves with a single outlier. A stage that
+  reports `p99 103.5s` off 16 requests is reporting one query.
+- **Effective concurrency far below the user count.** Users are closed-loop with
+  no think time (`wait_time = constant(0)`), so Little's Law concurrency should
+  track the stage's user count. When it is under half of it, most users spent the
+  stage blocked on queries that never finished inside it — and since requests are
+  bucketed by *finish* time, those completions land in the **next** stage. That
+  contaminates both: the giveaway is a later stage looking *faster* than an
+  earlier one with fewer users.
+
+The remedies live in the target's entry in `config.py`: **longer stage holds**
+(more samples per stage) for the first, a **`cooldown_s` drain gap** (so slow
+queries finish inside the stage that launched them) for the second. The printed
+block names whichever applies.
+
+`summary.json` carries the same information as `stage_warnings` and
+`knee_unsupported`, with each issue tagged `thin_samples` or `in_flight_bleed`,
+so a script can gate on it without parsing prose.
+
+> This is why the `kps` target holds each stage for **5 minutes** with a 60s
+> cooldown, rather than the 60s holds it carried when the KP layer was ~40
+> independent services answering in milliseconds. Retriever answers in seconds to
+> tens of seconds; at 60s holds every stage tripped both flags.
 
 ### The HTML report (`<prefix>_report.html`)
 
