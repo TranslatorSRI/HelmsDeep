@@ -81,17 +81,30 @@ TARGETS = {
         "corpus": "retriever",
         "protocol": "sync",
         "implemented": True,
-        # Cheap lookups -- ramp high to find saturation.
+        # Ramp high to find saturation. The holds are 5 minutes, not the 60s
+        # this target carried when the KP layer was ~40 independent services
+        # answering in milliseconds: Retriever answers a lookup in seconds to
+        # tens of seconds, and a 60s hold at that latency yielded 15-100
+        # completed requests per stage -- too few to put a p99 on (the printed
+        # value was one of the two slowest requests) and short enough that most
+        # queries were still in flight when the stage ended, landing in the next
+        # stage's bucket and making a later stage look faster than an earlier
+        # one. Five minutes gives the low stages ~75-150 samples and the high
+        # ones several hundred.
         "stages": [
-            (5,   5, 60),
-            (10,  5, 60),
-            (20,  5, 60),
-            (40, 10, 60),
-            (80, 10, 60),
-            (120, 20, 60),
-            (160, 20, 60),
+            (5,   5, 300),
+            (10,  5, 300),
+            (20,  5, 300),
+            (40, 10, 300),
+            (80, 10, 300),
+            (120, 20, 300),
+            (160, 20, 300),
         ],
         "p99_slo_ms": 60000,
+        # Matches the p99 SLO: a query that finishes inside its latency budget
+        # drains into the stage that launched it rather than contaminating the
+        # next one. (Cheap lookups didn't bleed; Retriever does.)
+        "cooldown_s": 60,
     },
     "aras": {
         "label": "Shepherd",

@@ -203,8 +203,8 @@ printed summary leads with a warning banner. **Don't quote a compressed run's kn
 as a capacity result, and don't gate CI on its checkpoints.**
 
 Compression only ever speeds a run up: a budget above the target's natural
-duration is ignored (`kps` already runs in 7 minutes, so `--quick` leaves it
-alone). Stages won't shrink below a 30-second floor, so a budget too small to fit
+duration is ignored (a 2-hour budget leaves every target alone). Stages won't
+shrink below a 30-second floor, so a budget too small to fit
 them simply overruns — the CLI says so and prints the real projected duration.
 
 > **Want each stage to get a specific amount of time?** The budget is for the
@@ -221,8 +221,10 @@ Written to the working directory by the standalone/master node:
   `stage_start` column with the stage's wall-clock start time (ISO 8601 UTC)
 - `<prefix>_by_qtype.csv` — one row per (stage, query type)
 - `<prefix>_summary.json` — config (including which `target` was measured and the
-  `time_scale` it ran at), all stages, and the chosen knee (plus `checkpoints` for
-  targets that define them)
+  `time_scale` it ran at), all stages, the chosen knee, and `stage_warnings` /
+  `knee_unsupported` (see
+  ["Measurement quality warnings"](#measurement-quality-warnings)) (plus
+  `checkpoints` for targets that define them)
 - `<prefix>_checkpoints.csv` — **targets with acceptance criteria** (`aras_mixed`
   / `ars_mixed`): one row per checkpoint with its `PASS` / `FAIL` verdict
 - `<prefix>_ars_health.csv` — **ARS only**: per-stage health signals (see below)
@@ -552,6 +554,46 @@ catch exactly this. In plain terms they flag things like:
 
 If `red_flags` is non-empty, the service may be degrading in a way the raw
 latency/error numbers alone wouldn't reveal — read those flags.
+
+### Measurement quality warnings
+
+A stage's row can be arithmetically correct and still not mean what it looks
+like. The summary flags two conditions the table itself cannot show, and repeats
+the flag on the headline when the knee rests on a flagged stage:
+
+```
+MEASUREMENT QUALITY (3 of 7 stage(s) flagged)
+  stage 0 (5u, n=15): p99 rests on the 2 slowest of 15 request(s)
+                      effective concurrency 0.9 is only 18% of 5 users -- most
+                      queries did not finish inside the stage, so they landed in
+                      the next one
+```
+
+- **Too few requests for the percentile.** At `n` samples the p99 interpolates
+  around index `(n-1) * 0.99`, so below ~100 completed requests it rests on the
+  two slowest requests in the stage and moves with a single outlier. A stage that
+  reports `p99 103.5s` off 16 requests is reporting one query.
+- **Effective concurrency far below the user count.** Users are closed-loop with
+  no think time (`wait_time = constant(0)`), so Little's Law concurrency should
+  track the stage's user count. When it is under half of it, most users spent the
+  stage blocked on queries that never finished inside it — and since requests are
+  bucketed by *finish* time, those completions land in the **next** stage. That
+  contaminates both: the giveaway is a later stage looking *faster* than an
+  earlier one with fewer users.
+
+The remedies live in the target's entry in `config.py`: **longer stage holds**
+(more samples per stage) for the first, a **`cooldown_s` drain gap** (so slow
+queries finish inside the stage that launched them) for the second. The printed
+block names whichever applies.
+
+`summary.json` carries the same information as `stage_warnings` and
+`knee_unsupported`, with each issue tagged `thin_samples` or `in_flight_bleed`,
+so a script can gate on it without parsing prose.
+
+> This is why the `kps` target holds each stage for **5 minutes** with a 60s
+> cooldown, rather than the 60s holds it carried when the KP layer was ~40
+> independent services answering in milliseconds. Retriever answers in seconds to
+> tens of seconds; at 60s holds every stage tripped both flags.
 
 ### The HTML report (`<prefix>_report.html`)
 

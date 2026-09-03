@@ -137,7 +137,11 @@ Package `helmsdeep/`:
   `checkpoints` — a list of pass/fail acceptance criteria (`users`, `goal`,
   `p99_slo_ms`, `max_error_rate`) evaluated against the stage that ran that many
   users. `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
-  Per-target ramps/SLOs live here because cost profiles differ wildly by layer.
+  Per-target ramps/SLOs live here because cost profiles differ wildly by layer:
+  `kps` holds each stage 5 minutes with a 60s cooldown because Retriever answers
+  in seconds to tens of seconds, not the milliseconds the old ~40-KP layer did --
+  at the 60s holds it used to carry, every stage tripped both measurement-quality
+  flags (see `_stage_quality`).
   `build_timeline(stages, cooldown_s)` lays the ramp out on a wall clock as
   `(start, end, stage_idx_or_None)` windows (`None` = a cooldown gap); the
   `StepLoad` shape drives users from it, and the live console uses it only for
@@ -231,6 +235,18 @@ Package `helmsdeep/`:
     polling to `COMPLETION_MAX_POLL_S` and appends one `COLLECTOR.record_completion`
     row (end-to-end time + whether it `finished`); queries that finish within
     `MAX_POLL_S` record their completion row inline.
+  - `_stage_quality(row)` — the two conditions that make a stage's row untrust-
+    worthy however correct its arithmetic: fewer than `MIN_P99_SAMPLES` (100)
+    completed requests, so the p99 rests on the two slowest and moves with one
+    outlier; and Little's-Law concurrency below `MIN_CONCURRENCY_RATIO` (0.5) of
+    the stage's user count, meaning most users were blocked on queries that
+    finished in the *next* stage (we bucket by finish time), inflating its tail
+    and deflating this one. Each issue is `{kind, detail}` (`thin_samples` /
+    `in_flight_bleed`) so the printed remedy names only the fix that applies and
+    a script can branch without parsing prose. `on_test_stop` collects these into
+    `stage_warnings` + `knee_unsupported` in the summary, a printed MEASUREMENT
+    QUALITY block, and a caveat on the final headline when the knee rests on a
+    flagged stage.
   - `_evaluate_checkpoints()` — for targets that configure `checkpoints`, judges
     each one against the stage matching its user count and returns a
     `PASS`/`FAIL`/`NO DATA` verdict (a checkpoint's `p99_slo_ms` defaults to the
@@ -410,6 +426,13 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io/ars/api --csv-p
   boundary, and stage verdicts landed on either side of the next stage's header
   depending on which won the race. If you add anything that reports where a run
   is, read it from the collector.
+- **A stage's row can be right and still not mean anything.** `_stage_quality`
+  flags the two ways that happens -- a p99 over too few samples, and effective
+  concurrency far below the user count (in-flight queries bleeding into the next
+  stage). Both are ramp-shape problems, fixed with longer holds and a
+  `cooldown_s` in `config.py`, never by adjusting the numbers. If you retune a
+  target's stages, check a real run for these flags rather than assuming the old
+  holds still fit the service's latency.
 - **Don't trust Locust's blended aggregate during a ramp.** We bucket per stage in
   `StageCollector` precisely because an aggregate p99 would mix easy early stages
   with saturated late ones.

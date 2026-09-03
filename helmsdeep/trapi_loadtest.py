@@ -351,6 +351,53 @@ def _ars_stage_health(idx, qtype="__all__"):
     }
 
 
+# A stage's numbers can be arithmetically correct and still not mean what they
+# look like. Two conditions make a row untrustworthy, and both are invisible in
+# the table itself:
+#
+#  - Too few completed requests for the percentile we print. At n samples the
+#    p99 interpolates around index (n-1)*0.99, so below ~100 requests it rests
+#    on the two slowest requests in the stage and moves with a single outlier.
+#  - Little's Law concurrency far below the stage's user count. Users are
+#    closed-loop with no think time, so effective concurrency should track the
+#    user count; when it doesn't, most users spent the stage blocked on queries
+#    that never finished inside it. Those completions are bucketed into the NEXT
+#    stage (we bucket by finish time), which inflates its tail and deflates
+#    this one -- the classic symptom is a later stage looking *faster* than an
+#    earlier one. A cooldown_s drain gap is the fix; longer holds help too.
+MIN_P99_SAMPLES = 100
+MIN_CONCURRENCY_RATIO = 0.5
+
+
+def _stage_quality(row):
+    """Reasons this stage's row should not be read at face value (may be empty).
+
+    Each issue is ``{"kind": ..., "detail": ...}``; the kind is what decides
+    which remedy the summary recommends (and lets a script branch on it without
+    parsing prose).
+    """
+    issues = []
+    n = row["requests"]
+    if n < MIN_P99_SAMPLES:
+        # How many completed requests actually sit at or above the p99 index.
+        top = n - int((n - 1) * 0.99) if n else 0
+        issues.append({
+            "kind": "thin_samples",
+            "detail": (f"p99 rests on the {top} slowest of {n} request(s)" if n
+                       else "no completed requests"),
+        })
+    users = row["users"]
+    if users and n and row["concurrency"] < users * MIN_CONCURRENCY_RATIO:
+        issues.append({
+            "kind": "in_flight_bleed",
+            "detail": (f"effective concurrency {row['concurrency']:.1f} is only "
+                       f"{row['concurrency'] / users:.0%} of {users} users -- "
+                       f"most queries did not finish inside the stage, so they "
+                       f"landed in the next one"),
+        })
+    return issues
+
+
 def _evaluate_checkpoints(overall_rows):
     """Judge each configured checkpoint against the stage that ran its user count.
 
@@ -838,6 +885,18 @@ def on_test_stop(environment, **_kw):
             if knee is None or row["concurrency"] > knee["concurrency"]:
                 knee = row
 
+    # Which stages can't carry the numbers printed for them (see _stage_quality).
+    stage_warnings = []
+    for row in overall_rows:
+        issues = _stage_quality(row)
+        if issues:
+            stage_warnings.append({
+                "stage": row["stage"], "users": row["users"],
+                "requests": row["requests"], "issues": issues,
+            })
+    knee_unsupported = bool(
+        knee and any(w["stage"] == knee["stage"] for w in stage_warnings))
+
     # Pass/fail acceptance checkpoints (targets that configure them).
     checkpoints = _evaluate_checkpoints(overall_rows)
 
@@ -995,6 +1054,10 @@ def on_test_stop(environment, **_kw):
         "stages": overall_rows,
         "knee": knee,
         "max_sustainable_concurrency": knee["concurrency"] if knee else None,
+        # Stages whose row is arithmetically right but not trustworthy, and
+        # whether the headline number rests on one of them.
+        "stage_warnings": stage_warnings,
+        "knee_unsupported": knee_unsupported,
     }
     if checkpoints:
         summary["config"]["checkpoints"] = CHECKPOINTS
@@ -1044,6 +1107,32 @@ def on_test_stop(environment, **_kw):
     else:
         print("No stage met the SLO -- service saturated below the first stage, "
               "or SLO is too strict. Lower the first stage or relax P99_SLO_MS.")
+
+    if stage_warnings:
+        print("-" * 64)
+        print(f"MEASUREMENT QUALITY ({len(stage_warnings)} of "
+              f"{len(overall_rows)} stage(s) flagged)")
+        kinds = {i["kind"] for w in stage_warnings for i in w["issues"]}
+        for w in stage_warnings:
+            head = f"  stage {w['stage']} ({w['users']}u, n={w['requests']}): "
+            for i, issue in enumerate(w["issues"]):
+                print((head if i == 0 else " " * len(head)) + issue["detail"])
+        if knee_unsupported:
+            print(f"  [!] The knee (stage {knee['stage']}) is one of them: the "
+                  f"headline number rests on a\n      stage that cannot support "
+                  f"it. Treat it as indicative, not a measurement.")
+        # Name only the remedy that applies -- both live in this target's entry.
+        remedies = []
+        if "thin_samples" in kinds:
+            remedies.append("longer stage holds, for more samples per stage")
+        if "in_flight_bleed" in kinds:
+            remedies.append(
+                f"a cooldown_s longer than the current {COOLDOWN_S}s"
+                if COOLDOWN_S else
+                "a cooldown_s drain gap, so slow queries finish inside the "
+                "stage that launched them")
+        print(f"  Fix in config.py under '{TARGET}': " + "; and ".join(remedies)
+              + ".")
 
     if checkpoints:
         print("-" * 64)
@@ -1136,7 +1225,9 @@ def on_test_stop(environment, **_kw):
     # Locust prints its own (long) request/percentile/error tables AFTER this
     # listener returns, which would bury the number the run exists to produce.
     # Stash the headline and repeat it on quit, so it is the last thing on screen.
-    _stash_headline(knee, checkpoints, red_flags if PROTOCOL == "async" else [])
+    _stash_headline(knee, checkpoints, red_flags if PROTOCOL == "async" else [],
+                    knee_unsupported=knee_unsupported,
+                    flagged_stages=len(stage_warnings))
 
 
 # ----------------------------------------------------------------------------
@@ -1146,15 +1237,28 @@ def on_test_stop(environment, **_kw):
 _HEADLINE = []
 
 
-def _stash_headline(knee, checkpoints, red_flags):
+def _stash_headline(knee, checkpoints, red_flags, *, knee_unsupported=False,
+                    flagged_stages=0):
     paint = console.painter()
     lines = [paint("─" * 64, "grey")]
     if knee:
+        # A knee drawn from a stage that can't support it is worse than no
+        # number, because it looks like one. Colour it accordingly.
+        tone = "yellow" if knee_unsupported else "green"
         lines.append(
             paint("MAX SUSTAINABLE CONCURRENCY: ", "bold")
-            + paint(f"{knee['concurrency']}", "bold", "green")
+            + paint(f"{knee['concurrency']}", "bold", tone)
             + paint(f"   ({_TGT['label']}, stage {knee['stage']}, "
                     f"{knee['users']} users)", "grey"))
+        if knee_unsupported:
+            lines.append(paint(
+                "  [!] indicative only -- that stage is flagged under "
+                "MEASUREMENT QUALITY above", "yellow"))
+    elif flagged_stages:
+        lines.append(paint("NO STAGE MET THE SLO", "bold", "red")
+                     + paint(f"   ({_TGT['label']}: but {flagged_stages} stage(s) "
+                             f"are flagged -- see MEASUREMENT QUALITY above)",
+                             "grey"))
     else:
         lines.append(paint("NO STAGE MET THE SLO", "bold", "red")
                      + paint(f"   ({_TGT['label']}: saturated below the first "
