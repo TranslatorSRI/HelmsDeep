@@ -37,7 +37,12 @@ Outputs:
                                 max_poll_s failure threshold up to
                                 completion_max_poll_s)
   - <prefix>_summary.json       config, all stages, the knee (+ checkpoints,
-                                ars_health/completion/red_flags)
+                                ars_health/completion/red_flags), and an
+                                error_samples tally of every error kind seen
+  - <prefix>_errors/            saved examples of each error kind (request +
+                                response body / client exception), one JSON
+                                file each, grouped by kind, + index.json --
+                                what a failure actually looked like
 
 Usage (headless, recommended for reproducible numbers):
 
@@ -51,6 +56,7 @@ Per-target load/SLO and the ARS poll knobs live in config.py.
 
 import itertools
 import json
+import logging
 import os
 import statistics
 import time
@@ -63,6 +69,7 @@ from locust.runners import MasterRunner, WorkerRunner
 
 import config
 import console
+import error_samples
 from trapi_corpus import corpus_for
 
 # ----------------------------------------------------------------------------
@@ -126,6 +133,49 @@ _COMPLETION_GREENLETS = []
 COOLDOWN_S = _TGT.get("cooldown_s", 0)
 
 CSV_PREFIX = os.environ.get("LOCUST_CSV_PREFIX", "trapi_run")
+
+# Full examples of every error kind -- the request sent, the response (status,
+# headers, body) or the client-side exception, and the stage it happened in --
+# saved to <prefix>_errors/ the moment they happen (see error_samples.py). The
+# per-stage tables say a request failed with a 502; the sample says what the 502
+# said. Capped per kind PER STAGE; HELMSDEEP_ERROR_SAMPLES (the CLI's
+# --error-samples) overrides the cap, 0 disables saving (occurrences are still
+# tallied for the summary).
+ERROR_SAMPLES_PER_KIND = int(
+    os.environ.get("HELMSDEEP_ERROR_SAMPLES", config.ERROR_SAMPLES_PER_KIND))
+SAMPLER = error_samples.ErrorSampler(
+    f"{CSV_PREFIX}_errors",
+    per_kind_per_stage=ERROR_SAMPLES_PER_KIND,
+    body_limit=config.ERROR_SAMPLE_BODY_BYTES,
+)
+
+
+def _sample(kind, qtype, error, *, response=None, request=None, latency_ms=None,
+            intermediate=False, stage=None, extra=None):
+    """Hand one error to the sampler, attributed to the stage active now (the
+    same rule the per-stage stats bucket by). Returns the saved file's path, or
+    None when it was only counted. Never raises: a sample is a convenience for
+    the post-mortem; the measurement must not depend on it.
+    """
+    stage = COLLECTOR.stage_idx if stage is None else stage
+    users = STAGES[stage][0] if stage < len(STAGES) else None
+    try:
+        return SAMPLER.capture(
+            kind, stage=stage, users=users, qtype=qtype, error=error,
+            response=response, request=request, latency_ms=latency_ms,
+            intermediate=intermediate, extra=extra)
+    except Exception as e:   # pragma: no cover - defensive
+        logging.getLogger(__name__).warning("error sample not saved: %r", e)
+        return None
+
+
+@events.test_start.add_listener
+def _reset_error_samples(environment, **_kw):
+    # Every node, not just the master: samples are written by whoever sends the
+    # request. Drops <prefix>_errors/ from a previous run with this prefix, the
+    # same way the CSVs are overwritten; runs before any request is sent.
+    SAMPLER.reset()
+
 
 # Weighted, flattened corpus for O(1)-ish random selection.
 import random
@@ -488,6 +538,7 @@ class TRAPIUser(HttpUser):
             catch_response=True,
         ) as resp:
             failed = False
+            error = None
             # malformed_query is expected to 4xx -- treat that as a successful
             # measurement of the error path, not a load-test failure.
             if qtype == "malformed_query":
@@ -495,15 +546,27 @@ class TRAPIUser(HttpUser):
                     resp.success()
                 else:
                     failed = True
-                    resp.failure(f"server error {resp.status_code}")
+                    error = f"server error {resp.status_code}"
+                    resp.failure(error)
             else:
                 if resp.status_code == 200:
                     resp.success()
                 else:
                     failed = True
-                    resp.failure(f"status {resp.status_code}")
+                    error = f"status {resp.status_code}"
+                    resp.failure(error)
             latency_ms = resp.request_meta["response_time"] or 0.0
             COLLECTOR.record(qtype, latency_ms, failed)
+            if failed:
+                # Keep an example of what this failure looked like. Status 0 is
+                # Locust's "no HTTP response at all" (timeout, connection
+                # refused); the kind and message then name the exception.
+                _sample(error_samples.http_kind(resp), qtype,
+                        error_samples.failure_message(resp, error),
+                        response=resp, latency_ms=latency_ms,
+                        request=error_samples.describe_request(
+                            resp, method="POST", url=self._url(ENDPOINT),
+                            payload=payload))
 
     def _record_ars(self, qtype, latency_ms, failed, exc_msg=None, **health):
         """Record one logical ARS query: into the per-stage COLLECTOR (drives
@@ -529,14 +592,19 @@ class TRAPIUser(HttpUser):
             finished=finished, status=status, start_ts=start,
         )
 
+    def _url(self, path):
+        """Absolute URL for a request path on this run's host."""
+        return f"{self.host.rstrip('/')}{path}"
+
     def _message_url(self, pk):
         """Full URL for pulling one ARS query up by hand (curl / browser)."""
-        return f"{self.host.rstrip('/')}{MESSAGES_PATH}/{pk}?trace=y" if pk else ""
+        return self._url(f"{MESSAGES_PATH}/{pk}?trace=y") if pk else ""
 
     def _record_query(self, query_id, qtype, pk, start, ars_status, *,
                       failed, error=None, submit_http=None, poll_http=None,
                       merge_http=None, polls=0, result_count=None,
-                      response_bytes=None, stage=None, issues=None):
+                      response_bytes=None, stage=None, issues=None,
+                      sample=None):
         """Append one row to the ARS per-query debug log.
 
         Written for EVERY logical query, terminal or not -- the failures are the
@@ -571,6 +639,9 @@ class TRAPIUser(HttpUser):
             "intermediate_errors": issues.summary() if issues else "",
             "error": error or "",
             "message_url": self._message_url(pk),
+            # Path of the saved example of this query's TERMINAL error (request
+            # + last response body), when one was kept -- see error_samples.py.
+            "error_sample": sample or "",
         })
 
     def _extended_poll(self, query_id, qtype, pk, start, stage):
@@ -620,9 +691,18 @@ class TRAPIUser(HttpUser):
         start = time.time()
         query_id = COLLECTOR.new_query_id()
         issues = QueryIssues()   # non-fatal trouble on the way to the outcome
+        pk = None
+        # The request side of every sample this query produces is the query it
+        # submitted; the ARS context (pk, step, message URL) rides alongside.
+        submit_req = {"method": "POST", "url": self._url(ENDPOINT),
+                      "json": payload}
 
         def _elapsed_ms():
             return (time.time() - start) * 1000.0
+
+        def _ars_ctx(step, **more):
+            return {"ars": {"query": query_id, "pk": pk, "step": step,
+                            "message_url": self._message_url(pk), **more}}
 
         # 1) Submit -> pk.
         with self.client.post(
@@ -631,13 +711,18 @@ class TRAPIUser(HttpUser):
         ) as resp:
             submit_http = resp.status_code
             if submit_http != 201:
-                resp.failure(f"submit status {submit_http}")
-                self._record_ars(qtype, _elapsed_ms(), True,
-                                 f"submit status {submit_http}",
+                msg = f"submit status {submit_http}"
+                resp.failure(msg)
+                self._record_ars(qtype, _elapsed_ms(), True, msg,
                                  status="SubmitError")
+                sample = _sample(
+                    "ars_submit_" + error_samples.http_kind(resp), qtype,
+                    error_samples.failure_message(resp, msg), response=resp,
+                    request=submit_req, latency_ms=_elapsed_ms(),
+                    extra=_ars_ctx("submit"))
                 self._record_query(query_id, qtype, None, start, "SubmitError",
                                    failed=True, submit_http=submit_http,
-                                   error=f"submit status {submit_http}")
+                                   error=msg, sample=sample)
                 self._record_completion(query_id, qtype, start, False,
                                         "SubmitError", COLLECTOR.stage_idx)
                 return
@@ -646,12 +731,15 @@ class TRAPIUser(HttpUser):
             except Exception:
                 pk = None
             if not pk:
-                resp.failure("no pk in submit response")
-                self._record_ars(qtype, _elapsed_ms(), True,
-                                 "no pk in submit response", status="NoPK")
+                msg = "no pk in submit response"
+                resp.failure(msg)
+                self._record_ars(qtype, _elapsed_ms(), True, msg, status="NoPK")
+                sample = _sample("ars_submit_no_pk", qtype, msg, response=resp,
+                                 request=submit_req, latency_ms=_elapsed_ms(),
+                                 extra=_ars_ctx("submit"))
                 self._record_query(query_id, qtype, None, start, "NoPK",
                                    failed=True, submit_http=submit_http,
-                                   error="no pk in submit response")
+                                   error=msg, sample=sample)
                 self._record_completion(query_id, qtype, start, False, "NoPK",
                                         COLLECTOR.stage_idx)
                 return
@@ -662,6 +750,8 @@ class TRAPIUser(HttpUser):
         merged_pk = None
         poll_http = None      # last poll HTTP code seen -- for the debug log
         polls = 0
+        last_poll = None      # last poll that parsed: the body behind Error/Timeout
+        poll_req = {"method": "GET", "url": self._message_url(pk)}
         deadline = start + MAX_POLL_S
         while time.time() < deadline:
             gevent.sleep(POLL_INTERVAL_S)   # cooperative; never time.sleep
@@ -672,18 +762,29 @@ class TRAPIUser(HttpUser):
             ) as resp:
                 poll_http = resp.status_code
                 if poll_http != 200:
-                    resp.failure(f"poll status {poll_http}")
+                    msg = f"poll status {poll_http}"
+                    resp.failure(msg)
                     # status_code 0 == locust caught a connection error/timeout,
                     # i.e. no HTTP response at all.
                     issues.add(f"poll HTTP {poll_http}" if poll_http
                                else "poll request failed")
+                    _sample("ars_poll_" + error_samples.http_kind(resp), qtype,
+                            error_samples.failure_message(resp, msg),
+                            response=resp, request=poll_req, intermediate=True,
+                            latency_ms=_elapsed_ms(),
+                            extra=_ars_ctx("poll", poll=polls))
                     continue   # transient; keep polling until the deadline
                 resp.success()
                 try:
                     body = resp.json() or {}
                 except Exception:
                     issues.add("poll body not JSON")
+                    _sample("ars_poll_bad_json", qtype, "poll body not JSON",
+                            response=resp, request=poll_req, intermediate=True,
+                            latency_ms=_elapsed_ms(),
+                            extra=_ars_ctx("poll", poll=polls))
                     continue
+                last_poll = resp
                 status = body.get("status")
                 merged_pk = body.get("merged_version") or merged_pk
                 if status in ("Done", "Error"):
@@ -692,8 +793,13 @@ class TRAPIUser(HttpUser):
         # 3) Terminal handling. The stage active now is what the main measurement
         # is attributed to; the completion sidecar row uses the same stage.
         stage = COLLECTOR.stage_idx
+        # The last trace=y poll body is what a sample of an Error/Timeout/empty
+        # Done carries: it lists the per-ARA children and their statuses, which
+        # is where "why" lives for an ARS query.
         if status == "Done":
-            result_count, nbytes, merge_http = self._fetch_merged(merged_pk, issues)
+            result_count, nbytes, merge_http, merged = self._fetch_merged(
+                merged_pk, issues, qtype=qtype, ctx=_ars_ctx,
+                elapsed_ms=_elapsed_ms, last_poll=last_poll)
             zero_result = result_count == 0
             # Whether an empty answer set scores against the error rate (and so
             # the knee) is a per-target policy -- see ZERO_RESULT_IS_FAILURE.
@@ -703,6 +809,20 @@ class TRAPIUser(HttpUser):
                 exc_msg=("Done with 0 results" if zero_result else None),
                 status="Done", result_count=result_count, response_bytes=nbytes,
             )
+            sample = None
+            if zero_result:
+                # Sampled whichever way the policy scores it: an empty answer
+                # set is still the thing you would open this pk to explain.
+                sample = _sample(
+                    "ars_done_zero_results", qtype, "Done with 0 results",
+                    response=merged, request=submit_req, stage=stage,
+                    latency_ms=_elapsed_ms(),
+                    extra={**_ars_ctx("merge", merged_pk=merged_pk, polls=polls,
+                                      merge_http=merge_http,
+                                      scored_as_failure=failed,
+                                      intermediate_errors=issues.summary()),
+                           "last_poll": error_samples.describe_response(
+                               last_poll, SAMPLER.body_limit)})
             self._record_query(query_id, qtype, pk, start, "Done",
                                # `failed` follows the policy, so the debug log
                                # agrees with how the query was actually scored;
@@ -713,15 +833,20 @@ class TRAPIUser(HttpUser):
                                submit_http=submit_http, poll_http=poll_http,
                                merge_http=merge_http, polls=polls,
                                result_count=result_count, response_bytes=nbytes,
-                               stage=stage, issues=issues)
+                               stage=stage, issues=issues, sample=sample)
             self._record_completion(query_id, qtype, start, True, "Done", stage)
         elif status == "Error":
             self._record_ars(qtype, _elapsed_ms(), True, "ARS Error status",
                              status="Error")
+            sample = _sample(
+                "ars_error", qtype, "ARS Error status", response=last_poll,
+                request=submit_req, stage=stage, latency_ms=_elapsed_ms(),
+                extra=_ars_ctx("poll", polls=polls,
+                               intermediate_errors=issues.summary()))
             self._record_query(query_id, qtype, pk, start, "Error", failed=True,
                                error="ARS Error status", submit_http=submit_http,
                                poll_http=poll_http, polls=polls, stage=stage,
-                               issues=issues)
+                               issues=issues, sample=sample)
             self._record_completion(query_id, qtype, start, True, "Error", stage)
         else:
             # Not terminal within MAX_POLL_S: fail the main measurement now
@@ -734,11 +859,17 @@ class TRAPIUser(HttpUser):
             # The pk is the point of this row: a timed-out query is the one you
             # most want to pull up by hand afterwards. `status` here is the last
             # non-terminal status the ARS reported (e.g. Running), if any.
+            msg = (f"no terminal status within {MAX_POLL_S}s"
+                   + (f" (last: {status})" if status else ""))
+            sample = _sample(
+                "ars_timeout", qtype, msg, response=last_poll,
+                request=submit_req, stage=stage, latency_ms=_elapsed_ms(),
+                extra=_ars_ctx("poll", polls=polls, last_status=status,
+                               intermediate_errors=issues.summary()))
             self._record_query(query_id, qtype, pk, start, "Timeout", failed=True,
-                               error=(f"no terminal status within {MAX_POLL_S}s"
-                                      + (f" (last: {status})" if status else "")),
-                               submit_http=submit_http, poll_http=poll_http,
-                               polls=polls, stage=stage, issues=issues)
+                               error=msg, submit_http=submit_http,
+                               poll_http=poll_http, polls=polls, stage=stage,
+                               issues=issues, sample=sample)
             if COMPLETION_MAX_POLL_S > MAX_POLL_S:
                 g = gevent.spawn(self._extended_poll, query_id, qtype, pk, start,
                                  stage)
@@ -747,39 +878,59 @@ class TRAPIUser(HttpUser):
                 self._record_completion(query_id, qtype, start, False, "Timeout",
                                         stage)
 
-    def _fetch_merged(self, merged_pk, issues=None):
-        """Fetch the merged message; return (result_count, response_bytes, http).
+    def _fetch_merged(self, merged_pk, issues=None, *, qtype=None, ctx=None,
+                      elapsed_ms=None, last_poll=None):
+        """Fetch the merged message; return
+        (result_count, response_bytes, http, response).
 
         Anything that goes wrong here is recorded in `issues` (the per-query
         intermediate-error log) rather than raised: a merged message we could not
         fetch or parse still leaves the query itself terminal, it just makes the
-        0 we report for result_count mean something different.
+        0 we report for result_count mean something different. Each such problem
+        is also handed to the sampler as an intermediate error, with `ctx` (the
+        query's ARS context builder) and `last_poll` (the trace body) attached.
         """
-        if not merged_pk:
+        merge_req = ({"method": "GET",
+                      "url": self._url(f"{MESSAGES_PATH}/{merged_pk}")}
+                     if merged_pk else None)
+
+        def _note(kind, issue, error, resp=None):
             if issues is not None:
-                issues.add("Done without merged_version")
-            return 0, 0, None
+                issues.add(issue)
+            _sample(kind, qtype, error, response=resp, request=merge_req,
+                    intermediate=True,
+                    latency_ms=elapsed_ms() if elapsed_ms else None,
+                    extra={**(ctx("merge", merged_pk=merged_pk) if ctx else {}),
+                           "last_poll": error_samples.describe_response(
+                               last_poll, SAMPLER.body_limit)})
+
+        if not merged_pk:
+            _note("ars_merge_missing", "Done without merged_version",
+                  "Done without merged_version")
+            return 0, 0, None, None
         with self.client.get(
             f"{MESSAGES_PATH}/{merged_pk}", name="ars_merge",
             timeout=REQUEST_TIMEOUT, catch_response=True,
         ) as resp:
             nbytes = len(resp.content or b"")
             if resp.status_code != 200:
-                resp.failure(f"merge status {resp.status_code}")
-                if issues is not None:
-                    issues.add(f"merge HTTP {resp.status_code}"
-                               if resp.status_code else "merge request failed")
-                return 0, nbytes, resp.status_code
+                msg = f"merge status {resp.status_code}"
+                resp.failure(msg)
+                _note("ars_merge_" + error_samples.http_kind(resp),
+                      (f"merge HTTP {resp.status_code}" if resp.status_code
+                       else "merge request failed"),
+                      error_samples.failure_message(resp, msg), resp)
+                return 0, nbytes, resp.status_code, resp
             resp.success()
             try:
                 body = resp.json() or {}
                 results = (((body.get("fields") or {}).get("data") or {})
                            .get("message") or {}).get("results") or []
-                return len(results), nbytes, resp.status_code
+                return len(results), nbytes, resp.status_code, resp
             except Exception:
-                if issues is not None:
-                    issues.add("merged message not parseable")
-                return 0, nbytes, resp.status_code
+                _note("ars_merge_unparseable", "merged message not parseable",
+                      "merged message not parseable", resp)
+                return 0, nbytes, resp.status_code, resp
 
 
 # ----------------------------------------------------------------------------
@@ -1065,7 +1216,7 @@ def on_test_stop(environment, **_kw):
                 "latency_s", "ars_status", "failed", "submit_http", "poll_http",
                 "merge_http", "polls", "intermediate_error_count",
                 "result_count", "response_bytes", "intermediate_errors", "error",
-                "message_url"]
+                "message_url", "error_sample"]
     if queries:
         with open(f"{CSV_PREFIX}_ars_queries.csv", "w") as f:
             f.write(",".join(qlfields) + "\n")
@@ -1085,6 +1236,11 @@ def on_test_stop(environment, **_kw):
             f.write(",".join(cfields) + "\n")
             for r in completions:
                 f.write(",".join(str(r[k]) for k in cfields) + "\n")
+
+    # Error samples: the files were written as the errors happened; this is the
+    # tally of every kind seen plus the index of the examples kept for each.
+    error_index = SAMPLER.write_index()
+    error_summary = SAMPLER.summary()
 
     summary = {
         "config": {
@@ -1107,6 +1263,9 @@ def on_test_stop(environment, **_kw):
         # whether the headline number rests on one of them.
         "stage_warnings": stage_warnings,
         "knee_unsupported": knee_unsupported,
+        # Every error kind seen (with per-stage counts) and where the saved
+        # examples of each live -- see error_samples.py.
+        "error_samples": error_summary,
     }
     if checkpoints:
         summary["config"]["checkpoints"] = CHECKPOINTS
@@ -1204,9 +1363,32 @@ def on_test_stop(environment, **_kw):
         else:
             print(f"RESULT: all {len(checkpoints)} checkpoints met.")
 
+    # What the failures actually were. The tables above count them; this names
+    # each kind, says how often and at which stages it happened, and points at
+    # a saved example (request + response) to open.
+    if error_summary["kinds"]:
+        print("-" * 64)
+        if SAMPLER.enabled:
+            where = (f"examples in {SAMPLER.root}/, up to "
+                     f"{SAMPLER.per_kind_per_stage} per kind per stage")
+        else:
+            where = "saving disabled (--error-samples 0)"
+        print(f"ERROR SAMPLES ({error_summary['total_occurrences']} error(s) "
+              f"of {len(error_summary['kinds'])} kind(s); {where})")
+        print(f"  {'kind':<26} {'count':>6} {'saved':>6}  stages")
+        for k in error_summary["kinds"]:
+            stages = ",".join(str(s) for s in k["stages"])
+            note = "  (intermediate: retried past)" if k["intermediate"] else ""
+            print(f"  {k['kind']:<26} {k['occurrences']:>6} {k['saved']:>6}  "
+                  f"{stages}{note}")
+            if k["example"]:
+                print(f"    e.g. {k['example']}")
+
     wrote = [f"{CSV_PREFIX}_stages.csv", f"{CSV_PREFIX}_by_qtype.csv"]
     if checkpoints:
         wrote.append(f"{CSV_PREFIX}_checkpoints.csv")
+    if error_index:
+        wrote.append(f"{SAMPLER.root}/")
     if ars_health:
         print("-" * 64)
         print("ARS HEALTH (per stage)")
@@ -1276,7 +1458,8 @@ def on_test_stop(environment, **_kw):
     # Stash the headline and repeat it on quit, so it is the last thing on screen.
     _stash_headline(knee, checkpoints, red_flags if PROTOCOL == "async" else [],
                     knee_unsupported=knee_unsupported,
-                    flagged_stages=len(stage_warnings))
+                    flagged_stages=len(stage_warnings),
+                    errors=error_summary)
 
 
 # ----------------------------------------------------------------------------
@@ -1287,7 +1470,7 @@ _HEADLINE = []
 
 
 def _stash_headline(knee, checkpoints, red_flags, *, knee_unsupported=False,
-                    flagged_stages=0):
+                    flagged_stages=0, errors=None):
     paint = console.painter()
     lines = [paint("─" * 64, "grey")]
     if knee:
@@ -1326,6 +1509,14 @@ def _stash_headline(knee, checkpoints, red_flags, *, knee_unsupported=False,
     if red_flags:
         lines.append(paint(f"RED FLAGS: {len(red_flags)} "
                            f"(see the ARS block above)", "yellow"))
+    if errors and errors["kinds"]:
+        kinds = errors["kinds"]
+        top = ", ".join(f"{k['kind']} x{k['occurrences']}" for k in kinds[:3])
+        if len(kinds) > 3:
+            top += f", +{len(kinds) - 3} more"
+        where = (f"; {errors['saved']} example(s) in {errors['dir']}/"
+                 if errors["saved"] else "")
+        lines.append(paint(f"ERRORS: {top}{where}", "yellow"))
     lines.append(paint(f"Reports: {CSV_PREFIX}_summary.json "
                        f"and {CSV_PREFIX}_stages.csv", "grey"))
     lines.append(paint("─" * 64, "grey"))

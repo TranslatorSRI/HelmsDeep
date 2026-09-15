@@ -74,6 +74,15 @@ Async (``ars``) targets add:
 # Shared across all targets: a stage also needs error_rate <= this to be a knee.
 MAX_ERROR_RATE = 0.01   # 1%
 
+# Error samples (error_samples.py): full request/response examples of every
+# distinct error kind, saved under <prefix>_errors/ as they happen so a run can
+# be picked apart afterwards. The cap is per kind, PER STAGE (the same 502 at 5
+# users and at 60 usually has a different body behind it); every occurrence is
+# still counted. The CLI's --error-samples (HELMSDEEP_ERROR_SAMPLES) overrides
+# the cap; 0 disables saving. Bodies are truncated to ERROR_SAMPLE_BODY_BYTES.
+ERROR_SAMPLES_PER_KIND = 3
+ERROR_SAMPLE_BODY_BYTES = 64 * 1024
+
 TARGETS = {
     "kps": {
         "label": "Retriever",

@@ -158,8 +158,9 @@ Package `helmsdeep/`:
 - **`cli.py`** — the `helmsdeep` entry point (registered in
   `setup.py` `console_scripts`). Parses `--targets` (required, one layer),
   `--host` (required), `--csv-prefix`, the mutually exclusive
-  `--time-budget DURATION` / `--quick` (= `--time-budget 10m`), and the two
-  output flags `--no-live` (sets `HELMSDEEP_LIVE=0`) / `--verbose`; rejects
+  `--time-budget DURATION` / `--quick` (= `--time-budget 10m`), the two
+  output flags `--no-live` (sets `HELMSDEEP_LIVE=0`) / `--verbose`, and
+  `--error-samples N` (sets `HELMSDEEP_ERROR_SAMPLES`; 0 = count only); rejects
   not-yet-`implemented` targets; sets `LOADTEST_TARGET` (+ `LOCUST_CSV_PREFIX`,
   + `HELMSDEEP_TIME_BUDGET_S` when a budget is given) and launches
   `python -m locust -f trapi_loadtest.py --headless --host …`. Unless
@@ -195,6 +196,27 @@ Package `helmsdeep/`:
   - `live_enabled()` / `color_enabled()` — a non-TTY stdout (CI, a pipe) or
     `HELMSDEEP_LIVE=0` drops to plain mode: the same content as one status line
     every `PLAIN_EVERY_S`. `NO_COLOR` drops colour only.
+- **`error_samples.py`** — bounded on-disk capture of what each failure actually
+  looked like. `ErrorSampler(root, per_kind_per_stage, body_limit)` keeps, under
+  `<prefix>_errors/<kind>/<NN>_stage<S>_<qtype>.json`, the request (method, URL,
+  payload), the response (status, reason, headers, body truncated to
+  `config.ERROR_SAMPLE_BODY_BYTES`, JSON kept as JSON) or the client exception
+  when there was none, the stage/users/qtype, and any `extra` context (the ARS
+  pk/step/`message_url`, the last `trace=y` poll body). `capture()` writes the
+  file *immediately* (an aborted run keeps its samples) and always counts the
+  occurrence, so `kinds()`/`summary()` are complete even once a `(kind, stage)`
+  bucket is full (cap is per kind **per stage** -- the same 502 at 5 and at 60
+  users has different bodies). `reset()` wipes the directory at `test_start`;
+  `write_index()` writes `index.json` (tally + every saved sample) at stop.
+  `http_kind(resp)` names a kind from a response (`http_502`; status 0 →
+  `timeout`/`connection_error`/`exception_<Class>` from Locust's `resp.error`),
+  `failure_message(resp, default)` swaps in the exception text for status 0.
+  Never raises into the user path (the engine's `_sample()` wrapper also
+  swallows). The engine's kinds: sync `http_<code>`/`timeout`/…; ARS
+  `ars_submit_http_<code>`/`ars_submit_no_pk`/`ars_error`/`ars_timeout`/
+  `ars_done_zero_results` (terminal) and `ars_poll_http_<code>`/
+  `ars_poll_bad_json`/`ars_merge_http_<code>`/`ars_merge_unparseable`/
+  `ars_merge_missing` (`intermediate: true`).
 - **`trapi_loadtest.py`** — the measurement engine (Locust). The component under
   test is chosen by `LOADTEST_TARGET`, and when `HELMSDEEP_TIME_BUDGET_S` is set
   the target config is passed through `config.time_scaled` at import (module-level
@@ -238,8 +260,17 @@ Package `helmsdeep/`:
     row (`_record_query`) carrying the `pk`, the submit/poll/merge HTTP codes, the
     poll count, the terminal ARS status, a `QueryIssues` tally of the
     intermediate (retried, non-fatal) errors hit along the way
-    (`intermediate_error_count` + `intermediate_errors`), and a `message_url` —
-    written on every terminal path including `SubmitError`/`NoPK`/`Timeout`. When a
+    (`intermediate_error_count` + `intermediate_errors`), a `message_url`, and
+    an `error_sample` path (the saved example of the terminal error, if kept) —
+    written on every terminal path including `SubmitError`/`NoPK`/`Timeout`.
+    Every failure on either path also goes through the module-level `_sample()`
+    → `SAMPLER` (an `error_samples.ErrorSampler` rooted at `<prefix>_errors`,
+    cap from `HELMSDEEP_ERROR_SAMPLES` else `config.ERROR_SAMPLES_PER_KIND`,
+    reset on `test_start` on every node): sync failures with the response and
+    the POSTed payload; ARS submit/poll/merge trouble as it happens (poll/merge
+    ones `intermediate=True`), and the terminal `ars_error`/`ars_timeout`/
+    `ars_done_zero_results` with the submitted query as the request and the
+    last parsed `trace=y` poll (`last_poll`) as the response. When a
     query blows `MAX_POLL_S` (already recorded as a Timeout failure — main stats
     unchanged), `_run_ars` spawns a detached `_extended_poll` greenlet that keeps
     polling to `COMPLETION_MAX_POLL_S` and appends one `COLLECTOR.record_completion`
@@ -277,7 +308,10 @@ Package `helmsdeep/`:
     error rate across the ramp, red where a stage broke its bar), and (async only) `ars_health.csv`, the `ars_queries.csv` per-query
     debug log + a printed "FAILED QUERIES" block naming the first few pks/URLs,
     the `ars_completion.csv` sidecar, plus `red_flags` + a `completion` roll-up in
-    the summary + printed block.
+    the summary + printed block. Also `SAMPLER.write_index()` →
+    `<prefix>_errors/index.json`, `error_samples` (the sampler's `summary()`)
+    in `summary.json`, a printed ERROR SAMPLES block (kind / count / saved /
+    stages / an example path) and an `ERRORS:` headline line.
 - **`trapi_corpus.py`** — the per-component query corpuses:
   - `_qg(nodes, edges, tier=None, bypass_cache=None)` — TRAPI envelope; adds
     scalar `parameters.tier` (KP-only) or top-level `bypass_cache` (ARA/ARS) only
@@ -396,8 +430,10 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io --csv-prefix mi
   (+ `<prefix>_checkpoints.csv` for checkpointed targets) (+
   `<prefix>_ars_health.csv`, the `<prefix>_ars_queries.csv` per-query debug log,
   the `<prefix>_ars_completion.csv` sidecar, and a `red_flags` list +
-  `completion` roll-up for the `ars` target), plus a printed summary table with
-  the knee.
+  `completion` roll-up for the `ars` target), a `<prefix>_errors/` directory
+  (one JSON file per saved error example, grouped by kind, plus `index.json`;
+  `--error-samples 0` counts kinds without saving files), plus a printed
+  summary table with the knee.
 
 ## Conventions & gotchas
 
@@ -488,6 +524,18 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io --csv-prefix mi
   `intermediate_error_count` (0 = clean) + `intermediate_errors` (`poll HTTP 502
   x3; merge HTTP 500`), and `on_test_stop` prints a roll-up separate from the
   FAILED QUERIES block precisely because most queries carrying them succeeded.
+- **Error samples are the bridge from a status code to a cause.** A stage row
+  says 12% failed; Locust's table says they were 502s; neither says what the
+  502 *said*. `error_samples.py` keeps a few full examples per error kind per
+  stage under `<prefix>_errors/` — the request, the response body/headers or
+  the client exception — written the moment they happen. Adding a new failure
+  path to the engine means adding a `_sample(...)` call beside its
+  `COLLECTOR.record` (terminal) or `issues.add` (intermediate), with a kind
+  slug that names the mode, not the query: kinds are what the post-mortem
+  groups by. Sampling never touches the measurement: every `_sample` call is
+  wrapped, a full bucket only bumps the counter, and a failed write gives the
+  slot back. The directory is wiped at `test_start` like the CSVs are
+  overwritten, so don't point two concurrent runs at one prefix.
 - **The per-query debug log is the bridge from a number to a query.** The
   aggregates say 3% failed; `<prefix>_ars_queries.csv` says which pks, with the
   HTTP status of each step and a `message_url` to pull one up. One row per logical

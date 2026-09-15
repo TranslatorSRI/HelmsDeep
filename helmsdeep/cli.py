@@ -108,6 +108,16 @@ def _parse_args(argv=None):
         help="Prefix for output files (<prefix>_stages.csv, etc.). "
              "Falls back to the LOCUST_CSV_PREFIX env var, then 'trapi_run'.",
     )
+    parser.add_argument(
+        "--error-samples",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"Save up to N full examples (request + response body, or the "
+             f"client exception) of each distinct error kind, per stage, under "
+             f"<prefix>_errors/ so a failure can be examined after the run. "
+             f"Default {config.ERROR_SAMPLES_PER_KIND}; 0 only counts them.",
+    )
     return parser.parse_args(argv)
 
 
@@ -209,6 +219,11 @@ def main(argv=None):
     # reads every other knob -- through the environment.
     if args.no_live:
         env["HELMSDEEP_LIVE"] = "0"
+    if args.error_samples is not None:
+        if args.error_samples < 0:
+            print("--error-samples must be 0 or more", file=sys.stderr)
+            return 2
+        env["HELMSDEEP_ERROR_SAMPLES"] = str(args.error_samples)
 
     cmd = [
         sys.executable, "-m", "locust",
@@ -238,6 +253,10 @@ def main(argv=None):
     _print_plan(plan, natural_s, budget_s, scale)
     print(paint(f"           ·  reports: {prefix}_summary.json, "
                 f"{prefix}_stages.csv, {html_report}", "grey"))
+    if args.error_samples != 0:
+        print(paint(f"           ·  error samples: {prefix}_errors/ "
+                    f"(request + response of each failure kind, per stage)",
+                    "grey"))
     print()
     return subprocess.run(cmd, env=env).returncode
 
