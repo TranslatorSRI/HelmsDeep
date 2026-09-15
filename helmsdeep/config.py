@@ -105,6 +105,7 @@ TARGETS = {
         # drains into the stage that launched it rather than contaminating the
         # next one. (Cheap lookups didn't bleed; Retriever does.)
         "cooldown_s": 60,
+        "request_timeout_s": 300,
     },
     "aras": {
         "label": "Shepherd",
@@ -124,7 +125,7 @@ TARGETS = {
         ],
         "p99_slo_ms": 300000,
         "cooldown_s": 120,                 # drain slow queries between stages
-        "request_timeout_s": 300,
+        "request_timeout_s": 400,
     },
     "ars": {
         "label": "ARS",
@@ -142,9 +143,9 @@ TARGETS = {
         "zero_result_is_failure": False,
         # Runs take minutes -- very low concurrency, long holds.
         "stages": [
-            (2,  1, 300),  # 5 mins
-            (5,  1, 300),  # 5 mins
-            (10, 2, 330),  # 5.5 mins
+            # (2,  1, 300),  # 5 mins
+            # (5,  1, 300),  # 5 mins
+            # (10, 2, 330),  # 5.5 mins
             (30, 2, 360),  # 6 mins
             (45, 5, 420),  # 7 mins
             (60, 5, 600),  # 10 mins
@@ -172,6 +173,7 @@ TARGETS = {
         ],
         "p99_slo_ms": 300000,             # 5-min knee target (vs 2 min for aras)
         "cooldown_s": 60,                 # drain slow queries between stages
+        "request_timeout_s": 400,
     },
     # Mixed profile (ARA + ARS): 2/3 inferred MVP1+MVP2, 1/3 Pathfinder, run as
     # one blended workload. Unlike the other targets -- which characterize a
