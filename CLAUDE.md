@@ -168,6 +168,37 @@ Package `helmsdeep/`:
   replaces (Locust still prints its final tables at shutdown). `_print_plan()`
   shows the (possibly compressed) ramp and what was traded away before the run
   starts; `_duration()` parses `600`/`90s`/`10m`/`1h30m`.
+- **`profile_corpus.py`** — the `helmsdeep-profile` entry point: the per-CURIE
+  cost profiler, and the **only** part of the package that is not a load test.
+  It walks every entity the inferred corpus can pin — every MVP1 disease
+  (`HEAVY_DISEASES` + `LONG_TAIL_DISEASES`), every MVP2 gene and chemical, both
+  directions — sends each one's query once (`--repeat` for more) at low
+  concurrency, and records response time, `result_count`, and knowledge-graph
+  size per CURIE. It is the profiling pass "Calibrate the inferred tiers" needs.
+  Plain threaded `requests`, no Locust and no gevent (`time.sleep` is correct
+  here, unlike in the engine).
+  - `build_probes()` builds each query by calling `trapi_corpus`'s own builders
+    (`_inferred_treats`, `_affects`) with a **pinned** entity instead of a
+    sampled one, so a profiled query is byte-for-byte the query the load test
+    sends. There is no second copy of the corpus to drift.
+  - `Prober` dispatches on the target's `protocol`, reusing `config.TARGETS`
+    for endpoint/poll/timeout knobs: `_run_sync` (one POST) or `_run_ars`
+    (submit → poll → merge, mirroring `_run_ars` in the engine). `--target` is
+    restricted to `aras`/`ars` (`PROFILABLE_TARGETS`) — Pathfinder pins two
+    endpoints and asks a different question.
+  - A 0-result `Done` is a **measurement, not a failure**, here: an empty answer
+    set is exactly what puts a CURIE in the light bin. (The opposite of the
+    engine's `zero_result_is_failure` policy, which is about the knee.)
+  - Long runs survive: every row is flushed to `<prefix>_probe.csv` as it lands,
+    `--resume` skips entities already measured successfully (retrying failures),
+    and Ctrl-C stops scheduling and still writes the roll-up.
+  - `entity_summary()` collapses probes to one row per (qtype, CURIE);
+    `assign_bins()` splits each qtype's entities into light/medium/heavy at
+    `--bin-cuts` quantiles of `--bin-metric` (within a qtype, so diseases rank
+    against diseases). An entity with no successful probe stays `unmeasured` and
+    is reported rather than binned on missing data. Outputs
+    `<prefix>_entities.csv` + `<prefix>_bins.json`; `--summarize-only` re-bins an
+    existing probe CSV without sending a single query.
 - **`console.py`** — the live terminal display. Purely cosmetic and strictly
   read-only: every number comes from the run's `StageCollector` and its
   `_stage_stats`, so the screen can't drift from `stages.csv`, and an exception
@@ -321,7 +352,8 @@ batch, predicate). For ARA/ARS creative queries, the dominant cost driver is the
 
 ## Status & what's left
 
-Implemented: component awareness, the `helmsdeep` CLI + entry point,
+Implemented: component awareness, the `helmsdeep` CLI + entry point, the
+`helmsdeep-profile` per-CURIE corpus profiler,
 per-target stages/SLO, segmented corpuses, scalar `parameters.tier` per KP query,
 the ARS async submit/poll/merge user, ARS health metrics + red flags, the
 tiered inferred disease mix, and the mixed capacity profile (2:1
@@ -329,9 +361,13 @@ inferred/Pathfinder blend + pass/fail acceptance checkpoints, ARA and ARS).
 
 Remaining refinements (not yet done — don't assume these exist):
 
-- **Medium vs light tiers aren't calibrated.** `inferred_medium` and
-  `inferred_light` currently draw from the same `LONG_TAIL_DISEASES` pool; split
-  it by measured answer-set size (a one-time profiling pass) for true separation.
+- **Medium vs light tiers aren't calibrated.** `mvp1_medium` and `mvp1_light`
+  still draw from the same `LONG_TAIL_DISEASES` pool, so they differ in weight
+  but not in cost. The measuring tool now exists — `helmsdeep-profile`
+  (`profile_corpus.py`) reports result count and latency per CURIE and emits
+  suggested light/medium/heavy pools — but **the pass has not been run against a
+  real service and `trapi_corpus.py` still ships the single shared pool.** Run it,
+  then replace the pool with the measured lists.
 - **No per-ARA child-result breakdown.** ARS health treats the merged message as
   a whole; the `trace=y` response exposes children, so per-agent health is possible.
 - **No full multi-endpoint registry.** Retriever is a single service today; the
@@ -381,6 +417,17 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io --csv-prefix mi
 - The `LoadTestShape` (`StepLoad`) **drives users, spawn rate, and duration**, so
   there is no `-u` / `-r` / `-t`. Tune the ramp via the per-target `stages` in
   `config.py`.
+Profiling the corpus (not a load test — one query per CURIE, low concurrency):
+
+```bash
+# Every MVP1 disease + every MVP2 gene/chemical, via the ARA.
+helmsdeep-profile --host https://your-ara.example.org --out mvp_profile
+helmsdeep-profile --host https://your-ara.example.org --out mvp_profile --resume
+# Re-bin from data already on disk; sends nothing.
+helmsdeep-profile --summarize-only mvp_profile_probe.csv --out mvp_profile \
+    --bin-cuts 0.25,0.75
+```
+
 - `--csv-prefix` is optional; it falls back to the `LOCUST_CSV_PREFIX` env var,
   then to `trapi_run`.
 - You can also run the locustfile directly (`locust -f helmsdeep/
@@ -537,8 +584,11 @@ submit→poll→merge user, per-target config, and a README for human onboarding
 
 Remaining, ordered so a future session can pick up where this leaves off:
 
-a. **Calibrate the inferred tiers.** Profile each disease once (sort by merged
-   result count) and split `LONG_TAIL_DISEASES` into real medium/light pools.
+a. **Calibrate the inferred tiers.** The profiler is written
+   (`helmsdeep-profile`); what remains is to *run* it against a real ARA, read
+   `<prefix>_bins.json`, and replace the single `LONG_TAIL_DISEASES` pool in
+   `trapi_corpus.py` with the measured light/medium/heavy lists so `mvp1_light`
+   and `mvp1_medium` stop sampling the same diseases.
 b. **Per-ARA health breakdown** for ARS, parsing the `trace=y` children so a
    red flag can name *which* downstream agent dropped answers.
 c. **Restore the full endpoint registry as config** (per-KP/ARA URLs +

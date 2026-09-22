@@ -65,6 +65,9 @@ DISEASE_BATCH = [T2D, ALZHEIMERS, PARKINSONS, ASTHMA, HUNTINGTON, SKIN_VASCULAR_
 # stands in for medium/light traffic. Tiering by *measured* answer-set size
 # isn't possible offline -- medium and light currently draw from the same
 # long-tail pool; split it once you have per-disease degree/result-size data.
+# `helmsdeep-profile` (profile_corpus.py) measures exactly that: it sends each
+# disease's MVP1 query once and writes a suggested light/medium/heavy split to
+# <prefix>_bins.json, ready to paste in here.
 # The heavy/medium/light WEIGHTS (in SHEPHERD_CORPUS) and the per-tier qtype
 # labels are already in place, so that refinement is a data change, not a code
 # change.

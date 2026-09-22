@@ -22,7 +22,8 @@ and the asynchronous **ARS**.
 ## Install
 
 ```bash
-pip install -e .          # Python >= 3.11; installs locust
+pip install -e .          # Python >= 3.11; installs locust + requests
+                          # entry points: helmsdeep, helmsdeep-profile
 ```
 
 3.11 rather than 3.12 because HelmsDeep is also installed as a dependency of the
@@ -669,6 +670,96 @@ quick visual feel and for sharing a screenshot.
   instead of latencies.
 - **Adjust corpus weights** in `RETRIEVER_CORPUS` / `SHEPHERD_CORPUS` to match
   your traffic mix.
+- **The MVP1 tiers are not yet calibrated.** `mvp1_medium` and `mvp1_light` draw
+  from the same long-tail pool, so they differ in weight but not in cost. Measure
+  the pools with [`helmsdeep-profile`](#profiling-the-corpus-helmsdeep-profile)
+  and split them on the result counts it reports.
+
+## Profiling the corpus (`helmsdeep-profile`)
+
+`helmsdeep-profile` is the companion to the load test, and the opposite kind of
+run. The load test sends *randomly sampled* queries from many concurrent users
+and asks how far the service scales. The profiler sends **every MVP1 and MVP2
+query exactly once**, at low concurrency, and asks what each individual query
+*costs*:
+
+- **response time** (wall clock, end to end)
+- **result count** — the answer-set size that dominates inferred-query cost
+- **knowledge-graph size** (nodes/edges), which keeps discriminating when a
+  service caps `results` and the top of the range flattens out
+
+…all broken out **per CURIE**. That is the data the corpus is missing: today
+`mvp1_medium` and `mvp1_light` sample the *same* `LONG_TAIL_DISEASES` pool
+because no per-disease size measurements existed, so the "tiers" aren't really
+tiered. This tool produces them.
+
+```bash
+# Profile every MVP1 disease (~1000) + every MVP2 gene/chemical via the ARA.
+helmsdeep-profile --host https://your-ara.example.org --out mvp_profile
+
+# Pilot first: 50 random entities per query type, repeatable sample.
+helmsdeep-profile --host https://your-ara.example.org --out pilot \
+    --sample 50 --seed 1
+
+# Long run interrupted or the service blipped? Pick up where it stopped —
+# entities already measured successfully are skipped, failures are retried.
+helmsdeep-profile --host https://your-ara.example.org --out mvp_profile --resume
+
+# Spot-check the same entities through the ARS (async submit/poll/merge).
+# Minutes per query, so keep the set small.
+helmsdeep-profile --host https://ars.ci.transltr.io --target ars \
+    --out ars_spot --sample 20
+
+# Re-bin from data already on disk — no queries sent, so try as many cuts as
+# you like.
+helmsdeep-profile --summarize-only mvp_profile_probe.csv --out mvp_profile \
+    --bin-cuts 0.25,0.75
+```
+
+The queries are built by calling `trapi_corpus`'s own builders with a pinned
+entity instead of a sampled one, so a profiled query is byte-for-byte the query
+the load test sends — same envelope, same qualifiers, same `bypass_cache`.
+`--dry-run` prints the plan and a sample payload per query type without sending
+anything.
+
+**This is not a load test.** Keep `--concurrency` low (default 4). At high
+concurrency you measure queueing, not answer-set size, and you are loading a
+shared service for no measurement benefit — the same layering rule applies
+(one layer per run; a profiling pass against the ARS also loads every ARA and
+Retriever beneath it).
+
+### Outputs
+
+| File | What's in it |
+|---|---|
+| `<prefix>_probe.csv` | One row per query sent: qtype, entity, current pool, MVP2 direction variant, rep, ok, status, HTTP code, `latency_s`, `result_count`, `kg_nodes`, `kg_edges`, response bytes, ARS `pk`, error. Flushed per row, so a killed run keeps everything it measured. |
+| `<prefix>_entities.csv` | One row per CURIE: median/min/max result count and latency across reps, median graph size, and its `suggested_bin`. Sorted heaviest first. |
+| `<prefix>_bins.json` | The suggested re-binning, per query type: the threshold values and the light/medium/heavy CURIE lists, plus the entities that never answered (`unmeasured` — they are *not* silently binned). |
+
+### Re-binning the pools
+
+`<prefix>_bins.json` is meant to be read straight into `trapi_corpus.py`.
+`bins["mvp1_treats"]["pools"]` gives three disease lists split at the quantile
+cuts; replace the single `LONG_TAIL_DISEASES` pool that `mvp1_medium` and
+`mvp1_light` share with the measured `light` / `medium` / `heavy` lists so the
+three MVP1 qtypes finally mean three different cost profiles.
+
+Two knobs decide the split, and both re-run for free against an existing probe
+CSV via `--summarize-only`:
+
+- `--bin-cuts LO,HI` (default `0.33,0.67`) — the quantile boundaries. Cuts are
+  applied **within** a query type, so diseases are ranked against diseases and
+  genes against genes.
+- `--bin-metric` (default `result_count_median`) — bin on
+  `kg_edges_median`/`kg_nodes_median` instead when the service caps results, or
+  on `latency_s_median` to tier by observed cost rather than answer size.
+
+Use `--repeat N` when a single measurement per CURIE is too noisy to trust; the
+roll-up takes the median across reps.
+
+A CURIE that never answered (all probes failed) is reported as `unmeasured`
+rather than being binned on missing data. Re-run with `--resume` to retry just
+those.
 
 ## Running the engine directly
 

@@ -22,10 +22,15 @@ setup(
     python_requires=">=3.11",
     install_requires=[
         "locust>=2.38.1",
+        # Used directly by the corpus profiler (helmsdeep-profile), which is a
+        # plain threaded HTTP walk, not a Locust run. Already a locust
+        # dependency; named here because this package imports it itself.
+        "requests>=2.31.0",
     ],
     entry_points={
         "console_scripts": [
             "helmsdeep=helmsdeep.cli:main",
+            "helmsdeep-profile=helmsdeep.profile_corpus:main",
         ],
     },
 )
