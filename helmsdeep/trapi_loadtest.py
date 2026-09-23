@@ -217,18 +217,26 @@ class StageCollector:
         """Append one ARS per-query debug row (pk + status codes + outcome)."""
         self.queries.append(row)
 
-    def mark_stage(self, idx):
+    def mark_stage(self, idx, when=None):
+        # `when` is the wall-clock instant of the ramp boundary this stage starts
+        # at (see StepLoad._boundary_time), so a stage's window is the one its
+        # config describes rather than the one Locust's ~1s tick poll noticed.
+        when = time.time() if when is None else when
         if idx != self.stage_idx:
             # setdefault (not =) so a cooldown that already froze this stage's end
             # time isn't overwritten when the next stage begins.
-            self.stage_ended.setdefault(self.stage_idx, time.time())
+            self.stage_ended.setdefault(self.stage_idx, when)
         self.stage_idx = idx
-        self.stage_started.setdefault(idx, time.time())
+        self.stage_started.setdefault(idx, when)
 
-    def end_active_stage(self):
-        # Called at cooldown start: freeze the just-finished stage's end time so
-        # its duration reflects the active-load window, not the drain period.
-        self.stage_ended.setdefault(self.stage_idx, time.time())
+    def end_active_stage(self, when=None):
+        # Called when a stage's load window closes -- at a cooldown gap, and at
+        # the end of the final stage's hold -- to freeze that stage's end time so
+        # its duration reflects the active-load window, not the drain that
+        # follows it. `when` back-dates the freeze to the exact ramp boundary
+        # (see StepLoad._boundary_time); it defaults to now.
+        self.stage_ended.setdefault(
+            self.stage_idx, time.time() if when is None else when)
 
     def record(self, qtype, latency_ms, failed, *,
                status=None, result_count=None, response_bytes=None):
@@ -858,13 +866,34 @@ class StepLoad(LoadTestShape):
         run_time = self.get_run_time()
         return any(start <= run_time < end for start, end, _ in self._cooldowns)
 
+    @staticmethod
+    def _boundary_time(run_time, boundary_s):
+        """Wall-clock instant of a ramp boundary we have just crossed.
+
+        Locust polls tick() about once a second, so it learns a boundary passed
+        up to a second late. Backing the freeze off by the overshoot keeps a
+        stage's duration_s the length its config says it is.
+        """
+        return time.time() - max(run_time - boundary_s, 0.0)
+
     def tick(self):
         run_time = self.get_run_time()
         if run_time > self._total:
+            # Ramp over. Freeze the final stage HERE, at the end of its hold --
+            # not at test stop, which lands on the far side of Locust's
+            # stop_timeout drain. tick() returning None starts no new queries,
+            # so letting that drain into duration_s divides the stage's requests
+            # by a window padded with dead air: a 600s hold trailed by a ~190s
+            # drain reported its RPS -- and with it its Little's-Law
+            # concurrency -- about 24% low, enough to move the knee off the top
+            # of the ramp onto a stage the service had already beaten.
+            COLLECTOR.end_active_stage(
+                when=self._boundary_time(run_time, self._total))
             return None
         for start, end, idx in self._bounds:
             if start <= run_time < end:
-                COLLECTOR.mark_stage(idx)
+                COLLECTOR.mark_stage(
+                    idx, when=self._boundary_time(run_time, start))
                 users, rate, _hold = STAGES[idx]
                 return (users, rate)
         # In a cooldown gap: ramp users to 0 so slow in-flight queries drain into
@@ -882,7 +911,8 @@ class StepLoad(LoadTestShape):
         # under Locust and restart the teardown mid-drain.
         for start, end, prev_idx in self._cooldowns:
             if start <= run_time < end:
-                COLLECTOR.end_active_stage()
+                COLLECTOR.end_active_stage(
+                    when=self._boundary_time(run_time, start))
                 return (0, max(1, STAGES[prev_idx][0]))
         return None
 
@@ -896,6 +926,9 @@ def on_test_stop(environment, **_kw):
     if isinstance(environment.runner, WorkerRunner):
         return
 
+    # Fallback only: on a normal run StepLoad.tick() already froze the final
+    # stage at the end of its hold. This catches a run that stopped before the
+    # ramp finished (Ctrl-C, a runner abort), where no boundary was crossed.
     COLLECTOR.stage_ended.setdefault(COLLECTOR.stage_idx, time.time())
 
     # Close out the live display: the final stage gets the same verdict line the

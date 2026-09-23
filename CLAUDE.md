@@ -206,7 +206,13 @@ Package `helmsdeep/`:
   - `StepLoad(LoadTestShape)` — drives the `stages` ramp and marks the active stage.
     When `COOLDOWN_S` is set it inserts a drain gap between stages (`tick()`
     returns 0 users in the gap and calls `COLLECTOR.end_active_stage()` to freeze
-    the just-finished stage's end time); an `@events.init` listener sets
+    the just-finished stage's end time); the tick that ends the ramp freezes the
+    **final** stage the same way, before returning `None`, so its `duration_s` is
+    its hold and not its hold plus Locust's shutdown drain. Every boundary the
+    shape reports is back-dated through `_boundary_time()` — `tick()` is polled
+    about once a second, so it learns a boundary passed up to a second late, and
+    a stage's recorded window is the one `stages` configures rather than the one
+    the poll noticed. An `@events.init` listener sets
     `stop_timeout = REQUEST_TIMEOUT` so a slow in-flight query finishes rather than
     being killed when users ramp to 0. The gap's spawn rate is the just-finished
     stage's **user count**, so Locust's dispatcher stops every user in one
@@ -223,9 +229,11 @@ Package `helmsdeep/`:
     stage active when it *finished* (per-stage, per-`qtype`). Also holds the two
     per-query ARS lists (`queries`, `completions`) and hands out the shared
     `new_query_id()` that joins them. Records each stage's
-    wall-clock `stage_started` / `stage_ended` (the latter is `setdefault`, so a
-    cooldown freeze isn't overwritten by the next `mark_stage`). `record()` also
-    takes optional ARS signals: `status`, `result_count`, `response_bytes`.
+    wall-clock `stage_started` / `stage_ended` (both `setdefault`, so a cooldown
+    freeze isn't overwritten by the next `mark_stage`; both take an optional
+    `when` the shape uses to back-date them to the exact ramp boundary).
+    `record()` also takes optional ARS signals: `status`, `result_count`,
+    `response_bytes`.
     `begin_inflight()`/`end_inflight()` track logical queries currently running,
     for the live display only -- no report reads them.
   - `_stage_stats()` — per-stage RPS, percentiles, error rate, Little's-Law
@@ -410,6 +418,17 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io --csv-prefix mi
   inferred/Pathfinder blend checked at 30 (peak) / 45 (headroom) / 60 (overload,
   error-rate only). Checkpoints are generic, not special-cased to that profile --
   a target without them behaves exactly as before.
+- **A stage's `duration_s` is its load window, never its drain.** Every stage's
+  end is frozen when its *load* stops: at the cooldown gap for stages that have
+  one, and — for the last stage, which has no gap after it — on the tick that
+  ends the ramp, before Locust's `stop_timeout` shutdown drain. Nothing starts a
+  new query in either drain, so counting it would divide the stage's requests by
+  a window padded with dead air. It is not a rounding error: a 600 s hold trailed
+  by a ~190 s drain reported its RPS, and with it its Little's-Law concurrency,
+  ~24 % low — enough to move the knee off the top of the ramp onto a stage the
+  service had already beaten. Requests are still bucketed by the stage active
+  when they *finished*, so a query that drains after the freeze still counts in
+  the stage that launched it; only the denominator changed.
 - **Cooldown drains, it doesn't bleed.** With `cooldown_s` set, the gap between
   stages ramps users to 0; the just-finished stage's end time is frozen so its
   `duration_s`/RPS reflect the active window, and a slow query still running
