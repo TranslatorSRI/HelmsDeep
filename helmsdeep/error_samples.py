@@ -14,6 +14,11 @@ Layout, under ``<prefix>_errors/``::
     index.json                       every saved sample + a tally of every kind
     <kind>/<NN>_stage<S>_<qtype>.json   one sample
 
+Saving is **opt-in** (``helmsdeep --save-errors [N]``): a disabled sampler only
+counts occurrences per kind and stage for the summary -- it writes nothing,
+deletes nothing, and never decodes a response body -- so a run on a box with
+little disk or RAM pays nothing for it.
+
 A *kind* is a short slug naming the failure mode -- ``http_502``, ``timeout``,
 ``connection_error`` for the sync layers; ``ars_submit_http_500``,
 ``ars_error``, ``ars_timeout``, ``ars_done_zero_results`` and the intermediate
@@ -169,8 +174,9 @@ class ErrorSampler:
     # -- lifecycle -----------------------------------------------------------
     def reset(self):
         """Start clean: drop the directory left by a previous run with this
-        prefix (the CSVs are overwritten the same way) and forget the tallies."""
-        if os.path.isdir(self.root):
+        prefix (the CSVs are overwritten the same way) and forget the tallies.
+        A disabled sampler never touches the filesystem, not even to delete."""
+        if self.enabled and os.path.isdir(self.root):
             shutil.rmtree(self.root, ignore_errors=True)
         self._occurrences.clear()
         self._saved.clear()

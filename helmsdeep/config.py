@@ -76,10 +76,12 @@ MAX_ERROR_RATE = 0.01   # 1%
 
 # Error samples (error_samples.py): full request/response examples of every
 # distinct error kind, saved under <prefix>_errors/ as they happen so a run can
-# be picked apart afterwards. The cap is per kind, PER STAGE (the same 502 at 5
-# users and at 60 usually has a different body behind it); every occurrence is
-# still counted. The CLI's --error-samples (HELMSDEEP_ERROR_SAMPLES) overrides
-# the cap; 0 disables saving. Bodies are truncated to ERROR_SAMPLE_BODY_BYTES.
+# be picked apart afterwards. OFF by default -- a run on a box with little disk
+# or RAM must not accumulate response bodies -- and switched on per run with the
+# CLI's --save-errors [N] (HELMSDEEP_ERROR_SAMPLES=N); error kinds are counted
+# for the summary either way. ERROR_SAMPLES_PER_KIND is the cap when N is
+# omitted: per kind, PER STAGE (the same 502 at 5 users and at 60 usually has a
+# different body behind it). Bodies are truncated to ERROR_SAMPLE_BODY_BYTES.
 ERROR_SAMPLES_PER_KIND = 3
 ERROR_SAMPLE_BODY_BYTES = 64 * 1024
 

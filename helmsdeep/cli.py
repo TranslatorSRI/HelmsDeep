@@ -109,14 +109,18 @@ def _parse_args(argv=None):
              "Falls back to the LOCUST_CSV_PREFIX env var, then 'trapi_run'.",
     )
     parser.add_argument(
-        "--error-samples",
+        "--save-errors",
         type=int,
-        default=None,
+        nargs="?",
+        const=config.ERROR_SAMPLES_PER_KIND,
+        default=0,
         metavar="N",
-        help=f"Save up to N full examples (request + response body, or the "
-             f"client exception) of each distinct error kind, per stage, under "
-             f"<prefix>_errors/ so a failure can be examined after the run. "
-             f"Default {config.ERROR_SAMPLES_PER_KIND}; 0 only counts them.",
+        help=f"Save full examples (request + response body, or the client "
+             f"exception) of each distinct error kind under <prefix>_errors/ "
+             f"so a failure can be examined after the run: up to N per kind "
+             f"per stage (default {config.ERROR_SAMPLES_PER_KIND} when N is "
+             f"omitted). Off unless given -- error kinds are still counted in "
+             f"the summary, but nothing is written to disk.",
     )
     return parser.parse_args(argv)
 
@@ -219,11 +223,14 @@ def main(argv=None):
     # reads every other knob -- through the environment.
     if args.no_live:
         env["HELMSDEEP_LIVE"] = "0"
-    if args.error_samples is not None:
-        if args.error_samples < 0:
-            print("--error-samples must be 0 or more", file=sys.stderr)
-            return 2
-        env["HELMSDEEP_ERROR_SAMPLES"] = str(args.error_samples)
+    # Error-sample saving is opt-in: the locustfile reads the per-kind cap from
+    # this env var and treats absent/0 as "count kinds, write nothing" -- so a
+    # run on a box with little disk or RAM never accumulates response bodies.
+    if args.save_errors < 0:
+        print("--save-errors must be 0 or more", file=sys.stderr)
+        return 2
+    if args.save_errors:
+        env["HELMSDEEP_ERROR_SAMPLES"] = str(args.save_errors)
 
     cmd = [
         sys.executable, "-m", "locust",
@@ -253,9 +260,9 @@ def main(argv=None):
     _print_plan(plan, natural_s, budget_s, scale)
     print(paint(f"           ·  reports: {prefix}_summary.json, "
                 f"{prefix}_stages.csv, {html_report}", "grey"))
-    if args.error_samples != 0:
+    if args.save_errors:
         print(paint(f"           ·  error samples: {prefix}_errors/ "
-                    f"(request + response of each failure kind, per stage)",
+                    f"(up to {args.save_errors} per failure kind per stage)",
                     "grey"))
     print()
     return subprocess.run(cmd, env=env).returncode

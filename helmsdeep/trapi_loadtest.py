@@ -138,11 +138,11 @@ CSV_PREFIX = os.environ.get("LOCUST_CSV_PREFIX", "trapi_run")
 # headers, body) or the client-side exception, and the stage it happened in --
 # saved to <prefix>_errors/ the moment they happen (see error_samples.py). The
 # per-stage tables say a request failed with a 502; the sample says what the 502
-# said. Capped per kind PER STAGE; HELMSDEEP_ERROR_SAMPLES (the CLI's
-# --error-samples) overrides the cap, 0 disables saving (occurrences are still
-# tallied for the summary).
-ERROR_SAMPLES_PER_KIND = int(
-    os.environ.get("HELMSDEEP_ERROR_SAMPLES", config.ERROR_SAMPLES_PER_KIND))
+# said. OPT-IN: HELMSDEEP_ERROR_SAMPLES (the CLI's --save-errors [N]) is the
+# per-kind, per-stage cap; absent or 0 means nothing is written and no response
+# body is decoded or kept -- only the count of each kind, for the summary -- so
+# a run on a box with little disk or RAM stays lean.
+ERROR_SAMPLES_PER_KIND = int(os.environ.get("HELMSDEEP_ERROR_SAMPLES", 0))
 SAMPLER = error_samples.ErrorSampler(
     f"{CSV_PREFIX}_errors",
     per_kind_per_stage=ERROR_SAMPLES_PER_KIND,
@@ -821,8 +821,10 @@ class TRAPIUser(HttpUser):
                                       merge_http=merge_http,
                                       scored_as_failure=failed,
                                       intermediate_errors=issues.summary()),
-                           "last_poll": error_samples.describe_response(
-                               last_poll, SAMPLER.body_limit)})
+                           # Decoded only when a file might be written.
+                           "last_poll": (error_samples.describe_response(
+                               last_poll, SAMPLER.body_limit)
+                               if SAMPLER.enabled else None)})
             self._record_query(query_id, qtype, pk, start, "Done",
                                # `failed` follows the policy, so the debug log
                                # agrees with how the query was actually scored;
@@ -901,8 +903,9 @@ class TRAPIUser(HttpUser):
                     intermediate=True,
                     latency_ms=elapsed_ms() if elapsed_ms else None,
                     extra={**(ctx("merge", merged_pk=merged_pk) if ctx else {}),
-                           "last_poll": error_samples.describe_response(
-                               last_poll, SAMPLER.body_limit)})
+                           "last_poll": (error_samples.describe_response(
+                               last_poll, SAMPLER.body_limit)
+                               if SAMPLER.enabled else None)})
 
         if not merged_pk:
             _note("ars_merge_missing", "Done without merged_version",
@@ -1372,7 +1375,7 @@ def on_test_stop(environment, **_kw):
             where = (f"examples in {SAMPLER.root}/, up to "
                      f"{SAMPLER.per_kind_per_stage} per kind per stage")
         else:
-            where = "saving disabled (--error-samples 0)"
+            where = "counted only; pass --save-errors to keep examples on disk"
         print(f"ERROR SAMPLES ({error_summary['total_occurrences']} error(s) "
               f"of {len(error_summary['kinds'])} kind(s); {where})")
         print(f"  {'kind':<26} {'count':>6} {'saved':>6}  stages")

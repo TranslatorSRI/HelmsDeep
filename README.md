@@ -85,9 +85,11 @@ helmsdeep --targets ars_mixed \
   ["Shorter runs"](#shorter-runs---time-budget----quick) below.
 - `--no-live` / `--verbose` control the terminal output — see
   ["Watching a run"](#watching-a-run) below.
-- `--error-samples N` caps how many full examples of each error kind (per
-  stage) are saved under `<prefix>_errors/` for the post-mortem; default 3, `0`
-  only counts them — see ["Error samples"](#error-samples-prefix_errors) below.
+- `--save-errors [N]` keeps full examples of each error kind (up to N per
+  stage, default 3) under `<prefix>_errors/` for the post-mortem. **Off unless
+  given** — a run on a box with little disk or RAM writes nothing, though error
+  kinds are still counted in the summary — see
+  ["Error samples"](#error-samples-prefix_errors) below.
 
 The load profile (users, spawn rate, duration) is driven by the `StepLoad` shape,
 **not** by CLI flags — so there is intentionally no `-u/-r/-t`. The ramp and knee
@@ -247,10 +249,10 @@ Written to the working directory by the standalone/master node:
 - `<prefix>_ars_completion.csv` — **ARS only**: one row per logical query with its
   end-to-end response time and whether it *eventually* finished — polled past the
   `max_poll_s` failure threshold up to `completion_max_poll_s` (see below)
-- `<prefix>_errors/` — **every target**: saved examples of each distinct error
-  kind — the request that was sent and the response (status, headers, body) or
-  client-side exception that came back — one JSON file each, plus an
-  `index.json` tallying every kind seen (see
+- `<prefix>_errors/` — **only with `--save-errors`**, any target: saved
+  examples of each distinct error kind — the request that was sent and the
+  response (status, headers, body) or client-side exception that came back —
+  one JSON file each, plus an `index.json` tallying every kind seen (see
   ["Error samples"](#error-samples-prefix_errors) below)
 - `<prefix>_report.html` — Locust's native, self-contained **HTML report**
   (latency-over-time charts, request/failure tables). Open it in any browser. See
@@ -303,12 +305,16 @@ Kinds are named after the failure mode:
 | `ars_done_zero_results` | a `Done` with an empty answer set — saved whichever way `zero_result_is_failure` scores it (`ars.scored_as_failure` says which). |
 | `ars_poll_http_<code>`, `ars_poll_bad_json`, `ars_merge_http_<code>`, `ars_merge_unparseable`, `ars_merge_missing` | **intermediate**: retried past, so the query still reached an outcome (`intermediate: true` in the file). |
 
-Samples are capped **per kind, per stage** (`--error-samples N`, default 3),
-not per kind overall: the same 502 at 5 users and at 60 usually has a different
-body behind it. Every occurrence is still **counted**, so the tally is complete
-even where the files are capped. That tally is printed at the end of the run,
-stored in `summary.json` under `error_samples` (per-kind and per-stage counts,
-plus the path of a first example), and repeated in `index.json`:
+Saving is **opt-in**: pass `--save-errors` (or `--save-errors N`) to keep
+examples. Without it a run writes nothing here, deletes nothing, and never
+decodes a failed response's body — the right setting for a box with limited
+disk or RAM — while still counting every error kind for the summary. Samples are
+capped **per kind, per stage** (N, default 3), not per kind overall: the same
+502 at 5 users and at 60 usually has a different body behind it. Every
+occurrence is still **counted**, so the tally is complete even where the files
+are capped. That tally is printed at the end of the run, stored in
+`summary.json` under `error_samples` (per-kind and per-stage counts, plus the
+path of a first example), and repeated in `index.json`:
 
 ```
 ERROR SAMPLES (143 error(s) of 3 kind(s); examples in run1_errors/, up to 3 per kind per stage)
@@ -322,7 +328,8 @@ ERROR SAMPLES (143 error(s) of 3 kind(s); examples in run1_errors/, up to 3 per 
 
 Files are written **the moment the error happens**, not at shutdown, so an
 aborted run still leaves its samples behind. The directory is wiped at the
-start of a run with the same prefix, the same way the CSVs are overwritten. For
+start of a run with the same prefix and `--save-errors`, the same way the CSVs
+are overwritten (a run without the flag leaves an old directory alone). For
 ARS runs the per-query debug log's `error_sample` column points at the sample
 of that query's terminal error, when one was kept. Request headers are
 deliberately not recorded; response headers are.

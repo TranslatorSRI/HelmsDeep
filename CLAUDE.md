@@ -159,8 +159,10 @@ Package `helmsdeep/`:
   `setup.py` `console_scripts`). Parses `--targets` (required, one layer),
   `--host` (required), `--csv-prefix`, the mutually exclusive
   `--time-budget DURATION` / `--quick` (= `--time-budget 10m`), the two
-  output flags `--no-live` (sets `HELMSDEEP_LIVE=0`) / `--verbose`, and
-  `--error-samples N` (sets `HELMSDEEP_ERROR_SAMPLES`; 0 = count only); rejects
+  output flags `--no-live` (sets `HELMSDEEP_LIVE=0`) / `--verbose`, and the
+  opt-in `--save-errors [N]` (`nargs="?"`, const = `config.ERROR_SAMPLES_PER_KIND`,
+  default 0; sets `HELMSDEEP_ERROR_SAMPLES=N` only when > 0 -- absent means
+  error kinds are counted but nothing is written to disk); rejects
   not-yet-`implemented` targets; sets `LOADTEST_TARGET` (+ `LOCUST_CSV_PREFIX`,
   + `HELMSDEEP_TIME_BUDGET_S` when a budget is given) and launches
   `python -m locust -f trapi_loadtest.py --headless --host …`. Unless
@@ -206,7 +208,10 @@ Package `helmsdeep/`:
   file *immediately* (an aborted run keeps its samples) and always counts the
   occurrence, so `kinds()`/`summary()` are complete even once a `(kind, stage)`
   bucket is full (cap is per kind **per stage** -- the same 502 at 5 and at 60
-  users has different bodies). `reset()` wipes the directory at `test_start`;
+  users has different bodies). **Opt-in**: with `per_kind_per_stage=0` (the
+  default, no `--save-errors`) `enabled` is False and the sampler only counts --
+  no file, no directory, no body decoding, and `reset()` doesn't delete either.
+  When enabled, `reset()` wipes the directory at `test_start`;
   `write_index()` writes `index.json` (tally + every saved sample) at stop.
   `http_kind(resp)` names a kind from a response (`http_502`; status 0 →
   `timeout`/`connection_error`/`exception_<Class>` from Locust's `resp.error`),
@@ -265,8 +270,10 @@ Package `helmsdeep/`:
     written on every terminal path including `SubmitError`/`NoPK`/`Timeout`.
     Every failure on either path also goes through the module-level `_sample()`
     → `SAMPLER` (an `error_samples.ErrorSampler` rooted at `<prefix>_errors`,
-    cap from `HELMSDEEP_ERROR_SAMPLES` else `config.ERROR_SAMPLES_PER_KIND`,
-    reset on `test_start` on every node): sync failures with the response and
+    cap from `HELMSDEEP_ERROR_SAMPLES`, default 0 = count only / write nothing,
+    reset on `test_start` on every node; the two `last_poll` descriptions are
+    guarded on `SAMPLER.enabled` so a disabled run never decodes a trace body):
+    sync failures with the response and
     the POSTed payload; ARS submit/poll/merge trouble as it happens (poll/merge
     ones `intermediate=True`), and the terminal `ars_error`/`ars_timeout`/
     `ars_done_zero_results` with the submitted query as the request and the
@@ -430,10 +437,10 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io --csv-prefix mi
   (+ `<prefix>_checkpoints.csv` for checkpointed targets) (+
   `<prefix>_ars_health.csv`, the `<prefix>_ars_queries.csv` per-query debug log,
   the `<prefix>_ars_completion.csv` sidecar, and a `red_flags` list +
-  `completion` roll-up for the `ars` target), a `<prefix>_errors/` directory
-  (one JSON file per saved error example, grouped by kind, plus `index.json`;
-  `--error-samples 0` counts kinds without saving files), plus a printed
-  summary table with the knee.
+  `completion` roll-up for the `ars` target), with `--save-errors [N]` only a
+  `<prefix>_errors/` directory (one JSON file per saved error example, grouped
+  by kind, plus `index.json`; without the flag error kinds are counted in the
+  summary but nothing is written), plus a printed summary table with the knee.
 
 ## Conventions & gotchas
 
@@ -528,7 +535,10 @@ helmsdeep --targets ars_mixed  --host https://ars.ci.transltr.io --csv-prefix mi
   says 12% failed; Locust's table says they were 502s; neither says what the
   502 *said*. `error_samples.py` keeps a few full examples per error kind per
   stage under `<prefix>_errors/` — the request, the response body/headers or
-  the client exception — written the moment they happen. Adding a new failure
+  the client exception — written the moment they happen, but **only when the
+  run passes `--save-errors`**: the default is count-only, so a run on a box
+  with little disk or RAM never accumulates response bodies, and the
+  printed/JSON tally of kinds is the same either way. Adding a new failure
   path to the engine means adding a `_sample(...)` call beside its
   `COLLECTOR.record` (terminal) or `issues.add` (intermediate), with a kind
   slug that names the mode, not the query: kinds are what the post-mortem
