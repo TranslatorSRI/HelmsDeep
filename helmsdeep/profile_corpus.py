@@ -92,6 +92,12 @@ ENTITY_FIELDS = [
 DEFAULT_CUTS = (0.33, 0.67)
 BIN_NAMES = ("light", "medium", "heavy")
 
+# An entity whose query answers with fewer than this many results is recorded
+# like any other, but marked unusable for load: it costs the service almost
+# nothing, teaches the ramp nothing, and on a target with
+# zero_result_is_failure it would score as a failure every time it was sampled.
+MIN_USABLE_RESULTS = 1
+
 USER_AGENT = "helmsdeep-profile/0.1 (+https://github.com/TranslatorSRI/StressTester)"
 
 
@@ -448,6 +454,36 @@ def _median(values):
     return statistics.median(values) if values else None
 
 
+def is_entity_csv(path):
+    """True if `path` is an ``<prefix>_entities.csv`` roll-up, not probe rows.
+
+    The roll-up is what you have when someone hands you the result of a profile
+    run they did (or when the probe CSV is long gone), and it is all the binning
+    needs -- so --summarize-only accepts either.
+    """
+    with open(path, newline="") as fh:
+        header = (csv.reader(fh).__next__() if os.path.getsize(path) else [])
+    return "result_count_median" in header
+
+
+def summary_from_entity_csv(rows):
+    """Read an ``<prefix>_entities.csv`` back as a roll-up, ready to re-bin."""
+    out = []
+    for row in rows:
+        rec = {key: row.get(key, "") for key in ("qtype", "mvp", "entity", "pool")}
+        rec["n"] = int(_num(row.get("n")) or 0)
+        rec["n_ok"] = int(_num(row.get("n_ok")) or 0)
+        for field in ("result_count_median", "result_count_min",
+                      "result_count_max", "latency_s_median", "latency_s_min",
+                      "latency_s_max", "kg_nodes_median", "kg_edges_median"):
+            rec[field] = _num(row.get(field))
+        rec["suggested_bin"] = "unmeasured"      # re-derived by assign_bins
+        out.append(rec)
+    out.sort(key=lambda r: (r["qtype"], -(r["result_count_median"] or -1),
+                            r["entity"]))
+    return out
+
+
 def entity_summary(rows):
     """Collapse probe rows to one record per (qtype, entity)."""
     grouped = {}
@@ -536,8 +572,49 @@ def assign_bins(summary, metric="result_count_median", cuts=DEFAULT_CUTS):
     return bins
 
 
+def baselines(summary, bins, meta):
+    """Build the artifact ``trapi_corpus`` loads: per-CURIE bin + expected results.
+
+    This is the profile in the form the rest of HelmsDeep consumes. It does two
+    jobs that used to be impossible:
+
+      - it *is* the tiered entity pools (``bin`` per CURIE), replacing the single
+        long-tail pool ``mvp1_medium`` and ``mvp1_light`` used to share, and
+      - it is the baseline a run checks its result counts against (``results``),
+        so "this query came back with a third of its answers" is detectable.
+
+    An entity with no successful probe, or one that answered with fewer than
+    ``MIN_USABLE_RESULTS``, is kept with ``usable: false``: it stays on the
+    record (that *is* the measurement) but the corpus will not sample it.
+    """
+    entities = {}
+    for rec in summary:
+        results = rec.get("result_count_median")
+        measured = results is not None and rec.get("n_ok", 0) > 0
+        entities.setdefault(rec["qtype"], {})[rec["entity"]] = {
+            "bin": rec.get("suggested_bin", "unmeasured"),
+            "usable": bool(measured and results >= MIN_USABLE_RESULTS),
+            "results": (None if not measured else int(round(results))),
+            "results_min": (None if rec.get("result_count_min") is None
+                            else int(round(rec["result_count_min"]))),
+            "results_max": (None if rec.get("result_count_max") is None
+                            else int(round(rec["result_count_max"]))),
+            "latency_s": (None if rec.get("latency_s_median") is None
+                          else round(rec["latency_s_median"], 1)),
+            "n_ok": rec.get("n_ok", 0),
+        }
+    thresholds = {qtype: (info.get("thresholds") or {})
+                  for qtype, info in bins.items()}
+    return {
+        **meta,
+        "min_usable_results": MIN_USABLE_RESULTS,
+        "thresholds": thresholds,
+        "entities": entities,
+    }
+
+
 def write_summary(prefix, summary, bins, meta):
-    """Write ``<prefix>_entities.csv`` and ``<prefix>_bins.json``."""
+    """Write ``<prefix>_entities.csv``, ``<prefix>_bins.json``, ``<prefix>_baselines.json``."""
     entities_path = f"{prefix}_entities.csv"
     with open(entities_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=ENTITY_FIELDS)
@@ -553,7 +630,14 @@ def write_summary(prefix, summary, bins, meta):
     bins_path = f"{prefix}_bins.json"
     with open(bins_path, "w") as fh:
         json.dump({**meta, "bins": bins}, fh, indent=2)
-    return entities_path, bins_path
+
+    # The one output the package itself reads. Copy it over
+    # helmsdeep/mvp_baselines.json to adopt this profile as the corpus's pools
+    # and its expected result counts.
+    baselines_path = f"{prefix}_baselines.json"
+    with open(baselines_path, "w") as fh:
+        json.dump(baselines(summary, bins, meta), fh, indent=2, sort_keys=True)
+    return entities_path, bins_path, baselines_path
 
 
 def print_report(summary, bins):
@@ -602,6 +686,11 @@ def print_report(summary, bins):
             more = f" (+{len(unmeasured) - 5} more)" if len(unmeasured) > 5 else ""
             print(paint(f"    unmeasured ({len(unmeasured)}): {shown}{more}",
                         "yellow"))
+        dead = [r for r in measured
+                if (r["result_count_median"] or 0) < MIN_USABLE_RESULTS]
+        if dead:
+            print(paint(f"    {len(dead)} answered with 0 results -- recorded, "
+                        f"but excluded from the sampling pools", "yellow"))
         top = measured[:3]
         print("    heaviest: " + ", ".join(
             f"{r['entity']} ({r['result_count_median']:.0f})" for r in top))
@@ -706,9 +795,11 @@ def _parse_args(argv=None):
              "range flattens out.",
     )
     parser.add_argument(
-        "--summarize-only", metavar="PROBE_CSV", default=None,
-        help="Skip querying: re-read this probe CSV and re-emit the roll-up and "
-             "bins. Re-bin with different --bin-cuts/--bin-metric for free.",
+        "--summarize-only", metavar="CSV", default=None,
+        help="Skip querying: re-read this CSV and re-emit the roll-up, the bins, "
+             "and the baselines file. Takes either a <prefix>_probe.csv or an "
+             "<prefix>_entities.csv roll-up, so you can re-bin someone else's "
+             "profile. Re-bin with different --bin-cuts/--bin-metric for free.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -743,13 +834,18 @@ def _sampled(probes, sample, rng):
 
 def _summarize(prefix, probe_csv, meta, cuts, metric):
     rows = read_rows(probe_csv)
-    summary = entity_summary(rows)
+    # Either shape works as input: per-query probe rows, or an entities roll-up
+    # from an earlier run (or from whoever handed you theirs).
+    summary = (summary_from_entity_csv(rows) if is_entity_csv(probe_csv)
+               else entity_summary(rows))
     bins = assign_bins(summary, metric=metric, cuts=cuts)
-    entities_path, bins_path = write_summary(prefix, summary, bins, meta)
+    written = write_summary(prefix, summary, bins, meta)
     print_report(summary, bins)
     paint = console.painter()
     print()
-    print(paint(f"wrote {probe_csv}, {entities_path}, {bins_path}", "grey"))
+    print(paint("wrote " + ", ".join((probe_csv,) + written), "grey"))
+    print(paint(f"adopt these pools + baselines:  cp {written[-1]} "
+                f"helmsdeep/mvp_baselines.json", "grey"))
     print(paint("re-bin without re-querying:  helmsdeep-profile "
                 f"--summarize-only {probe_csv} --out {prefix} "
                 "--bin-cuts 0.25,0.75", "grey"))

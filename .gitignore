@@ -6,6 +6,14 @@ ars-*/
 *.csv
 *.json
 *.html
+# ...but the package's own data files are source, not run output: the disease
+# CURIE pool, and the per-CURIE profile that supplies both the corpus's tiered
+# entity pools and the expected result counts a run is checked against.
+!helmsdeep/curie_list.json
+!helmsdeep/mvp_baselines.json
+# The profiling runs those baselines were generated from, kept for provenance
+# (and so they can be re-binned with different cuts).
+!profiles/*.csv
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

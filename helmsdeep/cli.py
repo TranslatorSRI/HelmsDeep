@@ -103,6 +103,18 @@ def _parse_args(argv=None):
              "quote, and the log narrates ramps the stage display already shows.",
     )
     parser.add_argument(
+        "--result-check",
+        choices=config.RESULT_CHECK_MODES,
+        default=None,
+        help="What to do about answer counts that don't match the profiled "
+             "baseline (helmsdeep/mvp_baselines.json). 'report' (the default) "
+             "measures every query that has a baseline and prints/writes a "
+             "summary without failing anything -- the knee and every checkpoint "
+             "are unaffected. 'enforce' additionally scores a shortfall as a "
+             "failure, so it counts against the error rate and the knee. 'off' "
+             "skips the check (and the response parsing it needs).",
+    )
+    parser.add_argument(
         "--csv-prefix",
         default=None,
         help="Prefix for output files (<prefix>_stages.csv, etc.). "
@@ -223,6 +235,8 @@ def main(argv=None):
     # reads every other knob -- through the environment.
     if args.no_live:
         env["HELMSDEEP_LIVE"] = "0"
+    if args.result_check:
+        env["HELMSDEEP_RESULT_CHECK"] = args.result_check
     # Error-sample saving is opt-in: the locustfile reads the per-kind cap from
     # this env var and treats absent/0 as "count kinds, write nothing" -- so a
     # run on a box with little disk or RAM never accumulates response bodies.
@@ -258,6 +272,14 @@ def main(argv=None):
     print(paint(f"HelmsDeep  ·  {tgt['label']} ({args.targets})", "bold"))
     print(paint(f"           ·  {args.host}{tgt['endpoint']}", "grey"))
     _print_plan(plan, natural_s, budget_s, scale)
+    # Say which answer-count policy is in force: in "report" mode it changes no
+    # measurement, in "enforce" mode it changes the knee, and that difference
+    # should not be something you have to remember you set.
+    mode = (args.result_check or tgt.get("result_check") or config.RESULT_CHECK)
+    if mode != "off":
+        note = ("shortfalls count as failures" if mode == "enforce"
+                else "reported only, nothing failed")
+        print(paint(f"           ·  result checks: {mode} -- {note}", "grey"))
     print(paint(f"           ·  reports: {prefix}_summary.json, "
                 f"{prefix}_stages.csv, {html_report}", "grey"))
     if args.save_errors:

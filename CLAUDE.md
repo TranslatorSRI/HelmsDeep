@@ -95,6 +95,49 @@ The ARS contract is **fundamentally different** from KP/ARA: it is asynchronous
 (submit → poll → merge), not a single blocking `POST /query`. Any ARS support must
 model that submit/poll loop rather than reuse the sync request path.
 
+## Result-count expectations
+
+`helmsdeep-profile` measured what every MVP1/MVP2 query answers against an idle
+service, and `helmsdeep/mvp_baselines.json` ships that measurement. A run can
+therefore check something neither latency nor HTTP status shows: **did this query
+come back with the answers it is supposed to have?** A service under load that
+quietly returns a third of its results is broken, and every other signal says it
+is fine.
+
+The mechanism is deliberately staged, because scoring answers as failures moves
+the knee:
+
+| mode | what it does |
+|---|---|
+| `off` | no check, and no parsing of the response body it would need |
+| **`report`** (default) | checks every query that has a baseline; writes `<prefix>_result_checks.csv`, a `results` block in `summary.json`, and a printed block — **fails nothing**. The error rate, the knee and every checkpoint verdict are bit-for-bit what they were before this existed |
+| `enforce` | a shortfall *also* scores as a failure, so it counts against the error rate and therefore the knee |
+
+Rules that matter:
+
+- **Only a shortfall counts.** More answers than the baseline is reported
+  (`over`) and never failed: the baseline is one measurement of a knowledge
+  graph that grows.
+- **The tolerance is loose on purpose** (`0.5` = "fewer than half the expected
+  answers"). In the profiling pass the same query run twice against an idle
+  service differed by up to **41%**, with one repeat landing 20% below its own
+  median, so a tighter bar flags ordinary non-determinism as breakage. The
+  printed block buckets the shortfalls (`under_10pct` … `under_75pct`) precisely
+  so a `report` run tells you where to set the bar before you turn on `enforce`.
+- **A query with no baseline is never checked** — and never even parsed. Every
+  KP qtype, Pathfinder (it pins *two* entities), a batch lookup (many ids), and
+  any unprofiled CURIE have no expectation, so `kps`/`*_pathfinder` runs print no
+  block at all and the mixed profile checks only its inferred 2/3.
+- **The pinned entity is read back out of the payload** (`trapi_corpus.pinned_entity`)
+  rather than carried alongside it, so the builders stay single-return and the
+  expectation is derived from the exact bytes that were sent.
+- `median_ratio` per stage (observed/expected) is the number to watch: it falling
+  as users rise is answer loss under load, visible in `report` mode without a
+  single query being scored as a failure.
+- Under `enforce` a 0-result `Done` fails as the most extreme shortfall there is,
+  **even where `zero_result_is_failure` is False** — the two policies overlap at
+  the bottom of the range.
+
 ## Architecture
 
 ```
@@ -137,6 +180,11 @@ Package `helmsdeep/`:
   `checkpoints` — a list of pass/fail acceptance criteria (`users`, `goal`,
   `p99_slo_ms`, `max_error_rate`) evaluated against the stage that ran that many
   users. `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
+  Also shared: the result-count expectation knobs `RESULT_CHECK`
+  (`off`/`report`/`enforce`, default **`report`**) and
+  `RESULT_SHORTFALL_TOLERANCE` (default 0.5), with per-target overrides
+  `result_check` / `result_shortfall_tolerance` -- see **Result-count
+  expectations** below.
   Per-target ramps/SLOs live here because cost profiles differ wildly by layer:
   `kps` holds each stage 5 minutes with a 60s cooldown because Retriever answers
   in seconds to tens of seconds, not the milliseconds the old ~40-KP layer did --
@@ -158,7 +206,9 @@ Package `helmsdeep/`:
 - **`cli.py`** — the `helmsdeep` entry point (registered in
   `setup.py` `console_scripts`). Parses `--targets` (required, one layer),
   `--host` (required), `--csv-prefix`, the mutually exclusive
-  `--time-budget DURATION` / `--quick` (= `--time-budget 10m`), the two
+  `--time-budget DURATION` / `--quick` (= `--time-budget 10m`),
+  `--result-check off|report|enforce` (sets `HELMSDEEP_RESULT_CHECK`; the banner
+  states which mode is in force, because `enforce` changes the knee), the two
   output flags `--no-live` (sets `HELMSDEEP_LIVE=0`) / `--verbose`, and the
   opt-in `--save-errors [N]` (`nargs="?"`, const = `config.ERROR_SAMPLES_PER_KIND`,
   default 0; sets `HELMSDEEP_ERROR_SAMPLES=N` only when > 0 -- absent means
@@ -201,7 +251,12 @@ Package `helmsdeep/`:
     against diseases). An entity with no successful probe stays `unmeasured` and
     is reported rather than binned on missing data. Outputs
     `<prefix>_entities.csv` + `<prefix>_bins.json`; `--summarize-only` re-bins an
-    existing probe CSV without sending a single query.
+    existing probe CSV without sending a single query. `baselines()` writes
+    `<prefix>_baselines.json` — the one output the package itself reads; copy it
+    over `helmsdeep/mvp_baselines.json` to adopt a profile as the corpus's pools
+    *and* its expected result counts. `--summarize-only` takes either a probe
+    CSV or an `<prefix>_entities.csv` roll-up (`is_entity_csv`), so a profile
+    someone hands you can be re-binned without the per-query rows.
 - **`console.py`** — the live terminal display. Purely cosmetic and strictly
   read-only: every number comes from the run's `StageCollector` and its
   `_stage_stats`, so the screen can't drift from `stages.csv`, and an exception
@@ -322,6 +377,22 @@ Package `helmsdeep/`:
     polling to `COMPLETION_MAX_POLL_S` and appends one `COLLECTOR.record_completion`
     row (end-to-end time + whether it `finished`); queries that finish within
     `MAX_POLL_S` record their completion row inline.
+  - `_check_results(qtype, payload, count, latency_ms)` + `_count_sync_results`
+    — the result-count expectation (see **Result-count expectations**). `count`
+    is a **callable**, not a number: the baseline lookup is a dict hit while the
+    observed count on the sync path means parsing a response that can be
+    megabytes, so a query with no baseline never decodes its body. Returns
+    `(verdict, failed)` where `failed` is True only under `enforce` and only for
+    a shortfall — in `report` mode this function cannot move the error rate, the
+    knee, or a checkpoint. `StageCollector.record_result_check` tallies per stage
+    (`checked`/`shortfalls`/`surpluses`/`result_ratios`) and appends one
+    `result_checks` row per *deviation* (not per query checked — the in-spec rows
+    would bury them). `_result_check_stage(idx)` is the per-stage roll-up;
+    `on_test_stop` writes `<prefix>_result_checks.csv`, the `results` block in
+    `summary.json`, and the printed RESULT COUNTS block. A shortfall is error-
+    sampled (kind `result_shortfall` / `ars_result_shortfall`) **only when it was
+    actually scored as a failure**, so the ERROR SAMPLES block keeps listing only
+    things that failed.
   - `_stage_quality(row)` — the two conditions that make a stage's row untrust-
     worthy however correct its arithmetic: fewer than `MIN_P99_SAMPLES` (100)
     completed requests, so the p99 rests on the two slowest and moves with one
@@ -390,10 +461,25 @@ Package `helmsdeep/`:
     `PATHFINDER_CORPUS` at `INFERRED_PATHFINDER_RATIO = (2, 1)` — 2/3 inferred
     MVP1+MVP2, 1/3 Pathfinder — preserving each corpus's internal weights, so
     retuning the MVP1/MVP2 mix propagates here automatically.
-  - Entity pools: `HEAVY_DISEASES` (curated hubs) + `LONG_TAIL_DISEASES` from
-    **`curie_list.json`** (~1000 real MONDO CURIEs, shipped via `package_data`),
-    a curated `GENES` pool (NCBIGene), and curated drug↔disease `CHEM_DISEASE_PAIRS`.
+  - Entity pools, now **measured** rather than curated. `mvp_baselines.json`
+    (shipped via `package_data`, written by `helmsdeep-profile`) carries one
+    record per CURIE — its measured `results`, `latency_s`, its `bin`, and
+    `usable` — and the pools are built from it at import by `_binned()`:
+    `HEAVY_DISEASES` (329 diseases, 218–1071 results, median 68s),
+    `MEDIUM_DISEASES` (337, 38–217, median 35s), `LIGHT_DISEASES` (243, 1–36,
+    median 11s). The tiers are disjoint and ordered, so `mvp1_heavy/medium/light`
+    finally differ in **cost** and not just in weight. `LONG_TAIL_DISEASES`
+    (from **`curie_list.json`**, ~1000 MONDO CURIEs) survives only as the
+    fallback when a tier has no measured members — a checkout whose baselines
+    file is missing still runs. `GENES`/`CHEMICALS` are curated pools filtered
+    through `_usable()`, which drops what the profile measured as answering
+    nothing (donepezil, `CHEBI:53289`, answered 0 on both probes and is out).
     `corpus_for(name)` returns the right list.
+  - `pinned_entity(payload)` — the one CURIE a query pins, or None if it pins
+    none or several. `baseline_for(qtype, payload)` — that CURIE's baseline
+    record via `BASELINE_QTYPES` (which maps the three MVP1 qtypes onto the one
+    `mvp1_treats` record set), or None when the question was never profiled.
+    `BASELINE_BY_ENTITY` is the flat `(qtype, entity) -> record` index it reads.
 
 For KPs, cost is driven by query-graph **shape** (hops, mode, pinned vs open,
 batch, predicate). For ARA/ARS creative queries, the dominant cost driver is the
@@ -402,21 +488,23 @@ batch, predicate). For ARA/ARS creative queries, the dominant cost driver is the
 ## Status & what's left
 
 Implemented: component awareness, the `helmsdeep` CLI + entry point, the
-`helmsdeep-profile` per-CURIE corpus profiler,
+`helmsdeep-profile` per-CURIE corpus profiler, the **measured** MVP1 tiers and
+the result-count expectation check (`report` mode on by default),
 per-target stages/SLO, segmented corpuses, scalar `parameters.tier` per KP query,
 the ARS async submit/poll/merge user, ARS health metrics + red flags, the
-tiered inferred disease mix, and the mixed capacity profile (2:1
+measured-and-tiered inferred disease mix, and the mixed capacity profile (2:1
 inferred/Pathfinder blend + pass/fail acceptance checkpoints, ARA and ARS).
 
 Remaining refinements (not yet done — don't assume these exist):
 
-- **Medium vs light tiers aren't calibrated.** `mvp1_medium` and `mvp1_light`
-  still draw from the same `LONG_TAIL_DISEASES` pool, so they differ in weight
-  but not in cost. The measuring tool now exists — `helmsdeep-profile`
-  (`profile_corpus.py`) reports result count and latency per CURIE and emits
-  suggested light/medium/heavy pools — but **the pass has not been run against a
-  real service and `trapi_corpus.py` still ships the single shared pool.** Run it,
-  then replace the pool with the measured lists.
+- **Enforcement of result counts is not switched on.** `RESULT_CHECK` defaults
+  to `report`: a run measures every answer count against the profiled baseline
+  and reports the deviations, but nothing fails and the knee is unchanged. That
+  is deliberate stage one. Stage two is flipping a target (or the shared default)
+  to `enforce` once a `report` run on the real service shows what its normal
+  spread is — read `observed_over_expected_bands` and `median_ratio` in
+  `summary.json` before choosing the tolerance, and expect to tighten
+  `RESULT_SHORTFALL_TOLERANCE` below 0.5 at the same time.
 - **No per-ARA child-result breakdown.** ARS health treats the merged message as
   a whole; the `trace=y` response exposes children, so per-agent health is possible.
 - **No full multi-endpoint registry.** Retriever is a single service today; the
@@ -472,9 +560,13 @@ Profiling the corpus (not a load test — one query per CURIE, low concurrency):
 # Every MVP1 disease + every MVP2 gene/chemical, via the ARA.
 helmsdeep-profile --host https://your-ara.example.org --out mvp_profile
 helmsdeep-profile --host https://your-ara.example.org --out mvp_profile --resume
-# Re-bin from data already on disk; sends nothing.
+# Re-bin from data already on disk; sends nothing. Takes either the probe CSV
+# or an _entities.csv roll-up.
 helmsdeep-profile --summarize-only mvp_profile_probe.csv --out mvp_profile \
     --bin-cuts 0.25,0.75
+
+# Adopt a profile as the corpus's pools AND its expected result counts:
+cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
 ```
 
 - `--csv-prefix` is optional; it falls back to the `LOCUST_CSV_PREFIX` env var,
@@ -489,7 +581,9 @@ helmsdeep-profile --summarize-only mvp_profile_probe.csv --out mvp_profile \
   to a wall clock; see the conventions note below for what that costs.
 - Outputs (written by the master/standalone node only):
   `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json`
-  (+ `<prefix>_checkpoints.csv` for checkpointed targets) (+
+  (+ `<prefix>_checkpoints.csv` for checkpointed targets)
+  (+ `<prefix>_result_checks.csv` whenever anything the run sent had a profiled
+  baseline -- one row per answer-count deviation, with the CURIE) (+
   `<prefix>_ars_health.csv`, the `<prefix>_ars_queries.csv` per-query debug log,
   the `<prefix>_ars_completion.csv` sidecar, and a `red_flags` list +
   `completion` roll-up for the `ars` target), with `--save-errors [N]` only a
@@ -631,6 +725,23 @@ helmsdeep-profile --summarize-only mvp_profile_probe.csv --out mvp_profile \
   budget) in `on_test_stop`; queries still unfinished at shutdown are simply absent
   from the sidecar. This separates *slow* (finished after the SLO) from *broken*
   (never finished).
+- **The inferred tiers are measured; don't hand-edit them.** `HEAVY_DISEASES` /
+  `MEDIUM_DISEASES` / `LIGHT_DISEASES` are derived at import from
+  `mvp_baselines.json`. Retune by re-profiling and copying the new
+  `<prefix>_baselines.json` over it, never by editing lists in
+  `trapi_corpus.py`. The same file is the expected-result-count baseline, so
+  editing one without the other would make the pools and the expectations
+  disagree.
+- **An entity that answers nothing is not a cheap query, it's a dead one.**
+  `usable: false` in the baselines (fewer than `min_usable_results` answers)
+  keeps a CURIE on the record but out of the sampling pools: it exercises
+  nothing, and on a target with `zero_result_is_failure` it would poison the
+  error rate with a known-empty question. 86 of the 995 profiled diseases are in
+  that state, plus donepezil on the MVP2 chemical side.
+- **A `report`-mode result check changes no measurement.** That is the whole
+  point of the default: the per-stage tables, the knee, the error rate and every
+  checkpoint verdict are identical with it on or off. Only `enforce` moves them.
+  If you touch `_check_results`, keep that true.
 - **Inferred corpus mixes MVP1 + MVP2 and varies entities per request.** MVP1
   (`mvp1_heavy/medium/light`, treats-disease) samples a tiered disease; MVP2
   (`mvp2_chem_affects_gene`/`mvp2_chem_affects_open_gene`, a chemical→gene
@@ -638,8 +749,8 @@ helmsdeep-profile --summarize-only mvp_profile_probe.csv --out mvp_profile \
   pinned entity + direction. The edge orientation is always chemical(subject)→
   gene(object) and the aspect qualifier is always `activity_or_abundance`. The
   per-request variation covers the real cost surface and avoids warming caches.
-  MVP1 medium and light share the long-tail pool until calibrated (see Status &
-  what's left).
+  MVP1's three tiers are measured (see **Result-count expectations**): on the
+  profiled ARA their median response times were 68s / 35s / 11s.
 - **Environments & TRAPI versions vary per service.** Endpoints live across
   `*.ci.transltr.io`, `*.test.transltr.io`, and prod, and individual services pin
   different TRAPI versions in their URL paths. Target deliberately.
@@ -647,10 +758,13 @@ helmsdeep-profile --summarize-only mvp_profile_probe.csv --out mvp_profile \
   because the [Translator TestHarness](https://github.com/TranslatorSRI/TestHarness)
   installs HelmsDeep as its performance runner and runs on a 3.11 base image. No
   3.12-only syntax anywhere in the package.
-- **Swap the CURIEs.** The KP corpus uses a few real MONDO/CHEBI entities and the
-  inferred corpus draws diseases from `curie_list.json`; replace/extend them with
-  entities the target service actually knows about, or queries return empty and
-  won't reflect real cost.
+- **Swap the CURIEs.** The KP corpus uses a few real MONDO/CHEBI entities;
+  replace/extend them with entities the target service actually knows about, or
+  queries return empty and won't reflect real cost. The *inferred* corpus no
+  longer needs this done by hand -- `helmsdeep-profile` finds the empty ones and
+  the baselines file keeps them out of the pools -- but a different service (a
+  different environment, or a different ARA) needs its own profile, because
+  which CURIEs answer is a property of the service, not of the corpus.
 
 ## Roadmap (broader repo, next phases)
 
@@ -661,11 +775,18 @@ submit→poll→merge user, per-target config, and a README for human onboarding
 
 Remaining, ordered so a future session can pick up where this leaves off:
 
-a. **Calibrate the inferred tiers.** The profiler is written
-   (`helmsdeep-profile`); what remains is to *run* it against a real ARA, read
-   `<prefix>_bins.json`, and replace the single `LONG_TAIL_DISEASES` pool in
-   `trapi_corpus.py` with the measured light/medium/heavy lists so `mvp1_light`
-   and `mvp1_medium` stop sampling the same diseases.
+a. **Turn on result-count enforcement.** The tiers are calibrated and the check
+   runs in `report` mode (done — see **Result-count expectations**). What remains
+   is a `report` run against the real service to learn its normal spread, then
+   `--result-check enforce` with a tolerance set from that evidence. Re-profile
+   first if the knowledge graph has moved since
+   `profiles/mvp_profile_entities_2026-10-14.csv`: a stale baseline makes a
+   healthy service look like it is dropping answers.
+a2. **Re-profile periodically.** `profiles/` holds the pass the shipped
+   baselines came from (995 diseases + 20 MVP2 entities, profiled via the ARA).
+   86 of those diseases answered 0 results and are excluded from sampling; if
+   that count moves a lot, the corpus is drifting away from what the service
+   knows.
 b. **Per-ARA health breakdown** for ARS, parsing the `trace=y` children so a
    red flag can name *which* downstream agent dropped answers.
 c. **Restore the full endpoint registry as config** (per-KP/ARA URLs +
