@@ -303,7 +303,7 @@ def one_hop_lookup_pinned():
                    "predicates": ["biolink:treats"],
                    "knowledge_type": "lookup"},
         },
-        tier=1,
+        tier=0,
     )
 
 
@@ -319,7 +319,7 @@ def one_hop_lookup_open():
                    "predicates": ["biolink:treats"],
                    "knowledge_type": "lookup"},
         },
-        tier=1,
+        tier=0,
     )
 
 
@@ -483,7 +483,7 @@ def one_hop_no_predicate():
             "e0": {"subject": "n0", "object": "n1",
                    "knowledge_type": "lookup"},
         },
-        tier=1,
+        tier=0,
     )
 
 
@@ -522,7 +522,7 @@ def batch_lookup():
                    "predicates": ["biolink:treats"],
                    "knowledge_type": "lookup"},
         },
-        tier=1,
+        tier=0,
     )
 
 
@@ -532,7 +532,7 @@ def malformed_query():
         nodes={"n0": {"ids": [T2D]}},
         edges={"e0": {"subject": "n0", "object": "n_missing",
                       "predicates": ["biolink:treats"]}},
-        tier=1,
+        tier=0,
     )
 
 
