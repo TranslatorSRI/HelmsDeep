@@ -782,6 +782,11 @@ cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
 - **Environments & TRAPI versions vary per service.** Endpoints live across
   `*.ci.transltr.io`, `*.test.transltr.io`, and prod, and individual services pin
   different TRAPI versions in their URL paths. Target deliberately.
+- **The TestHarness pins a tag, so releases are explicit.** TestHarness installs
+  HelmsDeep from `requirements-runners.txt` as `git+…/HelmsDeep@vX.Y.Z`, not
+  `@main`. To ship a change to it: bump `version` in `setup.py`, tag that commit
+  `vX.Y.Z` (matching), push the tag, then bump the pin in TestHarness. Never move
+  an existing tag -- a tag that changes underneath a built image defeats the pin.
 - **Stay on 3.11 syntax.** `setup.py` pins `python_requires=">=3.11"`, not 3.12,
   because the [Translator TestHarness](https://github.com/TranslatorSRI/TestHarness)
   installs HelmsDeep as its performance runner and runs on a 3.11 base image. No

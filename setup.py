@@ -6,10 +6,10 @@ with open("README.md", encoding="utf-8") as readme_file:
 
 setup(
     name="helmsdeep",
-    version="0.1.0",
+    version="0.2.0",
     author="Max Wang",
     author_email="max@covar.com",
-    url="https://github.com/TranslatorSRI/StressTester",
+    url="https://github.com/TranslatorSRI/HelmsDeep",
     description="HelmsDeep -- HTTP Endpoint Load Measurement System, "
                 "Determining Each Endpoint's Performance",
     long_description_content_type="text/markdown",
