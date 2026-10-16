@@ -32,6 +32,11 @@ for creative "what treats X?" queries the answer-set size of the pinned disease
 dominates cost far more than graph shape, so we sample from size-tiered disease
 pools (heavy/medium/light) to be representative of production traffic and to
 avoid the cache-warming artifact of repeating one entity.
+
+Those tiers are MEASURED, not guessed: `mvp_baselines.json` carries one record
+per CURIE from a `helmsdeep-profile` pass (result count, latency, its bin), and
+the pools below are built from it at import. The same file is the baseline a run
+compares its result counts against -- see `baseline_for`.
 """
 
 import json
@@ -57,23 +62,82 @@ DISEASE_BATCH = [T2D, ALZHEIMERS, PARKINSONS, ASTHMA, HUNTINGTON, SKIN_VASCULAR_
 
 
 # ---------------------------------------------------------------------------
-# Disease entity pools for the inferred (ARA/ARS) corpus.
+# Measured per-CURIE baselines (mvp_baselines.json).
 #
-# Heavy = common, heavily-studied disease hubs with large answer sets (curated
-# by domain knowledge). The long-tail pool is ~1000 real MONDO diseases restored
-# from git history (curie_list.json) and is dominated by rarer diseases, so it
-# stands in for medium/light traffic. Tiering by *measured* answer-set size
-# isn't possible offline -- medium and light currently draw from the same
-# long-tail pool; split it once you have per-disease degree/result-size data.
-# The heavy/medium/light WEIGHTS (in SHEPHERD_CORPUS) and the per-tier qtype
-# labels are already in place, so that refinement is a data change, not a code
-# change.
+# Written by `helmsdeep-profile`, which sends every entity's query once at low
+# concurrency and records what came back. One file, two jobs:
+#
+#   1. the tiered entity pools below -- each CURIE's `bin` is its measured
+#      answer-set size relative to the rest of its pool, so `mvp1_heavy`,
+#      `mvp1_medium` and `mvp1_light` finally differ in COST and not just in
+#      weight (they shared one long-tail pool until this file existed), and
+#   2. the expected result count a run checks against (`baseline_for`), so a
+#      query that comes back with a fraction of its answers is detectable.
+#
+# `usable: false` marks a CURIE the profile measured but the corpus must not
+# sample: it answered with fewer than `min_usable_results`. Those queries cost
+# the service almost nothing, teach a ramp nothing, and on a target with
+# zero_result_is_failure they score as a failure every time they are drawn. They
+# stay in the file because "this CURIE has no answers here" is a real
+# measurement -- it just isn't load.
+#
+# Re-profile and copy the new <prefix>_baselines.json over this file to retune;
+# nothing below needs editing.
 # ---------------------------------------------------------------------------
-HEAVY_DISEASES = [T2D, ASTHMA, ALZHEIMERS, PARKINSONS, HUNTINGTON, SKIN_VASCULAR_DISEASE]
+BASELINES_FILE = "mvp_baselines.json"
+
+# Which baseline record set a corpus qtype is judged against. The three MVP1
+# qtypes are the same query against differently-sized diseases, so they share
+# one record set. A qtype that is absent (every KP qtype, Pathfinder) simply has
+# no baseline, and nothing is checked for it.
+BASELINE_QTYPES = {
+    "mvp1_heavy": "mvp1_treats",
+    "mvp1_medium": "mvp1_treats",
+    "mvp1_light": "mvp1_treats",
+    "mvp2_chem_affects_gene": "mvp2_chem_affects_gene",
+    "mvp2_chem_affects_open_gene": "mvp2_chem_affects_open_gene",
+}
+
+
+def _load_baselines():
+    """Load mvp_baselines.json; an empty dict if it is missing or unreadable."""
+    path = os.path.join(os.path.dirname(__file__), BASELINES_FILE)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("entities"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+BASELINES = _load_baselines()
+# (baseline_qtype, entity) -> record. Flat because that is how it is read: one
+# lookup per query, on the hot path.
+BASELINE_BY_ENTITY = {
+    (qtype, entity): record
+    for qtype, entities in (BASELINES.get("entities") or {}).items()
+    for entity, record in entities.items()
+}
+
+
+def _binned(qtype, wanted):
+    """CURIEs the profile put in `wanted` for `qtype`, usable ones only."""
+    return sorted(
+        entity for (qt, entity), rec in BASELINE_BY_ENTITY.items()
+        if qt == qtype and rec.get("bin") == wanted and rec.get("usable")
+    )
 
 
 def _load_disease_pool():
-    """Load the long-tail disease pool (MONDO CURIEs) from curie_list.json."""
+    """The unbinned disease pool (MONDO CURIEs) from curie_list.json.
+
+    Still the fallback when a tier has no measured members (a fresh checkout
+    whose baselines file is missing, or a profile that covered only part of the
+    pool): a ramp that samples unprofiled diseases is better than one that
+    cannot start.
+    """
     path = os.path.join(os.path.dirname(__file__), "curie_list.json")
     try:
         with open(path) as f:
@@ -89,13 +153,23 @@ def _load_disease_pool():
 
 LONG_TAIL_DISEASES = _load_disease_pool()
 
+# The three measured MVP1 tiers. Curated hubs are no longer a separate concept:
+# the profile put all six of them in `heavy` on merit (758-1001 results each),
+# alongside 300+ others, so repeating the same handful -- and warming their
+# caches -- is no longer necessary. They remain as named constants because the
+# KP corpus pins them directly.
+HEAVY_DISEASES = _binned("mvp1_treats", "heavy") or [
+    T2D, ASTHMA, ALZHEIMERS, PARKINSONS, HUNTINGTON, SKIN_VASCULAR_DISEASE]
+MEDIUM_DISEASES = _binned("mvp1_treats", "medium") or LONG_TAIL_DISEASES
+LIGHT_DISEASES = _binned("mvp1_treats", "light") or LONG_TAIL_DISEASES
+
 
 # ---------------------------------------------------------------------------
 # Gene pool for MVP2 (chemical<->gene "affects") creative queries. A small
 # curated set of well-studied human genes by NCBIGene CURIE; extend/replace with
 # genes your target service knows. (Not size-tiered -- no gene-degree data.)
 # ---------------------------------------------------------------------------
-GENES = [
+_GENES_CURATED = [
     "NCBIGene:1956",   # EGFR
     "NCBIGene:7157",   # TP53
     "NCBIGene:3845",   # KRAS
@@ -110,11 +184,15 @@ GENES = [
     "NCBIGene:3569",   # IL6
 ]
 
+# Both pools are filtered by `_usable` (defined below) once the baselines are
+# loaded: the profile found every gene answering 490-690 results, and one of the
+# eight chemicals answering nothing at all.
+
 # Chemical pool for the pinned-chemical MVP2 variant ("what genes does chemical X
 # affect?"). The chemical side is otherwise an open answer set; this small curated
 # set of real CHEBI drug CURIEs is only used when the chemical is the pinned
 # endpoint. Swap/extend with chemicals your target service actually knows about.
-CHEMICALS = [
+_CHEMICALS_CURATED = [
     METFORMIN,    # CHEBI:6801
     LEVODOPA,     # CHEBI:15765
     DONEPEZIL,    # CHEBI:53289
@@ -124,6 +202,26 @@ CHEMICALS = [
     "CHEBI:45783",  # imatinib
     "CHEBI:8382",   # prednisone
 ]
+
+
+def _usable(qtype, curated):
+    """Drop the members the profile measured as answering nothing.
+
+    A pinned entity that comes back empty is not a cheap query, it is a dead
+    one: it exercises nothing and, where a 0-result answer is scored as a
+    failure, it poisons the error rate with a known-empty question. Anything the
+    profile has no record of is kept -- absence of data is not evidence of an
+    empty answer set.
+    """
+    kept = [e for e in curated
+            if BASELINE_BY_ENTITY.get((qtype, e), {}).get("usable", True)]
+    return kept or list(curated)
+
+
+GENES = _usable("mvp2_chem_affects_gene", _GENES_CURATED)
+# Donepezil (CHEBI:53289) answered 0 results on both probes -- see
+# profiles/ -- so it drops out here until a profile finds it answers again.
+CHEMICALS = _usable("mvp2_chem_affects_open_gene", _CHEMICALS_CURATED)
 
 # Canonical MVP2 object-qualifier values (mirrors the Translator TestHarness
 # generate_query.py): the aspect is the combined `activity_or_abundance` value the
@@ -236,7 +334,10 @@ def one_hop_lookup_open():
 #
 #   MVP1  "what chemicals treat disease X?"  -- open chemical -[treats]-> disease.
 #         Cost tracks the pinned disease's answer-set size, so the disease is
-#         sampled per request from size-tiered pools (heavy/medium/light).
+#         sampled per request from the three MEASURED size tiers
+#         (heavy/medium/light -- see the baselines note above). The tiers are
+#         real: on the profiled ARA their median response times were 68s / 35s /
+#         11s, so which tier a request draws from now changes what it costs.
 #   MVP2  chemical -[affects]-> gene with object aspect/direction qualifiers on
 #         the gene. The edge is ALWAYS oriented chemical(subject) -> gene(object)
 #         (matching the Translator TestHarness generate_query.py); the two
@@ -262,18 +363,18 @@ def _inferred_treats(disease):
 
 
 def mvp1_heavy():
-    """MVP1 heavy: a common, highly-connected disease hub -> large answer set."""
+    """MVP1 heavy: a measured large-answer-set disease (top third of the pool)."""
     return _inferred_treats(random.choice(HEAVY_DISEASES))
 
 
 def mvp1_medium():
-    """MVP1 medium: a long-tail disease (see pool note above)."""
-    return _inferred_treats(random.choice(LONG_TAIL_DISEASES))
+    """MVP1 medium: a measured mid-sized answer set (middle third)."""
+    return _inferred_treats(random.choice(MEDIUM_DISEASES))
 
 
 def mvp1_light():
-    """MVP1 light: a long-tail disease -> typically small answer set."""
-    return _inferred_treats(random.choice(LONG_TAIL_DISEASES))
+    """MVP1 light: a measured small answer set (bottom third, excluding empties)."""
+    return _inferred_treats(random.choice(LIGHT_DISEASES))
 
 
 def _affects(subject_node, object_node, aspect, direction):
@@ -531,3 +632,45 @@ CORPUS_BY_NAME = {
 def corpus_for(name):
     """Return the (qtype, builder, weight) list for a component corpus name."""
     return CORPUS_BY_NAME[name]
+
+
+# ----------------------------------------------------------------------------
+# Result-count expectations.
+#
+# The pinned entity is read back out of the payload rather than carried
+# alongside it: the builders stay single-return (payload in, payload out), there
+# is no second channel to keep in sync, and the answer is derived from the exact
+# bytes that were sent. A query with no single pinned entity -- a batch lookup,
+# a Pathfinder query pinning two -- has no expectation, which is correct: the
+# profile never measured one.
+# ----------------------------------------------------------------------------
+def pinned_entity(payload):
+    """The one CURIE this query pins, or None if it pins none or several."""
+    nodes = (((payload or {}).get("message") or {})
+             .get("query_graph") or {}).get("nodes") or {}
+    pinned = [ids for node in nodes.values()
+              if isinstance(node, dict) and (ids := node.get("ids"))]
+    if len(pinned) != 1 or len(pinned[0]) != 1:
+        return None
+    return pinned[0][0]
+
+
+def baseline_for(qtype, payload):
+    """The profiled baseline for this exact query, or None if there is none.
+
+    Returns the `mvp_baselines.json` record -- `results` is the measured median
+    answer count for the pinned entity, which is what a run compares against.
+    None whenever the question wasn't profiled: an unmapped qtype (KP,
+    Pathfinder), an unprofiled entity, or a query with no single pinned entity.
+    """
+    baseline_qtype = BASELINE_QTYPES.get(qtype)
+    if baseline_qtype is None:
+        return None
+    entity = pinned_entity(payload)
+    if entity is None:
+        return None
+    record = BASELINE_BY_ENTITY.get((baseline_qtype, entity))
+    if not record or not record.get("results"):
+        # No record, or a measured-empty entity: nothing to hold it to.
+        return None
+    return {"entity": entity, **record}

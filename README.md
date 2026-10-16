@@ -22,7 +22,8 @@ and the asynchronous **ARS**.
 ## Install
 
 ```bash
-pip install -e .          # Python >= 3.11; installs locust
+pip install -e .          # Python >= 3.11; installs locust + requests
+                          # entry points: helmsdeep, helmsdeep-profile
 ```
 
 3.11 rather than 3.12 because HelmsDeep is also installed as a dependency of the
@@ -85,6 +86,10 @@ helmsdeep --targets ars_mixed \
   ["Shorter runs"](#shorter-runs---time-budget----quick) below.
 - `--no-live` / `--verbose` control the terminal output — see
   ["Watching a run"](#watching-a-run) below.
+- `--result-check off|report|enforce` decides what happens when a query answers
+  with fewer results than the profile says it has. Defaults to `report`, which
+  measures and reports without failing anything — see
+  ["Did it answer with the right number of results?"](#did-it-answer-with-the-right-number-of-results).
 - `--save-errors [N]` keeps full examples of each error kind (up to N per
   stage, default 3) under `<prefix>_errors/` for the post-mortem. **Off unless
   given** — a run on a box with little disk or RAM writes nothing, though error
@@ -238,9 +243,14 @@ Written to the working directory by the standalone/master node:
   `time_scale` it ran at), all stages, the chosen knee, and `stage_warnings` /
   `knee_unsupported` (see
   ["Measurement quality warnings"](#measurement-quality-warnings)) (plus
-  `checkpoints` for targets that define them)
+  `checkpoints` for targets that define them, and a `results` block for runs
+  that checked answer counts against the profiled baseline)
 - `<prefix>_checkpoints.csv` — **targets with acceptance criteria** (`aras_mixed`
   / `ars_mixed`): one row per checkpoint with its `PASS` / `FAIL` verdict
+- `<prefix>_result_checks.csv` — whenever anything the run sent had a profiled
+  baseline (the inferred/mixed targets): one row per answer-count **deviation**,
+  naming the CURIE, what it was expected to answer and what it did (see
+  ["Did it answer with the right number of results?"](#did-it-answer-with-the-right-number-of-results))
 - `<prefix>_ars_health.csv` — **ARS only**: per-stage health signals (see below)
 - `<prefix>_ars_queries.csv` — **ARS only**: one row per logical query with its
   **pk**, the HTTP status of each step, the terminal ARS status, any intermediate
@@ -760,6 +770,206 @@ quick visual feel and for sharing a screenshot.
   instead of latencies.
 - **Adjust corpus weights** in `RETRIEVER_CORPUS` / `SHEPHERD_CORPUS` to match
   your traffic mix.
+- **The MVP1 tiers are measured, not guessed.** `HEAVY_DISEASES` /
+  `MEDIUM_DISEASES` / `LIGHT_DISEASES` are built at import from
+  `helmsdeep/mvp_baselines.json` (68s / 35s / 11s median response on the
+  profiled ARA). Retune them by re-profiling with
+  [`helmsdeep-profile`](#profiling-the-corpus-helmsdeep-profile) and copying the
+  new baselines file over the old one — not by editing lists in
+  `trapi_corpus.py`, which would also desync the expected result counts that
+  live in the same file.
+
+## Did it answer with the right number of results?
+
+Latency and HTTP status both say a service is fine when it hands back a third of
+its answers. `helmsdeep-profile` measured what every MVP1/MVP2 query answers
+against an idle service, so a run can now check the thing those two signals
+miss.
+
+Every query whose pinned CURIE has a profiled baseline
+(`helmsdeep/mvp_baselines.json`) is compared against it, and the deviations are
+reported:
+
+```
+RESULT COUNTS vs PROFILED BASELINE (report only -- no query was failed, no number above moved)
+  baseline: mvp_baselines.json (profiled 2026-10-14T13:43:22+00:00); short = below 50% of expected
+ stg  usr  checked  short  short%  median   worst
+   0    4      609    203   33.3%    1.00    0.00
+   1    8     1192    397   33.3%    1.00    0.00
+  median observed/expected across the run: 1.0  (600 of 1801 short, 0 over)
+  how far short: 33 under 10pct, 567 under 25pct
+  600 deviation(s) named with their CURIEs in run1_result_checks.csv
+  To make these count against the error rate and the knee: --result-check enforce
+```
+
+`median` is the column to watch: 1.00 means the stage answered what it is
+supposed to, 0.60 means it returned 60% of its answers. **Watching it fall as
+users rise is answer loss under load** — and in the default mode you see that
+without a single query being scored as a failure.
+
+### Three modes, rolled out in stages
+
+| `--result-check` | effect |
+|---|---|
+| `report` | **the default.** Measures, reports, writes `<prefix>_result_checks.csv` and a `results` block in `summary.json`. Fails nothing: the error rate, the knee and every checkpoint verdict are exactly what they were before this existed. |
+| `enforce` | a shortfall *also* scores as a failure, so it counts against the error rate and therefore the knee. |
+| `off` | no check, and no parsing of the response body it would need. |
+
+```bash
+helmsdeep --targets aras --host https://your-ara.example.org              # report
+helmsdeep --targets aras --host https://your-ara.example.org --result-check enforce
+```
+
+Start in `report`, read the numbers, then decide. Going straight to `enforce`
+means your knee is now gated by a bar you have not calibrated.
+
+### What counts, and what doesn't
+
+- **Only a shortfall counts.** Coming back with *more* answers than the baseline
+  is reported as `over` and never failed — the baseline is one measurement of a
+  knowledge graph that grows.
+- **The tolerance is loose on purpose.** The default is 0.5: "fewer than half
+  the expected answers". In the profiling pass the same query run twice against
+  an idle service differed by up to **41%**, with one repeat landing 20% below
+  its own median. A tighter bar flags ordinary non-determinism as breakage. The
+  `how far short` line buckets the deviations so a `report` run tells you where
+  your service's real floor is; tighten
+  `RESULT_SHORTFALL_TOLERANCE` in `config.py` (or per target) from that evidence.
+- **A query with no baseline is never checked** — and never even parsed, so this
+  costs nothing where it cannot apply. That means every KP qtype, Pathfinder (it
+  pins *two* entities), batch lookups, and any unprofiled CURIE. A `kps` or
+  `*_pathfinder` run prints no block at all; the mixed profile checks only its
+  inferred 2/3.
+- **Under `enforce`, a 0-result `Done` fails** as the most extreme shortfall
+  there is, even on a target with `zero_result_is_failure: false`. The two
+  policies overlap at the bottom of the range.
+- A stale baseline makes a healthy service look broken. If the knowledge graph
+  has moved, re-profile before enforcing.
+
+### `<prefix>_result_checks.csv`
+
+One row per deviation (not per query checked — the in-spec rows would bury
+them), naming the CURIE so you can reproduce it by hand:
+
+```csv
+stage,users,qtype,entity,expected_results,observed_results,ratio,verdict,latency_s
+0,4,mvp2_chem_affects_open_gene,CHEBI:6801,754,150,0.199,short,0.03
+0,4,mvp1_light,MONDO:0003964,14,2,0.143,short,0.05
+```
+
+```bash
+# Which CURIEs lost the most answers, worst first
+sort -t, -k7 -g run1_result_checks.csv | head -20
+
+# Did the shortfalls cluster in the top stage?
+cut -d, -f1 run1_result_checks.csv | sort | uniq -c
+```
+
+## Profiling the corpus (`helmsdeep-profile`)
+
+`helmsdeep-profile` is the companion to the load test, and the opposite kind of
+run. The load test sends *randomly sampled* queries from many concurrent users
+and asks how far the service scales. The profiler sends **every MVP1 and MVP2
+query exactly once**, at low concurrency, and asks what each individual query
+*costs*:
+
+- **response time** (wall clock, end to end)
+- **result count** — the answer-set size that dominates inferred-query cost
+- **knowledge-graph size** (nodes/edges), which keeps discriminating when a
+  service caps `results` and the top of the range flattens out
+
+…all broken out **per CURIE**. That is the data the corpus is missing: today
+`mvp1_medium` and `mvp1_light` sample the *same* `LONG_TAIL_DISEASES` pool
+because no per-disease size measurements existed, so the "tiers" aren't really
+tiered. This tool produces them.
+
+```bash
+# Profile every MVP1 disease (~1000) + every MVP2 gene/chemical via the ARA.
+helmsdeep-profile --host https://your-ara.example.org --out mvp_profile
+
+# Pilot first: 50 random entities per query type, repeatable sample.
+helmsdeep-profile --host https://your-ara.example.org --out pilot \
+    --sample 50 --seed 1
+
+# Long run interrupted or the service blipped? Pick up where it stopped —
+# entities already measured successfully are skipped, failures are retried.
+helmsdeep-profile --host https://your-ara.example.org --out mvp_profile --resume
+
+# Spot-check the same entities through the ARS (async submit/poll/merge).
+# Minutes per query, so keep the set small.
+helmsdeep-profile --host https://ars.ci.transltr.io --target ars \
+    --out ars_spot --sample 20
+
+# Re-bin from data already on disk — no queries sent, so try as many cuts as
+# you like.
+helmsdeep-profile --summarize-only mvp_profile_probe.csv --out mvp_profile \
+    --bin-cuts 0.25,0.75
+```
+
+The queries are built by calling `trapi_corpus`'s own builders with a pinned
+entity instead of a sampled one, so a profiled query is byte-for-byte the query
+the load test sends — same envelope, same qualifiers, same `bypass_cache`.
+`--dry-run` prints the plan and a sample payload per query type without sending
+anything.
+
+**This is not a load test.** Keep `--concurrency` low (default 4). At high
+concurrency you measure queueing, not answer-set size, and you are loading a
+shared service for no measurement benefit — the same layering rule applies
+(one layer per run; a profiling pass against the ARS also loads every ARA and
+Retriever beneath it).
+
+### Outputs
+
+| File | What's in it |
+|---|---|
+| `<prefix>_probe.csv` | One row per query sent: qtype, entity, current pool, MVP2 direction variant, rep, ok, status, HTTP code, `latency_s`, `result_count`, `kg_nodes`, `kg_edges`, response bytes, ARS `pk`, error. Flushed per row, so a killed run keeps everything it measured. |
+| `<prefix>_entities.csv` | One row per CURIE: median/min/max result count and latency across reps, median graph size, and its `suggested_bin`. Sorted heaviest first. |
+| `<prefix>_bins.json` | The suggested re-binning, per query type: the threshold values and the light/medium/heavy CURIE lists, plus the entities that never answered (`unmeasured` — they are *not* silently binned). |
+| `<prefix>_baselines.json` | **The one output the package itself reads.** Per-CURIE bin + measured result count + `usable`. Copy it over `helmsdeep/mvp_baselines.json` and it becomes both the corpus's tiered pools and the expected result counts a run is checked against. |
+
+### Re-binning the pools
+
+**This is already done for the shipped corpus** — `helmsdeep/mvp_baselines.json`
+holds a profile of all 995 MVP1 diseases and 20 MVP2 entities
+(`profiles/mvp_profile_entities_2026-10-14.csv` is the roll-up it came from), and
+`trapi_corpus.py` builds its pools from it at import. The measured tiers:
+
+| tier | diseases | results | median latency |
+|---|---|---|---|
+| `mvp1_heavy` | 329 | 218 – 1071 | 68s |
+| `mvp1_medium` | 337 | 38 – 217 | 35s |
+| `mvp1_light` | 243 | 1 – 36 | 11s |
+
+So the three MVP1 qtypes now differ in **cost**, not just in weight — they drew
+from the same long-tail pool until this profile existed. 86 further diseases
+answered 0 results and are excluded from sampling (and donepezil, `CHEBI:53289`,
+on the MVP2 chemical side): a query with no answers exercises nothing, and where
+`zero_result_is_failure` is set it would score as a failure every time it was
+drawn.
+
+To adopt a *new* profile, copy its baselines file over the shipped one — nothing
+in `trapi_corpus.py` needs editing:
+
+```bash
+cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
+```
+
+Two knobs decide the split, and both re-run for free against an existing probe
+CSV via `--summarize-only`:
+
+- `--bin-cuts LO,HI` (default `0.33,0.67`) — the quantile boundaries. Cuts are
+  applied **within** a query type, so diseases are ranked against diseases and
+  genes against genes.
+- `--bin-metric` (default `result_count_median`) — bin on
+  `kg_edges_median`/`kg_nodes_median` instead when the service caps results, or
+  on `latency_s_median` to tier by observed cost rather than answer size.
+
+Use `--repeat N` when a single measurement per CURIE is too noisy to trust; the
+roll-up takes the median across reps.
+
+A CURIE that never answered (all probes failed) is reported as `unmeasured`
+rather than being binned on missing data. Re-run with `--resume` to retry just
+those.
 
 ## Running the engine directly
 

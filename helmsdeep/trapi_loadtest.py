@@ -70,6 +70,7 @@ from locust.runners import MasterRunner, WorkerRunner
 import config
 import console
 import error_samples
+import trapi_corpus
 from trapi_corpus import corpus_for
 
 # ----------------------------------------------------------------------------
@@ -131,6 +132,22 @@ _COMPLETION_GREENLETS = []
 # Optional quiet gap between stages (users ramp to 0) so slow in-flight queries
 # drain into the stage that launched them instead of bleeding into the next one.
 COOLDOWN_S = _TGT.get("cooldown_s", 0)
+
+# Result-count expectations (see config.py for the staged rollout and why the
+# tolerance is loose). "off" | "report" (default: measure and report, never
+# fail) | "enforce" (a shortfall also scores as a failure). The CLI's
+# --result-check sets the env var.
+_ENV_CHECK = os.environ.get("HELMSDEEP_RESULT_CHECK")
+if _ENV_CHECK not in config.RESULT_CHECK_MODES:
+    _ENV_CHECK = None       # ignore junk rather than overriding the target
+RESULT_CHECK = (_ENV_CHECK
+                or _TGT.get("result_check")
+                or config.RESULT_CHECK)
+RESULT_SHORTFALL_TOLERANCE = _TGT.get("result_shortfall_tolerance",
+                                      config.RESULT_SHORTFALL_TOLERANCE)
+# A result count is only worth parsing out of a sync response if something reads
+# it. (The ARS path already counts results for its own health signals.)
+COUNT_RESULTS = RESULT_CHECK != "off"
 
 CSV_PREFIX = os.environ.get("LOCUST_CSV_PREFIX", "trapi_run")
 
@@ -243,6 +260,14 @@ class StageCollector:
         # ARS per-query debug log: one row per logical query, carrying the pk and
         # the status codes needed to pull that exact query up afterwards.
         self.queries = []
+        # Result-count expectations: one row per query that had a baseline to be
+        # held to, and the per-stage tallies the summary is built from.
+        self.result_checks = []
+        self.checked = defaultdict(lambda: defaultdict(int))     # stage->qtype->n
+        self.shortfalls = defaultdict(lambda: defaultdict(int))
+        self.surpluses = defaultdict(lambda: defaultdict(int))
+        # Observed/expected per stage, for "answers are degrading as load rises".
+        self.result_ratios = defaultdict(lambda: defaultdict(list))
         # Ids are handed out at submit time and shared by both per-query files,
         # so a row in one joins to its row in the other.
         self._next_query_id = itertools.count()
@@ -310,6 +335,42 @@ class StageCollector:
         if response_bytes is not None:
             self.response_bytes[s][qtype].append(response_bytes)
             self.response_bytes[s]["__all__"].append(response_bytes)
+
+    def record_result_check(self, *, qtype, entity, expected, observed, verdict,
+                            ratio, latency_ms, stage=None):
+        """Record one query's result count against its profiled baseline.
+
+        Tallies only -- whether a shortfall also counts as a *failure* is decided
+        by the caller (RESULT_CHECK), so in "report" mode none of the numbers the
+        knee rests on move.
+        """
+        s = self.stage_idx if stage is None else stage
+        self.checked[s][qtype] += 1
+        self.checked[s]["__all__"] += 1
+        if ratio is not None:
+            self.result_ratios[s][qtype].append(ratio)
+            self.result_ratios[s]["__all__"].append(ratio)
+        if verdict == "short":
+            self.shortfalls[s][qtype] += 1
+            self.shortfalls[s]["__all__"] += 1
+        elif verdict == "over":
+            self.surpluses[s][qtype] += 1
+            self.surpluses[s]["__all__"] += 1
+        if verdict != "ok":
+            # One row per deviation, not per query: the file exists to name the
+            # queries that came back wrong, and on a long run the ok rows would
+            # swamp them (and the disk).
+            self.result_checks.append({
+                "stage": s,
+                "users": (STAGES[s][0] if s < len(STAGES) else ""),
+                "qtype": qtype,
+                "entity": entity,
+                "expected_results": expected,
+                "observed_results": observed,
+                "ratio": (None if ratio is None else round(ratio, 3)),
+                "verdict": verdict,
+                "latency_s": round((latency_ms or 0) / 1000.0, 2),
+            })
 
     def record_completion(self, *, query_id, stage, qtype, total_ms, finished,
                           status, start_ts):
@@ -425,6 +486,84 @@ def _ars_stage_health(idx, qtype="__all__"):
 #    earlier one. A cooldown_s drain gap is the fix; longer holds help too.
 MIN_P99_SAMPLES = 100
 MIN_CONCURRENCY_RATIO = 0.5
+
+
+def _count_sync_results(resp):
+    """Answer count from a sync TRAPI response, or None if unreadable."""
+    try:
+        results = ((resp.json() or {}).get("message") or {}).get("results")
+    except Exception:
+        return None
+    return len(results) if isinstance(results, list) else None
+
+
+def _check_results(qtype, payload, count, latency_ms):
+    """Hold one query's answer count to what the profile measured for it.
+
+    `count` is a callable, not a number: looking up the baseline is a dict hit,
+    while getting the observed count on the sync path means parsing a response
+    that can be megabytes. Queries with no baseline (every KP qtype, Pathfinder,
+    an unprofiled CURIE) therefore cost nothing at all -- the body is never
+    decoded.
+
+    Returns ``(verdict, failed)``. `verdict` is None when there was nothing to
+    check, else "ok"/"short"/"over". `failed` is True only in "enforce" mode and
+    only for a shortfall, so in the default "report" mode this function cannot
+    move the error rate, the knee, or a checkpoint verdict.
+    """
+    if not COUNT_RESULTS:
+        return None, False
+    baseline = trapi_corpus.baseline_for(qtype, payload)
+    if baseline is None:
+        return None, False
+    observed = count()
+    if observed is None:
+        return None, False
+    expected = baseline["results"]
+    ratio = observed / expected
+    if ratio < 1.0 - RESULT_SHORTFALL_TOLERANCE:
+        verdict = "short"
+    elif ratio > 1.0 + RESULT_SHORTFALL_TOLERANCE:
+        # Reported, never failed: the baseline is one measurement of a knowledge
+        # graph that grows, so more answers than last month is not a fault.
+        verdict = "over"
+    else:
+        verdict = "ok"
+    COLLECTOR.record_result_check(
+        qtype=qtype, entity=baseline["entity"], expected=expected,
+        observed=observed, verdict=verdict, ratio=ratio, latency_ms=latency_ms)
+    return verdict, (verdict == "short" and RESULT_CHECK == "enforce")
+
+
+def _shortfall_message(qtype, payload, observed=None):
+    """Human-readable failure text for an enforced shortfall."""
+    baseline = trapi_corpus.baseline_for(qtype, payload) or {}
+    return (f"result shortfall: {observed} of ~{baseline.get('results')} "
+            f"expected answers for {baseline.get('entity')}")
+
+
+def _result_check_stage(idx, qtype="__all__"):
+    """Per-stage result-count row: how many queries had a baseline, and how many
+    came back short of it.
+
+    `median_ratio` is the headline: 1.0 means the stage answered what the
+    profile says it should, 0.6 means it returned 60% of its answers. Watching
+    that fall as users rise is the signal this whole mechanism exists for, and
+    it is visible in "report" mode without any query being scored as a failure.
+    """
+    ratios = COLLECTOR.result_ratios[idx][qtype]
+    checked = COLLECTOR.checked[idx][qtype]
+    short = COLLECTOR.shortfalls[idx][qtype]
+    return {
+        "stage": idx,
+        "users": STAGES[idx][0] if idx < len(STAGES) else "",
+        "checked": checked,
+        "short": short,
+        "over": COLLECTOR.surpluses[idx][qtype],
+        "short_rate": round(short / checked, 4) if checked else 0.0,
+        "median_ratio": round(statistics.median(ratios), 3) if ratios else None,
+        "min_ratio": round(min(ratios), 3) if ratios else None,
+    }
 
 
 def _stage_quality(row):
@@ -564,8 +703,36 @@ class TRAPIUser(HttpUser):
                     error = f"status {resp.status_code}"
                     resp.failure(error)
             latency_ms = resp.request_meta["response_time"] or 0.0
-            COLLECTOR.record(qtype, latency_ms, failed)
-            if failed:
+            # Did it answer with the results the profile says it has? Only
+            # checked on a query that succeeded -- a 502 has no answer count to
+            # judge -- and only when that query has a baseline, so nothing is
+            # parsed for the corpuses that were never profiled.
+            observed = None
+            sampled = False        # a shortfall saves its own sample, below
+            if not failed:
+                def _observed():
+                    nonlocal observed
+                    observed = _count_sync_results(resp)
+                    return observed
+                _verdict, shortfall = _check_results(
+                    qtype, payload, _observed, latency_ms)
+                if shortfall:
+                    failed = True
+                    sampled = True
+                    error = _shortfall_message(qtype, payload, observed)
+                    resp.failure(error)
+                    # A 200 that came back with a third of its answers is the
+                    # one error whose BODY is the evidence -- which agents went
+                    # missing -- so it gets its own sample kind rather than
+                    # landing under http_200.
+                    _sample("result_shortfall", qtype, error, response=resp,
+                            latency_ms=latency_ms,
+                            request=error_samples.describe_request(
+                                resp, method="POST", url=self._url(ENDPOINT),
+                                payload=payload))
+            COLLECTOR.record(qtype, latency_ms, failed,
+                             result_count=observed)
+            if failed and not sampled:
                 # Keep an example of what this failure looked like. Status 0 is
                 # Locust's "no HTTP response at all" (timeout, connection
                 # refused); the kind and message then name the exception.
@@ -694,7 +861,9 @@ class TRAPIUser(HttpUser):
         same full wall-clock (the submit/poll/merge HTTP calls also show
         separately in Locust's own table for diagnostics, but are not
         double-counted as the query time). A Done with 0 results is a failure
-        unless the target sets zero_result_is_failure=False.
+        unless the target sets zero_result_is_failure=False; a Done whose answer
+        count falls short of the profiled baseline is reported, and fails only
+        under RESULT_CHECK="enforce".
         """
         start = time.time()
         query_id = COLLECTOR.new_query_id()
@@ -812,22 +981,39 @@ class TRAPIUser(HttpUser):
             # Whether an empty answer set scores against the error rate (and so
             # the knee) is a per-target policy -- see ZERO_RESULT_IS_FAILURE.
             failed = zero_result and ZERO_RESULT_IS_FAILURE
+            # The same query also has a profiled answer count to live up to. The
+            # count is already in hand here, so the check is a dict lookup.
+            # Note the overlap at the bottom of the range: a 0-result Done is
+            # also the most extreme shortfall there is, so under "enforce" it
+            # fails on that ground even where zero_result_is_failure is False.
+            verdict, shortfall = _check_results(
+                qtype, payload, lambda: result_count, _elapsed_ms())
+            failed = failed or shortfall
+            note = ("Done with 0 results" if zero_result
+                    else (_shortfall_message(qtype, payload, result_count)
+                          if verdict == "short" else None))
             self._record_ars(
-                qtype, _elapsed_ms(), failed=failed,
-                exc_msg=("Done with 0 results" if zero_result else None),
+                qtype, _elapsed_ms(), failed=failed, exc_msg=note,
                 status="Done", result_count=result_count, response_bytes=nbytes,
             )
             sample = None
-            if zero_result:
+            # A shortfall is sampled only when it was actually scored as a
+            # failure: the ERROR SAMPLES block lists what went wrong, and in
+            # "report" mode nothing did -- the deviation is in
+            # <prefix>_result_checks.csv instead. A 0-result Done is sampled
+            # either way, as it always was.
+            if zero_result or shortfall:
                 # Sampled whichever way the policy scores it: an empty answer
                 # set is still the thing you would open this pk to explain.
                 sample = _sample(
-                    "ars_done_zero_results", qtype, "Done with 0 results",
+                    ("ars_done_zero_results" if zero_result
+                     else "ars_result_shortfall"), qtype, note,
                     response=merged, request=submit_req, stage=stage,
                     latency_ms=_elapsed_ms(),
                     extra={**_ars_ctx("merge", merged_pk=merged_pk, polls=polls,
                                       merge_http=merge_http,
                                       scored_as_failure=failed,
+                                      result_count=result_count,
                                       intermediate_errors=issues.summary()),
                            # Decoded only when a file might be written.
                            "last_poll": (error_samples.describe_response(
@@ -838,8 +1024,7 @@ class TRAPIUser(HttpUser):
                                # agrees with how the query was actually scored;
                                # the note is recorded either way, since an empty
                                # answer set is still why you'd open this pk.
-                               failed=failed,
-                               error=("Done with 0 results" if zero_result else None),
+                               failed=failed, error=note,
                                submit_http=submit_http, poll_http=poll_http,
                                merge_http=merge_http, polls=polls,
                                result_count=result_count, response_bytes=nbytes,
@@ -1136,6 +1321,42 @@ def on_test_stop(environment, **_kw):
     # Pass/fail acceptance checkpoints (targets that configure them).
     checkpoints = _evaluate_checkpoints(overall_rows)
 
+    # Result-count expectations: per-stage roll-up + the deviation rows. Empty
+    # when the mode is "off", and also when nothing the corpus sent had a
+    # profiled baseline (every KP qtype, Pathfinder) -- in which case there is
+    # nothing to report and no block is printed.
+    result_rows = [_result_check_stage(idx) for idx in seen_stages]
+    result_checked = sum(r["checked"] for r in result_rows)
+    result_summary = None
+    if RESULT_CHECK != "off" and result_checked:
+        short_total = sum(r["short"] for r in result_rows)
+        ratios = [x for idx in seen_stages
+                  for x in COLLECTOR.result_ratios[idx]["__all__"]]
+        # How far short the shortfalls fell. This is the distribution an
+        # operator reads before deciding where to set the bar for "enforce".
+        bands = {"under_10pct": 0, "under_25pct": 0, "under_50pct": 0,
+                 "under_75pct": 0}
+        for x in ratios:
+            if x < 0.10: bands["under_10pct"] += 1
+            elif x < 0.25: bands["under_25pct"] += 1
+            elif x < 0.50: bands["under_50pct"] += 1
+            elif x < 0.75: bands["under_75pct"] += 1
+        result_summary = {
+            "mode": RESULT_CHECK,
+            "shortfall_tolerance": RESULT_SHORTFALL_TOLERANCE,
+            "baseline_source": trapi_corpus.BASELINES_FILE,
+            "baseline_generated_utc": trapi_corpus.BASELINES.get("generated_utc"),
+            "checked": result_checked,
+            "short": short_total,
+            "over": sum(r["over"] for r in result_rows),
+            "short_rate": round(short_total / result_checked, 4),
+            "median_ratio": (round(statistics.median(ratios), 3) if ratios
+                             else None),
+            "observed_over_expected_bands": bands,
+            "scored_as_failures": RESULT_CHECK == "enforce",
+            "per_stage": result_rows,
+        }
+
     # ARS health signals + red flags (async target only).
     ars_health = []
     red_flags = []
@@ -1233,6 +1454,19 @@ def on_test_stop(environment, **_kw):
                 # so the naive CSV writer can't produce a ragged row.
                 f.write(",".join(str(r[k]).replace(",", ";") for k in kfields) + "\n")
 
+    # Write the result-check CSV: one row per query that deviated from its
+    # profiled answer count (not per query checked -- on a long run the
+    # in-spec rows would bury the interesting ones). Named CURIEs, so a
+    # shortfall can be reproduced by hand.
+    rcfields = ["stage", "users", "qtype", "entity", "expected_results",
+                "observed_results", "ratio", "verdict", "latency_s"]
+    if result_summary and COLLECTOR.result_checks:
+        with open(f"{CSV_PREFIX}_result_checks.csv", "w") as f:
+            f.write(",".join(rcfields) + "\n")
+            for r in COLLECTOR.result_checks:
+                f.write(",".join("" if r[k] is None else str(r[k])
+                                 for k in rcfields) + "\n")
+
     # Write ARS health CSV (async target only).
     hfields = ["stage", "requests", "done", "errored", "timed_out",
                "submit_failed", "zero_result_done", "results_min",
@@ -1303,6 +1537,10 @@ def on_test_stop(environment, **_kw):
         # examples of each live -- see error_samples.py.
         "error_samples": error_summary,
     }
+    if result_summary:
+        summary["config"]["result_check"] = RESULT_CHECK
+        summary["config"]["result_shortfall_tolerance"] = RESULT_SHORTFALL_TOLERANCE
+        summary["results"] = result_summary
     if checkpoints:
         summary["config"]["checkpoints"] = CHECKPOINTS
         summary["checkpoints"] = checkpoints
@@ -1377,6 +1615,44 @@ def on_test_stop(environment, **_kw):
                 "stage that launched them")
         print(f"  Fix in config.py under '{TARGET}': " + "; and ".join(remedies)
               + ".")
+
+    # Did the answers hold up? In the default "report" mode none of this moved
+    # a single number above -- it is the staging ground for enforcement.
+    if result_summary:
+        print("-" * 64)
+        scored = ("SCORED AS FAILURES" if RESULT_CHECK == "enforce"
+                  else "report only -- no query was failed, no number above moved")
+        print(f"RESULT COUNTS vs PROFILED BASELINE ({scored})")
+        print(f"  baseline: {trapi_corpus.BASELINES_FILE}"
+              + (f" (profiled {trapi_corpus.BASELINES.get('generated_utc')})"
+                 if trapi_corpus.BASELINES.get("generated_utc") else "")
+              + f"; short = below {(1 - RESULT_SHORTFALL_TOLERANCE) * 100:.0f}%"
+              f" of expected")
+        print(f"{'stg':>4} {'usr':>4} {'checked':>8} {'short':>6} "
+              f"{'short%':>7} {'median':>7} {'worst':>7}")
+        for r in result_rows:
+            if not r["checked"]:
+                continue
+            med = "-" if r["median_ratio"] is None else f"{r['median_ratio']:.2f}"
+            low = "-" if r["min_ratio"] is None else f"{r['min_ratio']:.2f}"
+            print(f"{r['stage']:>4} {r['users']:>4} {r['checked']:>8} "
+                  f"{r['short']:>6} {r['short_rate'] * 100:>6.1f}% "
+                  f"{med:>7} {low:>7}")
+        print(f"  median observed/expected across the run: "
+              f"{result_summary['median_ratio']}  "
+              f"({result_summary['short']} of {result_summary['checked']} short, "
+              f"{result_summary['over']} over)")
+        bands = result_summary["observed_over_expected_bands"]
+        if any(bands.values()):
+            print("  how far short: "
+                  + ", ".join(f"{v} under {k.split('_')[1]}"
+                              for k, v in bands.items() if v))
+        if COLLECTOR.result_checks:
+            print(f"  {len(COLLECTOR.result_checks)} deviation(s) named with "
+                  f"their CURIEs in {CSV_PREFIX}_result_checks.csv")
+        if RESULT_CHECK != "enforce" and result_summary["short"]:
+            print("  To make these count against the error rate and the knee: "
+                  "--result-check enforce")
 
     if checkpoints:
         print("-" * 64)

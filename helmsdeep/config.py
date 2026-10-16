@@ -33,6 +33,12 @@ Fields:
                optional per-HTTP-call timeout (default 210). Raise it on sync
                targets whose p99_slo_ms sits near or above the default, or every
                slow query is recorded as a client timeout instead of a latency.
+  result_check optional per-target override of config.RESULT_CHECK
+               ("off"/"report"/"enforce"); and result_shortfall_tolerance
+               overrides config.RESULT_SHORTFALL_TOLERANCE. Both default to the
+               shared values above. Targets whose corpus has no profiled
+               baselines (kps, the Pathfinder run types) check nothing whatever
+               the mode says, because no query they send has an expectation.
   checkpoints  optional list of pass/fail acceptance criteria, evaluated against
                the stage running that many users. Turns a run from "find the
                knee" into "does the system hold N concurrent queries?" -- the
@@ -73,6 +79,42 @@ Async (``ars``) targets add:
 
 # Shared across all targets: a stage also needs error_rate <= this to be a knee.
 MAX_ERROR_RATE = 0.01   # 1%
+
+# ---------------------------------------------------------------------------
+# Result-count expectations.
+#
+# `helmsdeep-profile` measured what every MVP1/MVP2 query answers when nothing
+# else is happening (helmsdeep/mvp_baselines.json). A run can therefore ask a
+# question it never could before: did this query come back with the answers it
+# is supposed to have? A service under load that quietly returns a third of its
+# results is broken in a way neither latency nor HTTP status shows.
+#
+# Rolled out in stages, because scoring answers as failures changes the knee:
+#
+#   "off"      don't look. No parsing of result counts on the sync path.
+#   "report"   (default) check every query that has a baseline, write
+#              <prefix>_result_checks.csv + a printed summary and a `results`
+#              block in summary.json -- but never fail a query. The error rate,
+#              the knee and every checkpoint verdict are exactly what they were
+#              before this existed.
+#   "enforce"  a shortfall additionally scores as a failure, so it counts
+#              against the error rate and therefore the knee.
+#
+# Only a SHORTFALL counts. Coming back with more answers than the baseline is
+# not a fault (the baseline is one measurement, and a growing knowledge graph
+# answers more over time), so it is reported separately and never fails.
+#
+# The tolerance is loose on purpose. In the profiling pass the same query run
+# twice against an idle service differed by up to 41%, with one repeat landing
+# 20% below its own median -- so a bar tighter than that flags ordinary
+# non-determinism as breakage. 0.5 means "fewer than half the expected answers",
+# which is the scale of a downstream agent dropping out rather than noise.
+# Tighten it once a `report` run on your own service shows the real spread (the
+# printed summary buckets the shortfalls for exactly that reason).
+# ---------------------------------------------------------------------------
+RESULT_CHECK_MODES = ("off", "report", "enforce")
+RESULT_CHECK = "report"
+RESULT_SHORTFALL_TOLERANCE = 0.5
 
 # Error samples (error_samples.py): full request/response examples of every
 # distinct error kind, saved under <prefix>_errors/ as they happen so a run can
