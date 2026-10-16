@@ -175,9 +175,9 @@ TARGETS = {
         # Creative (inferred) reasoning is far heavier -- gentler ramp, longer
         # holds (slow queries need time to accumulate samples), looser p99.
         "stages": [
-            # (2,  1, 300),  # 5 mins
-            # (3,  1, 300),  # 5 mins
-            (5,  2, 330),  # 5.5 mins
+            (2,  1, 300),  # 5 mins
+            (5,  2, 300),  # 5 mins
+            (10, 2, 330),  # 5.5 mins
             (30, 2, 360),  # 6 mins
             (45, 5, 420),  # 7 mins
             (60, 5, 600),  # 10 mins
@@ -202,9 +202,9 @@ TARGETS = {
         "zero_result_is_failure": False,
         # Runs take minutes -- very low concurrency, long holds.
         "stages": [
-            # (2,  1, 300),  # 5 mins
-            # (5,  1, 300),  # 5 mins
-            # (10, 2, 330),  # 5.5 mins
+            (2,  1, 300),  # 5 mins
+            (5,  1, 300),  # 5 mins
+            (10, 2, 330),  # 5.5 mins
             (30, 2, 360),  # 6 mins
             (45, 5, 420),  # 7 mins
             (60, 5, 600),  # 10 mins
