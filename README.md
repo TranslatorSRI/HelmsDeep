@@ -364,10 +364,16 @@ system hold a target concurrency when both query classes arrive together, the wa
 they do in production?**
 
 - **Corpus** — one blended workload: **2/3 inferred MVP1+MVP2** creative queries
-  and **1/3 Pathfinder**. MVP1/MVP2 keep their relative `SHEPHERD_CORPUS` weights
-  (so retuning that mix carries over); only the 2:1 split is imposed.
-  `by_qtype.csv` still breaks the two classes out separately, so you can see
-  which one drives the tail.
+  and **1/3 Pathfinder**, split by **concurrent users**: each user is pinned to
+  one class for the whole run, so at 30 users 20 are always running inferred
+  queries and 10 are always running Pathfinder. (A per-request 2:1 draw doesn't
+  hold that split. Inferred users finish fast and re-roll, the ones that rolled
+  Pathfinder stay stuck on it, and the in-flight mix drifts toward nearly all
+  Pathfinder.) MVP1/MVP2 keep their relative `SHEPHERD_CORPUS` weights within
+  the inferred users. Because the fast class completes far more queries, the
+  *request* counts lean heavily inferred; that's expected. `by_class.csv` (and a
+  printed BY QUERY CLASS block) reports each class on its own. Its `concurrency`
+  column should sit near that class's share of the users.
 - **Ramp** — a short low-load baseline stage, then the three concurrency levels
   the profile exists to judge: **30 → 45 → 60** simultaneous users. The baseline
   exists so a failure at 30 can be read against a healthy reference (is 30 slow,
@@ -759,10 +765,14 @@ quick visual feel and for sharing a screenshot.
   gentlest ramps and loosest SLOs (and, for `ars_pathfinder`, the longest
   `max_poll_s`); tune them in `config.py`.
 - **The mixed profile blends the two ARA/ARS classes** (`aras_mixed` /
-  `ars_mixed`). `MIXED_CORPUS` is *computed* from `SHEPHERD_CORPUS` +
-  `PATHFINDER_CORPUS` at the `INFERRED_PATHFINDER_RATIO` (2:1), so it tracks any
-  retuning of the inferred mix. Change the blend by editing that ratio; change
+  `ars_mixed`) by giving each its own Locust user class (`InferredUser` /
+  `PathfinderUser`), weighted by `INFERRED_PATHFINDER_RATIO` (2:1) in
+  `trapi_corpus.MIXED_CLASSES`. Change the blend by editing that ratio; change
   what counts as a pass by editing the per-target `checkpoints` in `config.py`.
+  Each checkpoint judges the pooled p99 **and** each class's own p99 (bar:
+  `class_p99_slo_ms[class]`, defaulting to the checkpoint's `p99_slo_ms`),
+  because the pooled p99 is mostly inferred and could hide a Pathfinder
+  regression.
   Because 1/3 of the mix is Pathfinder — the heaviest class — and p99 is a tail
   statistic, both mixed targets inherit the looser Pathfinder SLO. `aras_mixed`
   also raises `request_timeout_s` above the default 210 s: a sync target whose p99

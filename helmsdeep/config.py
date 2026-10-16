@@ -50,6 +50,12 @@ Fields:
                                  (an overload probe where slowdown is expected
                                  but failures are not)
                  max_error_rate  error-rate bar; omit to inherit MAX_ERROR_RATE
+                 class_p99_slo_ms
+                                 mixed profile only: {query class: p99 bar}.
+                                 Each class's own p99 is judged too, because
+                                 the pooled p99 is mostly the faster class's;
+                                 a class left out inherits this checkpoint's
+                                 p99_slo_ms (None = not judged)
                Results land in <prefix>_checkpoints.csv, the summary JSON, and
                the printed report; any failed checkpoint sets a non-zero exit code.
 
@@ -169,9 +175,9 @@ TARGETS = {
         # Creative (inferred) reasoning is far heavier -- gentler ramp, longer
         # holds (slow queries need time to accumulate samples), looser p99.
         "stages": [
-            # (2,  1, 300),  # 5 mins
-            # (3,  1, 300),  # 5 mins
-            (5,  2, 330),  # 5.5 mins
+            (2,  1, 300),  # 5 mins
+            (5,  2, 300),  # 5 mins
+            (10, 2, 330),  # 5.5 mins
             (30, 2, 360),  # 6 mins
             (45, 5, 420),  # 7 mins
             (60, 5, 600),  # 10 mins
@@ -196,9 +202,9 @@ TARGETS = {
         "zero_result_is_failure": False,
         # Runs take minutes -- very low concurrency, long holds.
         "stages": [
-            # (2,  1, 300),  # 5 mins
-            # (5,  1, 300),  # 5 mins
-            # (10, 2, 330),  # 5.5 mins
+            (2,  1, 300),  # 5 mins
+            (5,  1, 300),  # 5 mins
+            (10, 2, 330),  # 5.5 mins
             (30, 2, 360),  # 6 mins
             (45, 5, 420),  # 7 mins
             (60, 5, 600),  # 10 mins
@@ -229,7 +235,9 @@ TARGETS = {
         "request_timeout_s": 400,
     },
     # Mixed profile (ARA + ARS): 2/3 inferred MVP1+MVP2, 1/3 Pathfinder, run as
-    # one blended workload. Unlike the other targets -- which characterize a
+    # one blended workload. The split is of concurrent USERS (each user is
+    # pinned to one class -- see trapi_corpus.MIXED_CLASSES), so at 30 users
+    # 20 run inferred and 10 run Pathfinder throughout. Unlike the other targets -- which characterize a
     # single query class to FIND the knee -- this one answers a pass/fail
     # capacity question at three named concurrency checkpoints (see
     # ``checkpoints`` below). The knee is still computed and reported.
