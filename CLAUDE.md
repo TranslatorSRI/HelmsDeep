@@ -62,6 +62,8 @@ The one place the classes *are* combined is the **mixed capacity profile**
 (`aras_mixed`/`ars_mixed`): a deliberate 2/3 inferred + 1/3 Pathfinder blend that
 asks whether the system holds a target concurrency under the workload mix
 production actually sends, rather than characterizing one class in isolation.
+The 2:1 is a split of **concurrent users**, not of requests: each user is pinned
+to one class (see `MIXED_CLASSES` below).
 
 ### Retriever and the `tier` parameter
 
@@ -178,8 +180,9 @@ Package `helmsdeep/`:
   `request_timeout_s` (per-HTTP-call timeout, default 210; raised on `aras_mixed`
   so its 5-min p99 SLO is measurable instead of landing as client timeouts) and
   `checkpoints` — a list of pass/fail acceptance criteria (`users`, `goal`,
-  `p99_slo_ms`, `max_error_rate`) evaluated against the stage that ran that many
-  users. `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
+  `p99_slo_ms`, `max_error_rate`, and on the mixed profile an optional
+  `class_p99_slo_ms` per-class bar) evaluated against the stage that ran that
+  many users. `MAX_ERROR_RATE` is shared; `DEFAULT_TARGET="kps"`.
   Also shared: the result-count expectation knobs `RESULT_CHECK`
   (`off`/`report`/`enforce`, default **`report`**) and
   `RESULT_SHORTFALL_TOLERANCE` (default 0.5), with per-target overrides
@@ -346,12 +349,22 @@ Package `helmsdeep/`:
     freeze isn't overwritten by the next `mark_stage`; both take an optional
     `when` the shape uses to back-date them to the exact ramp boundary).
     `record()` also takes optional ARS signals: `status`, `result_count`,
-    `response_bytes`.
+    `response_bytes`. On a multi-class target it also buckets requests/errors/
+    latencies under `class:<name>` (via `CLASS_KEY`), which is what
+    `by_class.csv` and the per-class checkpoint p99 read.
     `begin_inflight()`/`end_inflight()` track logical queries currently running,
     for the live display only -- no report reads them.
   - `_stage_stats()` — per-stage RPS, percentiles, error rate, Little's-Law
     concurrency. `_ars_stage_health()` — per-stage ARS health row.
-  - `TRAPIUser(HttpUser)` — dispatches on `PROTOCOL`: `_run_sync()` (KP/ARA: one
+  - `TRAPIUser(HttpUser)` — **abstract**; the runnable user classes are
+    generated from `USER_CLASSES` (`trapi_corpus.user_classes_for`) and bound
+    into module globals so Locust discovers them: one class per query class,
+    weighted by its share of users, each with its own flattened corpus
+    (`_flat`). A single-class target gets one (`RetrieverUser`,
+    `ShepherdUser`, …); the mixed profile gets `InferredUser` (weight 2) +
+    `PathfinderUser` (weight 1), and Locust's dispatcher holds that split
+    exactly (20/10 at 30 users). `query()` draws from `self._flat`, then
+    dispatches on `PROTOCOL`: `_run_sync()` (KP/ARA: one
     blocking `POST`) or `_run_ars()` (submit → poll `/messages/{pk}` with
     `gevent.sleep` until `Done`/`Error`/timeout → `_fetch_merged()` counts
     `fields.data.message.results` and returns its HTTP status). One
@@ -406,7 +419,10 @@ Package `helmsdeep/`:
     QUALITY block, and a caveat on the final headline when the knee rests on a
     flagged stage.
   - `_evaluate_checkpoints()` — for targets that configure `checkpoints`, judges
-    each one against the stage matching its user count and returns a
+    each one against the stage matching its user count (and, on the mixed
+    profile, each query class's own p99 via `_class_p99s`, bar
+    `class_p99_slo_ms[cls]` defaulting to the checkpoint's; a judged class
+    with no completed requests is a miss) and returns a
     `PASS`/`FAIL`/`NO DATA` verdict (a checkpoint's `p99_slo_ms` defaults to the
     target's; explicit `None` means latency isn't judged — an overload probe where
     slowdown is expected but failures aren't).
@@ -456,11 +472,18 @@ Package `helmsdeep/`:
     and asks for connecting paths via a `paths` map in the query_graph — built by
     `_pathfinder_qg(nodes, paths)` (`nodes` + empty `edges` + `paths`; no
     `knowledge_type`, no `tier`; `bypass_cache=True`). Most intensive query class.
-  - **`MIXED_CORPUS`** — the mixed capacity profile (`aras_mixed`/`ars_mixed`).
-    Not hand-written: `_mixed_corpus()` blends `SHEPHERD_CORPUS` and
-    `PATHFINDER_CORPUS` at `INFERRED_PATHFINDER_RATIO = (2, 1)` — 2/3 inferred
-    MVP1+MVP2, 1/3 Pathfinder — preserving each corpus's internal weights, so
-    retuning the MVP1/MVP2 mix propagates here automatically.
+  - **`MIXED_CLASSES`** — the mixed capacity profile (`aras_mixed`/`ars_mixed`):
+    `[("inferred", SHEPHERD_CORPUS, 2), ("pathfinder", PATHFINDER_CORPUS, 1)]`,
+    weights from `INFERRED_PATHFINDER_RATIO = (2, 1)`. The weights split
+    **users**, not requests: each user stays in one class, and within a class
+    draws per request from that corpus (so MVP1/MVP2 retuning propagates). It
+    used to be one blended list drawn per request, and in a closed loop that
+    doesn't hold the mix. Inferred users finished fast and re-rolled, the ones
+    that rolled Pathfinder stayed stuck, and the in-flight share drifted to
+    ~`L_pf / (L_pf + 2·L_inf)` (~80% Pathfinder), worse as saturation slowed
+    Pathfinder further. `MIXED_CORPUS` is now just the union of the two, for
+    code that lists qtypes. `user_classes_for(name)` returns the split (a single
+    `(name, corpus, 1)` class for every other corpus).
   - Entity pools, now **measured** rather than curated. `mvp_baselines.json`
     (shipped via `package_data`, written by `helmsdeep-profile`) carries one
     record per CURIE — its measured `results`, `latency_s`, its `bin`, and
@@ -581,7 +604,10 @@ cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
   to a wall clock; see the conventions note below for what that costs.
 - Outputs (written by the master/standalone node only):
   `<prefix>_stages.csv`, `<prefix>_by_qtype.csv`, `<prefix>_summary.json`
-  (+ `<prefix>_checkpoints.csv` for checkpointed targets)
+  (+ `<prefix>_checkpoints.csv` for checkpointed targets, with a
+  `class_p99_ms` column on the mixed profile) (+ `<prefix>_by_class.csv` and a
+  `by_class` summary block for the mixed profile -- one row per (stage, query
+  class))
   (+ `<prefix>_result_checks.csv` whenever anything the run sent had a profiled
   baseline -- one row per answer-count deviation, with the CURIE) (+
   `<prefix>_ars_health.csv`, the `<prefix>_ars_queries.csv` per-query debug log,
@@ -600,7 +626,9 @@ cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
   pass/fail question at named concurrency levels ("does 30 hold?") and exits
   non-zero on a miss. `aras_mixed`/`ars_mixed` are the acceptance profile: a 2:1
   inferred/Pathfinder blend checked at 30 (peak) / 45 (headroom) / 60 (overload,
-  error-rate only). Checkpoints are generic, not special-cased to that profile --
+  error-rate only). The blend is of *users*, so the request counts lean hard
+  toward inferred (its users finish more queries) and the pooled p99 is mostly
+  inferred latency; that's why each class's p99 is judged on its own too. Checkpoints are generic, not special-cased to that profile --
   a target without them behaves exactly as before.
 - **A stage's `duration_s` is its load window, never its drain.** Every stage's
   end is frozen when its *load* stops: at the cooldown gap for stages that have

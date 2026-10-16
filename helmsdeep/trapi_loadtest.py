@@ -71,7 +71,7 @@ import config
 import console
 import error_samples
 import trapi_corpus
-from trapi_corpus import corpus_for
+from trapi_corpus import corpus_for, user_classes_for
 
 # ----------------------------------------------------------------------------
 # Configuration. Per-target load + SLO live in config.py (cost profiles differ
@@ -94,6 +94,15 @@ if _BUDGET_S:
 
 ENDPOINT = _TGT["endpoint"]    # request path for this component
 CORPUS = corpus_for(_TGT["corpus"])   # query subset for this component
+# How users are split across query classes: [(class, corpus, user weight)]. One
+# class for every target except the mixed profile, which pins each user to
+# either inferred or Pathfinder so the in-flight mix holds (trapi_corpus.py).
+USER_CLASSES = user_classes_for(_TGT["corpus"])
+MULTI_CLASS = len(USER_CLASSES) > 1
+# qtype -> collector key of its class ("class:pathfinder"); empty for a
+# single-class target, whose per-class stats would just repeat "__all__".
+CLASS_KEY = ({qt: f"class:{cls}" for cls, corpus, _ in USER_CLASSES
+              for qt, _, _ in corpus} if MULTI_CLASS else {})
 STAGES = _TGT["stages"]               # per-target step-load ramp
 P99_SLO_MS = _TGT["p99_slo_ms"]       # per-target knee threshold
 MAX_ERROR_RATE = config.MAX_ERROR_RATE   # shared error-rate cap
@@ -196,9 +205,13 @@ def _reset_error_samples(environment, **_kw):
 
 # Weighted, flattened corpus for O(1)-ish random selection.
 import random
-_FLAT = []
-for qtype, builder, weight in CORPUS:
-    _FLAT.extend([(qtype, builder)] * weight)
+
+
+def _flatten(corpus):
+    flat = []
+    for qtype, builder, weight in corpus:
+        flat.extend([(qtype, builder)] * weight)
+    return flat
 
 
 # ----------------------------------------------------------------------------
@@ -316,14 +329,16 @@ class StageCollector:
     def record(self, qtype, latency_ms, failed, *,
                status=None, result_count=None, response_bytes=None):
         s = self.stage_idx
-        self.requests[s][qtype] += 1
-        self.requests[s]["__all__"] += 1
-        if failed:
-            self.errors[s][qtype] += 1
-            self.errors[s]["__all__"] += 1
-        else:
-            self.samples[s][qtype].append(latency_ms)
-            self.samples[s]["__all__"].append(latency_ms)
+        # The mixed profile also buckets by query class, so each class can be
+        # judged on its own (the pooled p99 is mostly the faster class's).
+        keys = (qtype, "__all__") + ((CLASS_KEY[qtype],) if qtype in CLASS_KEY
+                                     else ())
+        for key in keys:
+            self.requests[s][key] += 1
+            if failed:
+                self.errors[s][key] += 1
+            else:
+                self.samples[s][key].append(latency_ms)
         # Optional ARS health signals (recorded regardless of pass/fail so a
         # zero-result "Done" still shows up in the distributions).
         if status is not None:
@@ -595,7 +610,32 @@ def _stage_quality(row):
     return issues
 
 
-def _evaluate_checkpoints(overall_rows):
+def _class_p99s(cp, class_rows, users, default_bar):
+    """Per-class p99s at `users`, and the misses against each class's bar.
+
+    Only for the mixed profile. A class's bar is ``class_p99_slo_ms[cls]`` on
+    the checkpoint, else the checkpoint's own p99 bar (None = not judged).
+    Pooled, the p99 is mostly the fast class -- fixed users per class mean the
+    inferred users complete many more queries -- so a Pathfinder regression
+    can hide under a pooled bar; judging each class closes that.
+    """
+    bars = cp.get("class_p99_slo_ms", {})
+    p99s, misses = {}, []
+    for cls, _corpus, _w in USER_CLASSES:
+        row = class_rows.get((users, cls))
+        bar = bars.get(cls, default_bar)
+        if row is None or not row["requests"]:
+            p99s[cls] = None
+            if bar is not None:
+                misses.append(f"no completed {cls} requests")
+            continue
+        p99s[cls] = row["p99_ms"]
+        if bar is not None and row["p99_ms"] > bar:
+            misses.append(f"{cls} p99 {row['p99_ms']:.0f}ms > {bar}ms")
+    return p99s, misses
+
+
+def _evaluate_checkpoints(overall_rows, class_rows=()):
     """Judge each configured checkpoint against the stage that ran its user count.
 
     A checkpoint asks a pass/fail question ("does 30 concurrent hold?") rather
@@ -606,6 +646,8 @@ def _evaluate_checkpoints(overall_rows):
     """
     # Match on user count; if two stages ran the same count, the later one wins.
     by_users = {r["users"]: r for r in overall_rows if r["users"] is not None}
+    by_class = {(r["users"], r["class"]): r for r in class_rows
+                if r["users"] is not None}
     results = []
     for cp in CHECKPOINTS:
         users = cp["users"]
@@ -622,6 +664,7 @@ def _evaluate_checkpoints(overall_rows):
             results.append({**base, "stage": row["stage"] if row else None,
                             "requests": row["requests"] if row else 0,
                             "p99_ms": None, "error_rate": None, "concurrency": None,
+                            "class_p99_ms": None,
                             "verdict": "NO DATA",
                             "detail": f"no completed requests at {users} users"})
             continue
@@ -631,6 +674,10 @@ def _evaluate_checkpoints(overall_rows):
         if row["error_rate"] > err_bar:
             misses.append(f"errors {row['error_rate'] * 100:.2f}% > "
                           f"{err_bar * 100:.2f}%")
+        class_p99 = None
+        if MULTI_CLASS:
+            class_p99, class_misses = _class_p99s(cp, by_class, users, p99_bar)
+            misses.extend(class_misses)
         results.append({
             **base,
             "stage": row["stage"],
@@ -638,6 +685,7 @@ def _evaluate_checkpoints(overall_rows):
             "p99_ms": row["p99_ms"],
             "error_rate": row["error_rate"],
             "concurrency": row["concurrency"],
+            "class_p99_ms": class_p99,
             "verdict": "FAIL" if misses else "PASS",
             "detail": "; ".join(misses) if misses else "within limits",
         })
@@ -649,7 +697,11 @@ def _evaluate_checkpoints(overall_rows):
 # Sync targets (KP/ARA) POST once; the ARS target submits then polls/merges.
 # ----------------------------------------------------------------------------
 class TRAPIUser(HttpUser):
+    """One concurrent user. Abstract: the runnable classes are generated below,
+    one per query class, each carrying its own corpus."""
+    abstract = True
     wait_time = constant(0)   # closed-loop; shape controls concurrency
+    _flat = []                # this class's weighted, flattened corpus
 
     @task
     def query(self):
@@ -663,7 +715,7 @@ class TRAPIUser(HttpUser):
         if _draining():
             gevent.sleep(DRAIN_RECHECK_S)
             return
-        qtype, builder = random.choice(_FLAT)
+        qtype, builder = random.choice(self._flat)
         payload = builder()
         token = COLLECTOR.begin_inflight(qtype)
         try:
@@ -1163,6 +1215,21 @@ def _set_stop_timeout(environment, **_kw):
         environment.stop_timeout = REQUEST_TIMEOUT
 
 
+# One runnable Locust user class per query class, weighted by its share of the
+# users. Locust discovers user classes from this module's globals, so they are
+# bound here by name (InferredUser, PathfinderUser, ShepherdUser, ...). A user
+# never changes class, so the mixed profile's in-flight split is the user
+# split -- 20/10 at 30 users -- however long either class's queries take.
+for _cls, _corpus, _weight in USER_CLASSES:
+    _name = "".join(p.title() for p in _cls.split("_")) + "User"
+    globals()[_name] = type(_name, (TRAPIUser,), {
+        "abstract": False,
+        "weight": _weight,
+        "_flat": _flatten(_corpus),
+        "__module__": __name__,
+    })
+
+
 # ----------------------------------------------------------------------------
 # Step-load shape. tick() returns (user_count, spawn_rate) or None to stop.
 # It also tells the collector which stage is active.
@@ -1260,6 +1327,14 @@ class StepLoad(LoadTestShape):
 # On test stop, compute per-stage stats, find the knee, write outputs.
 # Only the master/standalone node writes files.
 # ----------------------------------------------------------------------------
+def _fmt_class_p99(p99s, sep=";"):
+    """{"inferred": 41000.0, "pathfinder": None} -> 'inferred=41000;pathfinder=-'."""
+    if not p99s:
+        return ""
+    return sep.join(f"{cls}={'-' if v is None else f'{v:.0f}'}"
+                    for cls, v in p99s.items())
+
+
 @events.test_stop.add_listener
 def on_test_stop(environment, **_kw):
     if isinstance(environment.runner, WorkerRunner):
@@ -1293,11 +1368,17 @@ def on_test_stop(environment, **_kw):
     seen_stages = sorted(COLLECTOR.requests.keys())
     qtypes = [c[0] for c in CORPUS]
 
+    class_rows = []   # mixed profile only: one row per (stage, query class)
     for idx in seen_stages:
         overall_rows.append(_stage_stats(idx, "__all__"))
         for qt in qtypes:
             if COLLECTOR.requests[idx].get(qt):
                 qtype_rows.append(_stage_stats(idx, qt))
+        if MULTI_CLASS:
+            for cls, _corpus, _w in USER_CLASSES:
+                row = _stage_stats(idx, f"class:{cls}")
+                row["class"] = cls
+                class_rows.append(row)
 
     # Knee = highest stage meeting BOTH p99 SLO and error-rate cap.
     knee = None
@@ -1319,7 +1400,7 @@ def on_test_stop(environment, **_kw):
         knee and any(w["stage"] == knee["stage"] for w in stage_warnings))
 
     # Pass/fail acceptance checkpoints (targets that configure them).
-    checkpoints = _evaluate_checkpoints(overall_rows)
+    checkpoints = _evaluate_checkpoints(overall_rows, class_rows)
 
     # Result-count expectations: per-stage roll-up + the deviation rows. Empty
     # when the mode is "off", and also when nothing the corpus sent had a
@@ -1443,13 +1524,26 @@ def on_test_stop(environment, **_kw):
         for r in qtype_rows:
             f.write(",".join(str(r[k]) for k in qfields) + "\n")
 
+    # Write the per-class CSV (mixed profile only). Same columns as by_qtype,
+    # one level up: its `concurrency` is how many users of that class were
+    # actually busy, i.e. the in-flight mix the user split is there to hold.
+    cfields = ["stage", "class", "users", "requests", "errors", "error_rate",
+               "rps", "mean_ms", "p50_ms", "p95_ms", "p99_ms", "concurrency"]
+    if class_rows:
+        with open(f"{CSV_PREFIX}_by_class.csv", "w") as f:
+            f.write(",".join(cfields) + "\n")
+            for r in class_rows:
+                f.write(",".join(str(r[k]) for k in cfields) + "\n")
+
     # Write the checkpoints CSV (targets that configure acceptance criteria).
     kfields = ["users", "goal", "stage", "requests", "p99_ms", "p99_slo_ms",
-               "error_rate", "max_error_rate", "concurrency", "verdict", "detail"]
+               "error_rate", "max_error_rate", "concurrency", "class_p99_ms",
+               "verdict", "detail"]
     if checkpoints:
         with open(f"{CSV_PREFIX}_checkpoints.csv", "w") as f:
             f.write(",".join(kfields) + "\n")
             for r in checkpoints:
+                r = {**r, "class_p99_ms": _fmt_class_p99(r["class_p99_ms"])}
                 # Free-text columns are semicolon-separated; strip stray commas
                 # so the naive CSV writer can't produce a ragged row.
                 f.write(",".join(str(r[k]).replace(",", ";") for k in kfields) + "\n")
@@ -1541,6 +1635,12 @@ def on_test_stop(environment, **_kw):
         summary["config"]["result_check"] = RESULT_CHECK
         summary["config"]["result_shortfall_tolerance"] = RESULT_SHORTFALL_TOLERANCE
         summary["results"] = result_summary
+    if MULTI_CLASS:
+        # Weights are each class's share of concurrent USERS, not of requests.
+        summary["config"]["user_classes"] = {
+            cls: {"user_weight": w, "corpus_weights": {c[0]: c[2] for c in corpus}}
+            for cls, corpus, w in USER_CLASSES}
+        summary["by_class"] = class_rows
     if checkpoints:
         summary["config"]["checkpoints"] = CHECKPOINTS
         summary["checkpoints"] = checkpoints
@@ -1581,6 +1681,19 @@ def on_test_stop(environment, **_kw):
               f"(SLO {console.fmt_ms(P99_SLO_MS)}; red = over)")
         print(f"    err  {err_spark}   "
               f"(cap {MAX_ERROR_RATE * 100:.1f}%; red = over)")
+    if class_rows:
+        # Mixed profile: each class's users are fixed, so `conc` should sit
+        # near that class's share of the stage's users. `req` will lean hard
+        # toward the faster class -- that is expected, not a skewed mix.
+        print("-" * 64)
+        print("BY QUERY CLASS (users split by weight: " + ", ".join(
+            f"{cls} {w}" for cls, _c, w in USER_CLASSES) + ")")
+        print(f"{'stg':>3} {'class':<11} {'req':>5} {'p50':>7} {'p99':>8} "
+              f"{'err%':>6} {'conc':>7}")
+        for r in class_rows:
+            print(f"{r['stage']:>3} {r['class']:<11} {r['requests']:>5} "
+                  f"{r['p50_ms']:>7.0f} {r['p99_ms']:>8.0f} "
+                  f"{r['error_rate']*100:>5.1f}% {r['concurrency']:>7.1f}")
     print("-" * 64)
     if knee:
         print(f"Max sustainable concurrency: {knee['concurrency']} "
@@ -1665,6 +1778,8 @@ def on_test_stop(environment, **_kw):
             err = f"{c['error_rate'] * 100:.1f}" if c["error_rate"] is not None else "-"
             print(f"{c['users']:>4} {p99:>8} {bar:>8} {err:>6} "
                   f"{c['max_error_rate'] * 100:>6.1f} {c['verdict']:>8}  {c['goal']}")
+            if c["class_p99_ms"]:
+                print(f"     p99 by class: {_fmt_class_p99(c['class_p99_ms'], ', ')}")
             if c["verdict"] != "PASS":
                 print(f"     -> {c['detail']}")
         failed = [c for c in checkpoints if c["verdict"] != "PASS"]
@@ -1697,6 +1812,8 @@ def on_test_stop(environment, **_kw):
                 print(f"    e.g. {k['example']}")
 
     wrote = [f"{CSV_PREFIX}_stages.csv", f"{CSV_PREFIX}_by_qtype.csv"]
+    if class_rows:
+        wrote.append(f"{CSV_PREFIX}_by_class.csv")
     if checkpoints:
         wrote.append(f"{CSV_PREFIX}_checkpoints.csv")
     if error_index:

@@ -40,7 +40,6 @@ compares its result counts against -- see `baseline_for`.
 """
 
 import json
-import math
 import os
 import random
 
@@ -587,38 +586,40 @@ PATHFINDER_CORPUS = [
 # operational question instead: can the system hold a target concurrency when
 # both classes arrive together, as they do in production?
 #
-# The split is computed rather than hand-written: MVP1/MVP2 keep their relative
-# SHEPHERD_CORPUS weights (so retuning that mix propagates here) and Pathfinder
-# is scaled to half their combined weight, i.e. 1/3 of the whole.
+# The 2:1 split is a split of USERS, not of requests. Each user is pinned to
+# one query class for its whole life (one Locust user class per entry below,
+# weighted by the ratio), so at 30 users 20 are always running inferred queries
+# and 10 are always running Pathfinder. It used to be a per-request weighted
+# draw from one blended list, which in a closed loop does not hold the mix:
+# every user re-rolled after each query, inferred queries returned several
+# times faster, and the users that rolled Pathfinder stayed stuck on it -- by
+# Little's Law the in-flight share drifted toward
+#     L_pf / (L_pf + 2 * L_inf)
+# (~80% Pathfinder at 5 min vs 40 s), and higher still as saturation slowed
+# Pathfinder more than inferred. A fixed share of users keeps the in-flight
+# mix at 2:1 however slow either class gets. The flip side: the *request*
+# mix leans heavily inferred (fast users complete more queries), which is why
+# the engine reports and judges each class separately (see by_class).
+#
+# Within a class each user still draws per request from that class's corpus,
+# so the MVP1/MVP2 weights in SHEPHERD_CORPUS carry over unchanged.
 # ----------------------------------------------------------------------------
-# Inferred : Pathfinder weight ratio of the blended corpus -- 2/3 MVP1+MVP2,
-# 1/3 Pathfinder.
+# Inferred : Pathfinder share of concurrent users -- 2/3 MVP1+MVP2, 1/3
+# Pathfinder.
 INFERRED_PATHFINDER_RATIO = (2, 1)
 
+# (class name, corpus, user weight). Locust's dispatcher splits users across
+# the classes by weight exactly at every count divisible by the total weight
+# (10 -> 7/3, 30 -> 20/10, 45 -> 30/15, 60 -> 40/20).
+MIXED_CLASSES = [
+    ("inferred", SHEPHERD_CORPUS, INFERRED_PATHFINDER_RATIO[0]),
+    ("pathfinder", PATHFINDER_CORPUS, INFERRED_PATHFINDER_RATIO[1]),
+]
 
-def _mixed_corpus(inferred=None, pathfinder=None, ratio=INFERRED_PATHFINDER_RATIO):
-    """Blend the inferred and Pathfinder corpuses at a fixed ratio of shares.
-
-    Relative weights *within* each corpus are preserved (so retuning the MVP1/MVP2
-    mix in SHEPHERD_CORPUS propagates here); only the split between the two
-    corpuses is imposed. Weights are relative, so each side is scaled by an
-    integer factor -- cross-multiplying by the other side's total makes the
-    requested ratio exact regardless of how either corpus is weighted internally.
-    """
-    inferred = SHEPHERD_CORPUS if inferred is None else inferred
-    pathfinder = PATHFINDER_CORPUS if pathfinder is None else pathfinder
-    a, b = ratio
-    inferred_total = sum(w for _, _, w in inferred)
-    pathfinder_total = sum(w for _, _, w in pathfinder)
-    inf_scale = a * pathfinder_total
-    pf_scale = b * inferred_total
-    g = math.gcd(inf_scale, pf_scale)          # keep the flattened list small
-    inf_scale, pf_scale = inf_scale // g, pf_scale // g
-    return ([(qt, bld, w * inf_scale) for qt, bld, w in inferred]
-            + [(qt, bld, w * pf_scale) for qt, bld, w in pathfinder])
-
-
-MIXED_CORPUS = _mixed_corpus()
+# Every query the mixed profile can send, for code that lists qtypes. Weights
+# here are only meaningful *within* a class; the split between classes is the
+# user weights above.
+MIXED_CORPUS = [entry for _, corpus, _ in MIXED_CLASSES for entry in corpus]
 
 CORPUS_BY_NAME = {
     "retriever": RETRIEVER_CORPUS,
@@ -632,6 +633,21 @@ CORPUS_BY_NAME = {
 def corpus_for(name):
     """Return the (qtype, builder, weight) list for a component corpus name."""
     return CORPUS_BY_NAME[name]
+
+
+# Corpuses whose users are split into fixed query classes (see MIXED_CLASSES).
+CLASSES_BY_NAME = {
+    "mixed": MIXED_CLASSES,
+}
+
+
+def user_classes_for(name):
+    """Return the [(class name, corpus, user weight)] split for a corpus name.
+
+    A single-class corpus is one class holding every user, so the engine has a
+    single code path either way.
+    """
+    return CLASSES_BY_NAME.get(name, [(name, corpus_for(name), 1)])
 
 
 # ----------------------------------------------------------------------------

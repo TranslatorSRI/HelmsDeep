@@ -50,6 +50,12 @@ Fields:
                                  (an overload probe where slowdown is expected
                                  but failures are not)
                  max_error_rate  error-rate bar; omit to inherit MAX_ERROR_RATE
+                 class_p99_slo_ms
+                                 mixed profile only: {query class: p99 bar}.
+                                 Each class's own p99 is judged too, because
+                                 the pooled p99 is mostly the faster class's;
+                                 a class left out inherits this checkpoint's
+                                 p99_slo_ms (None = not judged)
                Results land in <prefix>_checkpoints.csv, the summary JSON, and
                the printed report; any failed checkpoint sets a non-zero exit code.
 
@@ -229,7 +235,9 @@ TARGETS = {
         "request_timeout_s": 400,
     },
     # Mixed profile (ARA + ARS): 2/3 inferred MVP1+MVP2, 1/3 Pathfinder, run as
-    # one blended workload. Unlike the other targets -- which characterize a
+    # one blended workload. The split is of concurrent USERS (each user is
+    # pinned to one class -- see trapi_corpus.MIXED_CLASSES), so at 30 users
+    # 20 run inferred and 10 run Pathfinder throughout. Unlike the other targets -- which characterize a
     # single query class to FIND the knee -- this one answers a pass/fail
     # capacity question at three named concurrency checkpoints (see
     # ``checkpoints`` below). The knee is still computed and reported.
