@@ -173,7 +173,7 @@ Package `helmsdeep/`:
   sidecar — how long a background poller keeps watching a timed-out query to see if
   it *eventually* finishes; defaults to `max_poll_s` = off) and an optional
   `zero_result_is_failure` (whether a terminal `Done` carrying 0 results scores
-  as a failure; defaults to `True`). The `*_pathfinder` targets
+  as a failure; defaults to `False`, and every target leaves it `False`). The `*_pathfinder` targets
   reuse the ARA/ARS endpoints + protocols but point at the `pathfinder` corpus and
   ship a gentler ramp + looser SLO (pinned-two-endpoint path-finding is the
   heaviest query class). The `*_mixed` targets add two more optional fields:
@@ -713,15 +713,15 @@ cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
   wall-clock, so Locust's native stats table shows the true per-query time
   (otherwise the only ARS rows would be the individual sub-calls — e.g. the
   `ars_merge` GET, which times just the final merge fetch, not the whole query).
-  A `Done` that returns **0 results counts as a failure** by default (and raises
-  a red flag) — see `zero_result_is_failure` below; a non-terminal status past
+  A `Done` that returns **0 results is not a failure** (it still raises a red
+  flag) — see `zero_result_is_failure` below; a non-terminal status past
   `max_poll_s` is a `Timeout` failure.
 - **`zero_result_is_failure` decides what a 0-result `Done` means.** Default
-  `True`: an empty answer set under load usually means a downstream agent silently
-  dropped out, so it scores as a failure and counts against the knee. Set it
-  `False` on a target to score only transport/protocol outcomes (submit error,
-  `Error` status, `Timeout`) as failures — the zero-result query's latency then
-  also joins the percentile pool instead of being discarded (failed requests
+  `False`, and **every target keeps it `False`**: only transport/protocol
+  outcomes (submit error, `Error` status, `Timeout`) fail, and the zero-result
+  query's latency joins the percentile pool. Setting it `True` on a target scores
+  an empty answer set as a failure (a silent downstream drop-out) that counts
+  against the knee — and drops its latency from the pool (failed requests
   contribute no latency samples), so it shifts mean/p99/concurrency, not just the
   error rate. Either way the query is still tallied in `ars_health`
   (`zero_result_done`) and still raises a red flag, the per-query debug log still
