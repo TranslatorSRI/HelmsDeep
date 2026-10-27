@@ -160,6 +160,10 @@ COUNT_RESULTS = RESULT_CHECK != "off"
 
 CSV_PREFIX = os.environ.get("LOCUST_CSV_PREFIX", "trapi_run")
 
+# The TRAPI version the corpus is written in (the CLI's --trapi-version). Read
+# here once so a bad value stops the run before any user spawns.
+TRAPI_VERSION = trapi_corpus.trapi_version()
+
 # Full examples of every error kind -- the request sent, the response (status,
 # headers, body) or the client-side exception, and the stage it happened in --
 # saved to <prefix>_errors/ the moment they happen (see error_samples.py). The
@@ -1617,6 +1621,7 @@ def on_test_stop(environment, **_kw):
             "protocol": PROTOCOL,
             "p99_slo_ms": P99_SLO_MS,
             "max_error_rate": MAX_ERROR_RATE,
+            "trapi_version": TRAPI_VERSION,
             "stages": STAGES,
             "corpus_weights": {c[0]: c[2] for c in CORPUS},
         },

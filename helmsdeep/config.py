@@ -83,8 +83,25 @@ Async (``ars``) targets add:
                           still raise a red flag.
 """
 
+import re
+
 # Shared across all targets: a stage also needs error_rate <= this to be a knee.
 MAX_ERROR_RATE = 0.01   # 1%
+
+# The TRAPI version the queries are written in. 2.0 moved the query-level
+# options (``bypass_cache``) into the query's ``parameters`` object; 1.x carries
+# them as top-level fields of the query, and a 2.0 service rejects that shape.
+# Chosen per run with the CLI's --trapi-version (HELMSDEEP_TRAPI_VERSION).
+TRAPI_VERSIONS = ("2.0", "1.6")
+TRAPI_VERSION = "2.0"
+
+
+def trapi_minor(version):
+    """``"2.0.0"`` -> ``"2.0"``, if it is a version HelmsDeep can write; else None."""
+    match = re.match(r"(\d+)\.(\d+)", str(version or ""))
+    minor = f"{match.group(1)}.{match.group(2)}" if match else None
+    return minor if minor in TRAPI_VERSIONS else None
+
 
 # ---------------------------------------------------------------------------
 # Result-count expectations.

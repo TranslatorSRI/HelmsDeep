@@ -46,6 +46,15 @@ def _duration(text):
     return seconds
 
 
+def _trapi_version(text):
+    minor = config.trapi_minor(text)
+    if minor is None:
+        raise argparse.ArgumentTypeError(
+            f"unsupported TRAPI version {text!r}; use one of "
+            f"{', '.join(config.TRAPI_VERSIONS)}")
+    return minor
+
+
 # One duration format across the CLI banner, the live display, and the summary.
 _fmt_duration = console.fmt_duration
 
@@ -113,6 +122,17 @@ def _parse_args(argv=None):
              "are unaffected. 'enforce' additionally scores a shortfall as a "
              "failure, so it counts against the error rate and the knee. 'off' "
              "skips the check (and the response parsing it needs).",
+    )
+    parser.add_argument(
+        "--trapi-version",
+        type=_trapi_version,
+        default=None,
+        metavar="VERSION",
+        help=f"TRAPI version to write the queries in: "
+             f"{' or '.join(config.TRAPI_VERSIONS)} (a full version such as "
+             f"2.0.0 is fine). Default {config.TRAPI_VERSION}. 2.0 sends "
+             f"bypass_cache under the query's 'parameters'; 1.x as a top-level "
+             f"field, which a TRAPI 2.0 service rejects.",
     )
     parser.add_argument(
         "--csv-prefix",
@@ -237,6 +257,12 @@ def main(argv=None):
         env["HELMSDEEP_LIVE"] = "0"
     if args.result_check:
         env["HELMSDEEP_RESULT_CHECK"] = args.result_check
+    if args.trapi_version:
+        env["HELMSDEEP_TRAPI_VERSION"] = args.trapi_version
+    # what the corpus will be written in: the flag, else the env, else default
+    trapi = (args.trapi_version
+             or config.trapi_minor(env.get("HELMSDEEP_TRAPI_VERSION"))
+             or config.TRAPI_VERSION)
     # Error-sample saving is opt-in: the locustfile reads the per-kind cap from
     # this env var and treats absent/0 as "count kinds, write nothing" -- so a
     # run on a box with little disk or RAM never accumulates response bodies.
@@ -270,7 +296,8 @@ def main(argv=None):
     paint = console.painter()
     print()
     print(paint(f"HelmsDeep  ·  {tgt['label']} ({args.targets})", "bold"))
-    print(paint(f"           ·  {args.host}{tgt['endpoint']}", "grey"))
+    print(paint(f"           ·  {args.host}{tgt['endpoint']}  ·  TRAPI {trapi}",
+                "grey"))
     _print_plan(plan, natural_s, budget_s, scale)
     # Say which answer-count policy is in force: in "report" mode it changes no
     # measurement, in "enforce" mode it changes the knee, and that difference

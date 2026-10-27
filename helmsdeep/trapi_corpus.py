@@ -43,6 +43,11 @@ import json
 import os
 import random
 
+try:                       # installed package
+    from . import config
+except ImportError:        # loaded flat by the locustfile (locust -f puts the
+    import config          # package dir on sys.path, so these are top-level)
+
 
 # A few real-ish CURIEs from the Biolink/MONDO/CHEBI space used in TRAPI docs.
 # Swap these for entities your target service actually knows about.
@@ -269,6 +274,31 @@ CHEM_DISEASE_PAIRS = [
 ]
 
 
+def trapi_version():
+    """The TRAPI version (``major.minor``) the queries are written in.
+
+    Read when each query is built, so the CLI's --trapi-version
+    (HELMSDEEP_TRAPI_VERSION) reaches the load test and the profiler alike.
+    """
+    env = os.environ.get("HELMSDEEP_TRAPI_VERSION")
+    if env and config.trapi_minor(env) is None:
+        raise ValueError(
+            f"HELMSDEEP_TRAPI_VERSION={env!r}: expected one of "
+            f"{', '.join(config.TRAPI_VERSIONS)}")
+    return config.trapi_minor(env) or config.TRAPI_VERSION
+
+
+def _set_bypass_cache(env, bypass_cache):
+    """Put ``bypass_cache`` where the TRAPI version keeps query options: the
+    query's ``parameters`` object in 2.0, a top-level field in 1.x."""
+    if bypass_cache is None:
+        return
+    if trapi_version().startswith("2."):
+        env.setdefault("parameters", {})["bypass_cache"] = bypass_cache
+    else:
+        env["bypass_cache"] = bypass_cache
+
+
 def _qg(nodes, edges, tier=None, bypass_cache=None):
     """Wrap a query graph in the TRAPI envelope.
 
@@ -278,6 +308,7 @@ def _qg(nodes, edges, tier=None, bypass_cache=None):
         is meaningless to ARAs/ARS, so inferred builders leave it off.
       - ``bypass_cache``: forces fresh reasoning. Used by creative-mode (ARA)
         queries so the load test measures reasoning cost, not cache hits.
+        Placed per the TRAPI version (see ``_set_bypass_cache``).
     """
     env = {
         "message": {
@@ -286,8 +317,7 @@ def _qg(nodes, edges, tier=None, bypass_cache=None):
     }
     if tier is not None:
         env["parameters"] = {"tier": tier}
-    if bypass_cache is not None:
-        env["bypass_cache"] = bypass_cache
+    _set_bypass_cache(env, bypass_cache)
     return env
 
 
@@ -448,8 +478,7 @@ def _pathfinder_qg(nodes, paths, bypass_cache=True):
             "query_graph": {"nodes": nodes, "paths": paths}
         }
     }
-    if bypass_cache is not None:
-        env["bypass_cache"] = bypass_cache
+    _set_bypass_cache(env, bypass_cache)
     return env
 
 

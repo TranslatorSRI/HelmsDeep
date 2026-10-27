@@ -754,6 +754,13 @@ def _parse_args(argv=None):
              "whole run, so a mid-run service slowdown doesn't land entirely on "
              "one pool.",
     )
+    parser.add_argument(
+        "--trapi-version", default=None, metavar="VERSION",
+        help=f"TRAPI version to write the queries in: "
+             f"{' or '.join(config.TRAPI_VERSIONS)} (default "
+             f"{config.TRAPI_VERSION}). Profile in the version the load test "
+             f"will send, so the queries match byte for byte.",
+    )
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed for --sample/--shuffle.")
     parser.add_argument(
@@ -854,6 +861,14 @@ def _summarize(prefix, probe_csv, meta, cuts, metric):
 
 def main(argv=None):
     args = _parse_args(argv)
+    if args.trapi_version:
+        if config.trapi_minor(args.trapi_version) is None:
+            print(f"unsupported TRAPI version {args.trapi_version!r}; use one "
+                  f"of {', '.join(config.TRAPI_VERSIONS)}", file=sys.stderr)
+            return 2
+        # the corpus builders read it as they build each query
+        os.environ["HELMSDEEP_TRAPI_VERSION"] = config.trapi_minor(
+            args.trapi_version)
     paint = console.painter()
     cuts = _cuts(args.bin_cuts)
     prefix = args.out
