@@ -91,9 +91,10 @@ helmsdeep --targets ars_mixed \
   measures and reports without failing anything — see
   ["Did it answer with the right number of results?"](#did-it-answer-with-the-right-number-of-results).
 - `--trapi-version 2.0|1.6` picks the TRAPI version the queries are written in.
-  Defaults to `2.0`, which sends `bypass_cache` under the query's `parameters`;
-  `1.6` sends it as a top-level field, the 1.x shape, which a TRAPI 2.0 service
-  rejects. A full version (`2.0.0`) is accepted, and so is the
+  Defaults to `2.0`, which sends `bypass_cache` under the query's `parameters`
+  and MVP2's qualifiers as the edge's `constraints.qualifiers`; `1.6` sends the
+  1.x shapes (a top-level `bypass_cache`, `qualifier_constraints`), which a
+  TRAPI 2.0 service rejects. A full version (`2.0.0`) is accepted, and so is the
   `HELMSDEEP_TRAPI_VERSION` environment variable. The banner and
   `summary.json`'s `config.trapi_version` say which was used.
 - `--save-errors [N]` keeps full examples of each error kind (up to N per
