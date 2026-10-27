@@ -127,11 +127,11 @@ MAX_POLL_S = _TGT.get("max_poll_s", 900)
 # to MAX_POLL_S, i.e. no extended tracking.
 COMPLETION_MAX_POLL_S = max(_TGT.get("completion_max_poll_s", MAX_POLL_S), MAX_POLL_S)
 # Whether a terminal "Done" carrying 0 results scores as a failure (and so counts
-# against the knee). Defaults True: an empty answer set under load usually means a
-# downstream agent silently dropped out. When False, only transport/protocol
-# outcomes (submit error, Error status, Timeout) fail, and the zero-result query's
-# latency joins the percentile pool instead of being discarded -- but it is still
-# tallied in ars_health and still raises a red flag.
+# against the knee). Defaults False, which every target keeps: only
+# transport/protocol outcomes (submit error, Error status, Timeout) fail, and the
+# zero-result query's latency joins the percentile pool -- but it is still
+# tallied in ars_health and still raises a red flag. A target can set it True to
+# score an empty answer set as a silent downstream drop-out.
 ZERO_RESULT_IS_FAILURE = _TGT.get("zero_result_is_failure", False)
 
 # Detached greenlets still polling timed-out queries for the completion sidecar;
@@ -916,8 +916,8 @@ class TRAPIUser(HttpUser):
         query, plus one synthetic 'ars_query' Locust request event carrying that
         same full wall-clock (the submit/poll/merge HTTP calls also show
         separately in Locust's own table for diagnostics, but are not
-        double-counted as the query time). A Done with 0 results is a failure
-        unless the target sets zero_result_is_failure=False; a Done whose answer
+        double-counted as the query time). A Done with 0 results fails only if
+        the target sets zero_result_is_failure=True (none do); a Done whose answer
         count falls short of the profiled baseline is reported, and fails only
         under RESULT_CHECK="enforce".
         """

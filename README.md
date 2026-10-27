@@ -438,9 +438,9 @@ flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
 
 - **result-count variation** (min/mean/max + coefficient of variation) across
   identical queries;
-- **zero-result `Done`** count — by default a `Done` with 0 results is treated
-  as a **failure** (counts against the error rate and the knee) and flagged; the
-  per-target `zero_result_is_failure` flag can score it as a success instead (see
+- **zero-result `Done`** count — a `Done` with 0 results is flagged but **not**
+  a failure (it doesn't count against the error rate or the knee); the
+  per-target `zero_result_is_failure` flag can score it as a failure instead (see
   ["Is an empty answer a failure?"](#is-an-empty-answer-a-failure));
 - **response size** (merged-message bytes, mean/max);
 - **result drop under load** — flagged when the mean result count falls sharply
@@ -448,22 +448,21 @@ flag silent downstream breakage, written to `<prefix>_ars_health.csv` and
 
 ### Is an empty answer a failure?
 
-A terminal `Done` that carries **0 results** is scored as a **failure** by
-default: under load an empty answer set usually means a downstream agent silently
-dropped out, which is exactly what the knee should catch. But that conflates a
-silent break with a query whose answer set is legitimately empty, so it is a
-per-target switch in `config.py`:
+A terminal `Done` that carries **0 results** is **not** a failure, on every
+target: only submit errors, an `Error` status, and `Timeout` count as failures,
+and an empty answer set is a legitimate response. Under load an empty answer can
+also mean a downstream agent silently dropped out, so it is a per-target switch
+in `config.py`:
 
 ```python
-"zero_result_is_failure": True,   # the default; set False to score only
-                                  # transport/protocol outcomes as failures
+"zero_result_is_failure": False,  # the default, on every target; set True to
+                                  # score a 0-result Done as a failure
 ```
 
-With `False`, only submit errors, an `Error` status, and `Timeout` count as
-failures. Note this shifts **more than the error rate**: a failed request
-contributes no latency sample, so a zero-result query that stops being a failure
-starts feeding the percentile pool — mean, p99, and therefore the Little's-Law
-concurrency all move too. The two policies give two different knees, which is the
+With `True`, a 0-result `Done` counts against the error rate. Note this shifts
+**more than the error rate**: a failed request contributes no latency sample, so
+a zero-result query that becomes a failure stops feeding the percentile pool —
+mean, p99, and therefore the Little's-Law concurrency all move too. The two policies give two different knees, which is the
 point: run both to see how much of your ceiling is empty answers versus broken
 transport.
 
@@ -475,7 +474,7 @@ ARS health table, so a run's numbers can't be read under the wrong assumption:
 
 ```
 ARS HEALTH (per stage)
-  0-result 'Done' scored as: FAILURE (zero_result_is_failure=True)
+  0-result 'Done' scored as: success (zero_result_is_failure=False)
 ```
 
 ### Per-query debug log (`ars_queries.csv`)
@@ -494,7 +493,7 @@ out.
 | `submit_start` | When it was submitted (ISO 8601 UTC) — line it up against service logs. |
 | `latency_s` | Wall clock from submit to terminal status. |
 | `ars_status` | `Done` / `Error` / `Timeout` / `SubmitError` / `NoPK`. |
-| `failed` | Whether it counted against the error rate. A **`Done` with 0 results is `failed=True`** under the default `zero_result_is_failure` policy — see [below](#is-an-empty-answer-a-failure). |
+| `failed` | Whether it counted against the error rate. A **`Done` with 0 results is `failed=False`** under the default `zero_result_is_failure` policy (its `Done with 0 results` note still says so) — see [below](#is-an-empty-answer-a-failure). |
 | `submit_http`, `poll_http`, `merge_http` | HTTP status of the submit, the last poll, and the merged fetch. Separates "the ARS said no" from "the HTTP call broke". |
 | `polls` | How many status polls it took — a large number on a slow query says it was genuinely working, not stuck. |
 | `intermediate_error_count` | How many **non-fatal** errors the query hit on the way to its outcome (`0` = it ran clean). The poll loop retries through these, so they never decide `ars_status` — but they say a query only limped to `Done`. |
