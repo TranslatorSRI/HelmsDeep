@@ -211,7 +211,9 @@ Package `helmsdeep/`:
   `--host` (required), `--csv-prefix`, the mutually exclusive
   `--time-budget DURATION` / `--quick` (= `--time-budget 10m`),
   `--result-check off|report|enforce` (sets `HELMSDEEP_RESULT_CHECK`; the banner
-  states which mode is in force, because `enforce` changes the knee), the two
+  states which mode is in force, because `enforce` changes the knee),
+  `--trapi-version 2.0|1.6` (normalized to major.minor by `config.trapi_minor`;
+  sets `HELMSDEEP_TRAPI_VERSION`; the banner shows the version in force), the two
   output flags `--no-live` (sets `HELMSDEEP_LIVE=0`) / `--verbose`, and the
   opt-in `--save-errors [N]` (`nargs="?"`, const = `config.ERROR_SAMPLES_PER_KIND`,
   default 0; sets `HELMSDEEP_ERROR_SAMPLES=N` only when > 0 -- absent means
@@ -447,8 +449,14 @@ Package `helmsdeep/`:
     stages / an example path) and an `ERRORS:` headline line.
 - **`trapi_corpus.py`** — the per-component query corpuses:
   - `_qg(nodes, edges, tier=None, bypass_cache=None)` — TRAPI envelope; adds
-    scalar `parameters.tier` (KP-only) or top-level `bypass_cache` (ARA/ARS) only
-    when supplied.
+    scalar `parameters.tier` (KP-only) or `bypass_cache` (ARA/ARS) only when
+    supplied. `_set_bypass_cache` places `bypass_cache` per `trapi_version()`:
+    `parameters.bypass_cache` for TRAPI 2.0 (the default, `config.TRAPI_VERSION`),
+    a top-level field for 1.x. `trapi_version()` reads `HELMSDEEP_TRAPI_VERSION`
+    each time a query is built, so the CLI flag reaches the load test and
+    `helmsdeep-profile` alike; the locustfile reads it once at import (so a bad
+    value fails before any user spawns) and records it as
+    `summary.json`'s `config.trapi_version`.
   - **`RETRIEVER_CORPUS`** — `lookup`-mode KP builders, each pinning its own
     `tier` (multi-hop→0, single-hop→1): `one_hop_lookup_pinned`,
     `one_hop_lookup_open`, `one_hop_no_predicate`, `two_hop_lookup`,

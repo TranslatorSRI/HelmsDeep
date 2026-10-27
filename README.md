@@ -90,6 +90,12 @@ helmsdeep --targets ars_mixed \
   with fewer results than the profile says it has. Defaults to `report`, which
   measures and reports without failing anything — see
   ["Did it answer with the right number of results?"](#did-it-answer-with-the-right-number-of-results).
+- `--trapi-version 2.0|1.6` picks the TRAPI version the queries are written in.
+  Defaults to `2.0`, which sends `bypass_cache` under the query's `parameters`;
+  `1.6` sends it as a top-level field, the 1.x shape, which a TRAPI 2.0 service
+  rejects. A full version (`2.0.0`) is accepted, and so is the
+  `HELMSDEEP_TRAPI_VERSION` environment variable. The banner and
+  `summary.json`'s `config.trapi_version` say which was used.
 - `--save-errors [N]` keeps full examples of each error kind (up to N per
   stage, default 3) under `<prefix>_errors/` for the post-mortem. **Off unless
   given** — a run on a box with little disk or RAM writes nothing, though error
@@ -737,7 +743,8 @@ quick visual feel and for sharing a screenshot.
   with tier 0 and single-hop shapes with tier 1. ARA queries carry no tier.
 - **Shepherd/ARS send inferred + bypass_cache, mixing MVP1 and MVP2.**
   `SHEPHERD_CORPUS` (also used for `ars`) holds creative-mode queries
-  (`knowledge_type: "inferred"`, `bypass_cache: true`) split evenly between two
+  (`knowledge_type: "inferred"`, `bypass_cache: true`, under `parameters` in
+  TRAPI 2.0) split evenly between two
   Translator templates, with entities varied per request to spread load and avoid
   cache-warming. `by_qtype.csv` breaks out latency per template/tier.
   - **MVP1 — "what treats disease X?"** (`chemical -[treats]-> disease`): the
