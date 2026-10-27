@@ -299,6 +299,24 @@ def _set_bypass_cache(env, bypass_cache):
         env["bypass_cache"] = bypass_cache
 
 
+def _set_qualifiers(edge, qualifiers):
+    """Constrain a query edge to one qualifier set (``{type_id: value}``), in
+    the TRAPI version's shape.
+
+    TRAPI 2.0: ``constraints.qualifiers``, a list of sets, each a plain
+    ``{qualifier_type_id: qualifier_value}`` mapping. TRAPI 1.x:
+    ``qualifier_constraints``, a list of ``{"qualifier_set": [{qualifier_type_id,
+    qualifier_value}, ...]}``, which a 2.0 service rejects.
+    """
+    if trapi_version().startswith("2."):
+        edge.setdefault("constraints", {})["qualifiers"] = [dict(qualifiers)]
+    else:
+        edge["qualifier_constraints"] = [{"qualifier_set": [
+            {"qualifier_type_id": type_id, "qualifier_value": value}
+            for type_id, value in qualifiers.items()
+        ]}]
+
+
 def _qg(nodes, edges, tier=None, bypass_cache=None):
     """Wrap a query graph in the TRAPI envelope.
 
@@ -414,19 +432,16 @@ def _affects(subject_node, object_node, aspect, direction):
     qualifiers the reference emits are sent (object aspect + direction); the
     `qualified_predicate` carried on real test assets is intentionally omitted.
     """
+    edge = {"subject": "n0", "object": "n1",
+            "predicates": ["biolink:affects"],
+            "knowledge_type": "inferred"}
+    _set_qualifiers(edge, {
+        "biolink:object_aspect_qualifier": aspect,
+        "biolink:object_direction_qualifier": direction,
+    })
     return _qg(
         nodes={"n0": subject_node, "n1": object_node},
-        edges={
-            "e0": {"subject": "n0", "object": "n1",
-                   "predicates": ["biolink:affects"],
-                   "knowledge_type": "inferred",
-                   "qualifier_constraints": [{"qualifier_set": [
-                       {"qualifier_type_id": "biolink:object_aspect_qualifier",
-                        "qualifier_value": aspect},
-                       {"qualifier_type_id": "biolink:object_direction_qualifier",
-                        "qualifier_value": direction},
-                   ]}]},
-        },
+        edges={"e0": edge},
         bypass_cache=True,
     )
 
@@ -464,7 +479,8 @@ def mvp2_chem_affects_open_gene():
 # inferred reasoning to find multi-hop paths between them, so this is the most
 # intensive query class -- hence its own heavier ramp / looser SLO in config.
 # `predicates` on a QPath conveys the *desired* path type (not a hard filter);
-# `constraints[].intermediate_categories` hints at what may sit on the path.
+# `constraints[].required_intermediate_categories` (TRAPI 2.0; 1.x called it
+# `intermediate_categories`) hints at what may sit on the path. Not sent today.
 # Pathfinder has no `knowledge_type` (that's edge-only) and no `tier` (ARA/ARS).
 # ----------------------------------------------------------------------------
 def _pathfinder_qg(nodes, paths, bypass_cache=True):
@@ -495,7 +511,9 @@ def pathfinder_drug_disease():
                 "subject": "n0",
                 "object": "n1",
                 # Hint that gene-mediated mechanism paths are of interest.
-                # "constraints": [{"intermediate_categories": ["biolink:Gene"]}],
+                # TRAPI 2.0; 1.x named the key "intermediate_categories":
+                # "constraints": [
+                #     {"required_intermediate_categories": ["biolink:Gene"]}],
             },
         },
     )

@@ -452,7 +452,14 @@ Package `helmsdeep/`:
     scalar `parameters.tier` (KP-only) or `bypass_cache` (ARA/ARS) only when
     supplied. `_set_bypass_cache` places `bypass_cache` per `trapi_version()`:
     `parameters.bypass_cache` for TRAPI 2.0 (the default, `config.TRAPI_VERSION`),
-    a top-level field for 1.x. `trapi_version()` reads `HELMSDEEP_TRAPI_VERSION`
+    a top-level field for 1.x. `_set_qualifiers` does the same for an edge's
+    qualifier set: `constraints.qualifiers` (a list of plain
+    `{qualifier_type_id: value}` mappings) for 2.0, `qualifier_constraints`
+    (`[{"qualifier_set": [{qualifier_type_id, qualifier_value}]}]`) for 1.x.
+    The 1.x query shape is byte-for-byte what 0.3.0 sent; under 2.0 every
+    corpus query validates against `translator_tom`'s TRAPI 2.0 `Query` with no
+    field the model doesn't define, bar Retriever's own `parameters.tier`.
+    `trapi_version()` reads `HELMSDEEP_TRAPI_VERSION`
     each time a query is built, so the CLI flag reaches the load test and
     `helmsdeep-profile` alike; the locustfile reads it once at import (so a bad
     value fails before any user spawns) and records it as
