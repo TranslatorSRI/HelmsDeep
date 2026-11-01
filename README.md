@@ -420,6 +420,39 @@ comparable.
 > **Layering still applies:** `ars_mixed` fans out to the ARAs, so run one or the
 > other — never both at once.
 
+#### ARAs that don't answer a query class (BTE and Pathfinder)
+
+Not every ARA answers every question. BTE refuses Pathfinder outright: its
+worker raises `BTE does not support Pathfinder type queries.`, and Shepherd's
+`/query` returns that as a **500**. Scoring it as an error would put a mixed
+run's error rate near the Pathfinder share and fail every checkpoint on
+something no amount of capacity fixes. So on the sync path, a non-2xx response
+is classed as **unsupported** when:
+
+- its status is in `config.UNSUPPORTED_STATUSES` (TRAPI's `501`), or
+- its top-level `status`/`description`, or one of its **ERROR-level** log
+  messages, contains one of `config.UNSUPPORTED_MARKERS` (`does not support`,
+  `not supported`, `not implemented`; case-insensitive; override per target
+  with `unsupported_markers`, `[]` = 501 only).
+
+Only ERROR logs are searched, because a failed query's body carries every log
+line it produced. A WARNING from a sub-service that happens to say
+"not supported" does not turn a real 500 into a pass.
+
+An unsupported answer is **not a request in the stats**: it adds no error and no
+latency sample. After the first refusal that qtype is **never sent again** in
+this run, so the class's users idle rather than hammering the rejection path in a
+closed loop. Checkpoints skip per-class judging for a class with nothing left to
+send (`detail` says `pathfinder not judged: unsupported by the service`). The
+in-flight-bleed quality check compares concurrency against the users that were
+actually sending. It all shows up in a printed `UNSUPPORTED BY THE SERVICE`
+block, an `UNSUPPORTED (not errors)` headline line, and an `unsupported` block
+in `summary.json`. So `aras_mixed` against BTE in practice measures the inferred
+2/3 alone, and the report says so.
+
+The ARS path is unaffected: the ARS merges whichever ARAs answered, so one ARA
+refusing never surfaces as an ARS error.
+
 ### ARS async workflow and health signals
 
 The `ars` target is asynchronous: each logical query is `POST /submit` → poll

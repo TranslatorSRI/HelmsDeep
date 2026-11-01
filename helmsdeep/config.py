@@ -39,6 +39,10 @@ Fields:
                shared values above. Targets whose corpus has no profiled
                baselines (kps, the Pathfinder run types) check nothing whatever
                the mode says, because no query they send has an expectation.
+  unsupported_markers
+               optional per-target override of config.UNSUPPORTED_MARKERS
+               (sync targets only); [] turns body matching off, leaving only
+               the 501 rule. See "Unsupported query classes" below.
   checkpoints  optional list of pass/fail acceptance criteria, evaluated against
                the stage running that many users. Turns a run from "find the
                knee" into "does the system hold N concurrent queries?" -- the
@@ -137,6 +141,32 @@ def trapi_minor(version):
 RESULT_CHECK_MODES = ("off", "report", "enforce")
 RESULT_CHECK = "report"
 RESULT_SHORTFALL_TOLERANCE = 0.5
+
+# ---------------------------------------------------------------------------
+# Unsupported query classes (sync targets). Not every ARA answers every
+# question: BTE refuses Pathfinder outright ("BTE does not support Pathfinder
+# type queries.", returned by Shepherd's /query as a 500). That refusal is a
+# capability gap, not the service breaking under load, so scoring it as an
+# error would pin a mixed run's error rate near the Pathfinder share and fail
+# every checkpoint on something no amount of capacity fixes.
+#
+# A non-2xx answer is UNSUPPORTED when its status is in UNSUPPORTED_STATUSES
+# (TRAPI's 501 Not Implemented), or when its top-level status/description, or
+# one of its ERROR-level log messages, contains one of UNSUPPORTED_MARKERS
+# (case-insensitive). Only ERROR logs are searched: a failed query's body
+# carries every log line it produced, and a WARNING from some sub-service that
+# merely mentions "not supported" must not turn a real 500 into a pass.
+#
+# An unsupported answer is not a request in the stats -- no error, no latency
+# sample (an instant refusal would flatter the p99) -- and once a qtype has been
+# refused it is not sent again for the rest of the run: re-sending it in a
+# closed loop would only hammer the service's rejection path at a rate
+# production never produces. Users of a class with nothing left to send idle.
+# Every refusal is counted and reported (summary.json "unsupported", a printed
+# block, and a headline line), so a misfire can't silently drop a class.
+# ---------------------------------------------------------------------------
+UNSUPPORTED_STATUSES = (501,)
+UNSUPPORTED_MARKERS = ("does not support", "not supported", "not implemented")
 
 # Error samples (error_samples.py): full request/response examples of every
 # distinct error kind, saved under <prefix>_errors/ as they happen so a run can
