@@ -158,6 +158,16 @@ RESULT_SHORTFALL_TOLERANCE = _TGT.get("result_shortfall_tolerance",
 # it. (The ARS path already counts results for its own health signals.)
 COUNT_RESULTS = RESULT_CHECK != "off"
 
+# Unsupported query classes (sync path; see config.py). A refusal like BTE's
+# "does not support Pathfinder" is a capability gap, not a load failure: it is
+# tallied apart from the stats, and the refused qtype is not sent again.
+UNSUPPORTED_STATUSES = tuple(config.UNSUPPORTED_STATUSES)
+UNSUPPORTED_MARKERS = tuple(
+    m.lower() for m in _TGT.get("unsupported_markers",
+                                config.UNSUPPORTED_MARKERS))
+# How long a user with nothing supported left to send idles between checks.
+UNSUPPORTED_PARK_S = 1.0
+
 CSV_PREFIX = os.environ.get("LOCUST_CSV_PREFIX", "trapi_run")
 
 # The TRAPI version the corpus is written in (the CLI's --trapi-version). Read
@@ -285,6 +295,11 @@ class StageCollector:
         self.surpluses = defaultdict(lambda: defaultdict(int))
         # Observed/expected per stage, for "answers are degrading as load rises".
         self.result_ratios = defaultdict(lambda: defaultdict(list))
+        # Unsupported query classes: refusals per stage->qtype, and the first
+        # refusal of each qtype (its presence is what stops the qtype being
+        # sent again).
+        self.unsupported = defaultdict(lambda: defaultdict(int))
+        self.unsupported_qtypes = {}
         # Ids are handed out at submit time and shared by both per-query files,
         # so a row in one joins to its row in the other.
         self._next_query_id = itertools.count()
@@ -354,6 +369,18 @@ class StageCollector:
         if response_bytes is not None:
             self.response_bytes[s][qtype].append(response_bytes)
             self.response_bytes[s]["__all__"].append(response_bytes)
+
+    def record_unsupported(self, qtype, status, reason):
+        """Tally a query the service refused as unsupported. Deliberately NOT a
+        request in the per-stage stats: no error, no latency sample."""
+        s = self.stage_idx
+        self.unsupported[s][qtype] += 1
+        self.unsupported_qtypes.setdefault(qtype, {
+            "first_stage": s,
+            "first_users": STAGES[s][0] if s < len(STAGES) else None,
+            "status": status,
+            "reason": reason,
+        })
 
     def record_result_check(self, *, qtype, entity, expected, observed, verdict,
                             ratio, latency_ms, stage=None):
@@ -425,6 +452,61 @@ def _pct(values, p):
     lo = int(k)
     hi = min(lo + 1, len(s) - 1)
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def _unsupported_reason(resp):
+    """Why a non-2xx response is a refusal to answer this KIND of query (a
+    capability gap, e.g. BTE on Pathfinder) rather than a failure -- or None.
+
+    Searches only the response's own verdict: its top-level status/description
+    and its ERROR-level log messages. A failed query's body carries every log
+    line it produced, and a WARNING that merely mentions "not supported" must
+    not turn a genuine 500 into a pass.
+    """
+    status = resp.status_code
+    if not status or 200 <= status < 300:
+        return None
+    if status in UNSUPPORTED_STATUSES:
+        return f"HTTP {status}"
+    if not UNSUPPORTED_MARKERS:
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    texts = []
+    if isinstance(body, dict):
+        for key in ("status", "description", "detail", "message"):
+            if isinstance(body.get(key), str):
+                texts.append(body[key])
+        for log in body.get("logs") or []:
+            if (isinstance(log, dict)
+                    and str(log.get("level", "")).upper() in ("ERROR", "CRITICAL")
+                    and isinstance(log.get("message"), str)):
+                texts.append(log["message"])
+    elif body is None:
+        # Not JSON (a plain-text error page): its text is the verdict.
+        texts.append((resp.text or "")[:4096])
+    for text in texts:
+        low = text.lower()
+        if any(m in low for m in UNSUPPORTED_MARKERS):
+            return text.strip()[:300]
+    return None
+
+
+def _idle_classes():
+    """Query classes with no supported qtype left to send (mixed profile:
+    "pathfinder" against BTE). Their users idle, so they put no load on."""
+    return [cls for cls, corpus, _w in USER_CLASSES
+            if all(qt in COLLECTOR.unsupported_qtypes for qt, _, _ in corpus)]
+
+
+def _active_user_share():
+    """Fraction of users (by class weight) that still have work to send."""
+    idle = set(_idle_classes())
+    total = sum(w for _c, _corpus, w in USER_CLASSES)
+    live = sum(w for c, _corpus, w in USER_CLASSES if c not in idle)
+    return live / total if total else 1.0
 
 
 def _stage_stats(idx, qtype):
@@ -603,11 +685,17 @@ def _stage_quality(row):
                        else "no completed requests"),
         })
     users = row["users"]
-    if users and n and row["concurrency"] < users * MIN_CONCURRENCY_RATIO:
+    # Users of a class the service refused as unsupported idle, so judge the
+    # concurrency against the users that were actually sending.
+    share = _active_user_share()
+    active = users * share if users else users
+    if active and n and row["concurrency"] < active * MIN_CONCURRENCY_RATIO:
+        who = (f"{users} users" if share >= 1.0
+               else f"the {active:.0f} of {users} users sending supported queries")
         issues.append({
             "kind": "in_flight_bleed",
             "detail": (f"effective concurrency {row['concurrency']:.1f} is only "
-                       f"{row['concurrency'] / users:.0%} of {users} users -- "
+                       f"{row['concurrency'] / active:.0%} of {who} -- "
                        f"most queries did not finish inside the stage, so they "
                        f"landed in the next one"),
         })
@@ -625,7 +713,14 @@ def _class_p99s(cp, class_rows, users, default_bar):
     """
     bars = cp.get("class_p99_slo_ms", {})
     p99s, misses = {}, []
+    idle = set(_idle_classes())
     for cls, _corpus, _w in USER_CLASSES:
+        if cls in idle:
+            # The service refused this class outright: there is nothing to
+            # judge, and "no completed requests" would be a capacity miss for
+            # a capability the service never had.
+            p99s[cls] = None
+            continue
         row = class_rows.get((users, cls))
         bar = bars.get(cls, default_bar)
         if row is None or not row["requests"]:
@@ -652,6 +747,7 @@ def _evaluate_checkpoints(overall_rows, class_rows=()):
     by_users = {r["users"]: r for r in overall_rows if r["users"] is not None}
     by_class = {(r["users"], r["class"]): r for r in class_rows
                 if r["users"] is not None}
+    idle = _idle_classes() if MULTI_CLASS else []
     results = []
     for cp in CHECKPOINTS:
         users = cp["users"]
@@ -691,7 +787,9 @@ def _evaluate_checkpoints(overall_rows, class_rows=()):
             "concurrency": row["concurrency"],
             "class_p99_ms": class_p99,
             "verdict": "FAIL" if misses else "PASS",
-            "detail": "; ".join(misses) if misses else "within limits",
+            "detail": ("; ".join(misses) if misses else "within limits")
+                      + (f" ({', '.join(idle)} not judged: unsupported by the "
+                         f"service)" if idle else ""),
         })
     return results
 
@@ -719,7 +817,14 @@ class TRAPIUser(HttpUser):
         if _draining():
             gevent.sleep(DRAIN_RECHECK_S)
             return
-        qtype, builder = random.choice(self._flat)
+        flat = self._flat
+        if COLLECTOR.unsupported_qtypes:
+            # Never re-send a qtype the service has refused as unsupported.
+            flat = [c for c in flat if c[0] not in COLLECTOR.unsupported_qtypes]
+            if not flat:
+                gevent.sleep(UNSUPPORTED_PARK_S)
+                return
+        qtype, builder = random.choice(flat)
         payload = builder()
         token = COLLECTOR.begin_inflight(qtype)
         try:
@@ -750,14 +855,24 @@ class TRAPIUser(HttpUser):
                 else:
                     failed = True
                     error = f"server error {resp.status_code}"
-                    resp.failure(error)
             else:
                 if resp.status_code == 200:
                     resp.success()
                 else:
                     failed = True
                     error = f"status {resp.status_code}"
-                    resp.failure(error)
+            if failed:
+                # A refusal to answer this kind of query at all (BTE on
+                # Pathfinder) is a capability gap, not a load failure: tally it
+                # apart -- no error, no latency sample -- and stop sending it.
+                # (Not for malformed_query: its 5xx is a server bug by design.)
+                reason = (None if qtype == "malformed_query"
+                          else _unsupported_reason(resp))
+                if reason is not None:
+                    resp.success()
+                    COLLECTOR.record_unsupported(qtype, resp.status_code, reason)
+                    return
+                resp.failure(error)
             latency_ms = resp.request_meta["response_time"] or 0.0
             # Did it answer with the results the profile says it has? Only
             # checked on a query that succeeded -- a 502 has no answer count to
@@ -1406,6 +1521,23 @@ def on_test_stop(environment, **_kw):
     # Pass/fail acceptance checkpoints (targets that configure them).
     checkpoints = _evaluate_checkpoints(overall_rows, class_rows)
 
+    # Query types the service refused as unsupported (BTE on Pathfinder). None
+    # of these are in the stats above; this is the only place they show.
+    unsupported_summary = None
+    if COLLECTOR.unsupported_qtypes:
+        refusal_stages = sorted(COLLECTOR.unsupported.keys())
+        unsupported_summary = {
+            "qtypes": {
+                qt: {**info, "refusals": sum(COLLECTOR.unsupported[s].get(qt, 0)
+                                             for s in refusal_stages)}
+                for qt, info in COLLECTOR.unsupported_qtypes.items()},
+            # Classes with nothing left to send: their users idled.
+            "idle_classes": _idle_classes() if MULTI_CLASS else [],
+            "active_user_share": round(_active_user_share(), 3),
+            "refusals_by_stage": {
+                str(s): dict(COLLECTOR.unsupported[s]) for s in refusal_stages},
+        }
+
     # Result-count expectations: per-stage roll-up + the deviation rows. Empty
     # when the mode is "off", and also when nothing the corpus sent had a
     # profiled baseline (every KP qtype, Pathfinder) -- in which case there is
@@ -1636,6 +1768,10 @@ def on_test_stop(environment, **_kw):
         # examples of each live -- see error_samples.py.
         "error_samples": error_summary,
     }
+    if unsupported_summary:
+        summary["config"]["unsupported_markers"] = list(UNSUPPORTED_MARKERS)
+        summary["config"]["unsupported_statuses"] = list(UNSUPPORTED_STATUSES)
+        summary["unsupported"] = unsupported_summary
     if result_summary:
         summary["config"]["result_check"] = RESULT_CHECK
         summary["config"]["result_shortfall_tolerance"] = RESULT_SHORTFALL_TOLERANCE
@@ -1695,10 +1831,27 @@ def on_test_stop(environment, **_kw):
             f"{cls} {w}" for cls, _c, w in USER_CLASSES) + ")")
         print(f"{'stg':>3} {'class':<11} {'req':>5} {'p50':>7} {'p99':>8} "
               f"{'err%':>6} {'conc':>7}")
+        idle = set(unsupported_summary["idle_classes"]
+                   if unsupported_summary else ())
         for r in class_rows:
             print(f"{r['stage']:>3} {r['class']:<11} {r['requests']:>5} "
                   f"{r['p50_ms']:>7.0f} {r['p99_ms']:>8.0f} "
-                  f"{r['error_rate']*100:>5.1f}% {r['concurrency']:>7.1f}")
+                  f"{r['error_rate']*100:>5.1f}% {r['concurrency']:>7.1f}"
+                  + ("  (unsupported)" if r["class"] in idle else ""))
+    if unsupported_summary:
+        u = unsupported_summary
+        print("-" * 64)
+        print(f"UNSUPPORTED BY THE SERVICE ({len(u['qtypes'])} query type(s); "
+              f"not counted as errors, not sent again)")
+        for qt, info in u["qtypes"].items():
+            print(f"  {qt}: refused {info['refusals']}x from stage "
+                  f"{info['first_stage']} (HTTP {info['status']}) -- "
+                  f"{info['reason']}")
+        if u["idle_classes"]:
+            print(f"  [!] {', '.join(u['idle_classes'])} users idled: only "
+                  f"{u['active_user_share']:.0%} of each stage's users put load "
+                  f"on the service,\n      so this is not the mixed workload -- "
+                  f"read it as the supported classes alone.")
     print("-" * 64)
     if knee:
         print(f"Max sustainable concurrency: {knee['concurrency']} "
@@ -1893,7 +2046,7 @@ def on_test_stop(environment, **_kw):
     _stash_headline(knee, checkpoints, red_flags if PROTOCOL == "async" else [],
                     knee_unsupported=knee_unsupported,
                     flagged_stages=len(stage_warnings),
-                    errors=error_summary)
+                    errors=error_summary, unsupported=unsupported_summary)
 
 
 # ----------------------------------------------------------------------------
@@ -1904,7 +2057,7 @@ _HEADLINE = []
 
 
 def _stash_headline(knee, checkpoints, red_flags, *, knee_unsupported=False,
-                    flagged_stages=0, errors=None):
+                    flagged_stages=0, errors=None, unsupported=None):
     paint = console.painter()
     lines = [paint("─" * 64, "grey")]
     if knee:
@@ -1951,6 +2104,11 @@ def _stash_headline(knee, checkpoints, red_flags, *, knee_unsupported=False,
         where = (f"; {errors['saved']} example(s) in {errors['dir']}/"
                  if errors["saved"] else "")
         lines.append(paint(f"ERRORS: {top}{where}", "yellow"))
+    if unsupported:
+        qts = ", ".join(unsupported["qtypes"])
+        idle = (f"; {', '.join(unsupported['idle_classes'])} users idled"
+                if unsupported["idle_classes"] else "")
+        lines.append(paint(f"UNSUPPORTED (not errors): {qts}{idle}", "yellow"))
     lines.append(paint(f"Reports: {CSV_PREFIX}_summary.json "
                        f"and {CSV_PREFIX}_stages.csv", "grey"))
     lines.append(paint("─" * 64, "grey"))

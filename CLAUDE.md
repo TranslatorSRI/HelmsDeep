@@ -187,7 +187,10 @@ Package `helmsdeep/`:
   (`off`/`report`/`enforce`, default **`report`**) and
   `RESULT_SHORTFALL_TOLERANCE` (default 0.5), with per-target overrides
   `result_check` / `result_shortfall_tolerance` -- see **Result-count
-  expectations** below.
+  expectations** below. And the unsupported-query-class knobs
+  `UNSUPPORTED_STATUSES` (`(501,)`) / `UNSUPPORTED_MARKERS` (per-target
+  override `unsupported_markers`) -- see **Unsupported query classes** in the
+  conventions.
   Per-target ramps/SLOs live here because cost profiles differ wildly by layer:
   `kps` holds each stage 5 minutes with a 60s cooldown because Retriever answers
   in seconds to tens of seconds, not the milliseconds the old ~40-KP layer did --
@@ -392,6 +395,19 @@ Package `helmsdeep/`:
     polling to `COMPLETION_MAX_POLL_S` and appends one `COLLECTOR.record_completion`
     row (end-to-end time + whether it `finished`); queries that finish within
     `MAX_POLL_S` record their completion row inline.
+  - `_unsupported_reason(resp)` — on the sync path, decides whether a failed
+    response is the service refusing this *kind* of query (BTE on Pathfinder)
+    rather than failing it: status in `UNSUPPORTED_STATUSES`, or a marker in the
+    body's top-level `status`/`description` or an ERROR/CRITICAL log message
+    (never WARNING/INFO logs). `_run_sync` then marks the Locust request a
+    success, calls `COLLECTOR.record_unsupported` (`unsupported` per
+    stage/qtype + `unsupported_qtypes`, first refusal per qtype) and returns
+    **without** `COLLECTOR.record`. Not applied to `malformed_query`. `query()`
+    filters `unsupported_qtypes` out of `self._flat`, and a user with nothing
+    left parks on `gevent.sleep(UNSUPPORTED_PARK_S)`. `_idle_classes()` /
+    `_active_user_share()` feed `_class_p99s` (an idle class is not judged),
+    `_stage_quality` (bleed is judged against the active users), and the
+    `unsupported` summary block / printed block / headline line.
   - `_check_results(qtype, payload, count, latency_ms)` + `_count_sync_results`
     — the result-count expectation (see **Result-count expectations**). `count`
     is a **callable**, not a number: the baseline lookup is a dict hit while the
@@ -727,6 +743,18 @@ cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
   (`zero_result_done`) and still raises a red flag, the per-query debug log still
   carries the `Done with 0 results` note (its `failed` column follows the policy),
   and the summary JSON + printed ARS health block record which policy was in force.
+- **Unsupported query classes are a capability gap, not an error.** BTE answers
+  every Pathfinder query with a 500 saying `BTE does not support Pathfinder type
+  queries.` (Shepherd's `workers/bte/worker.py`). On the sync path that is
+  classed as *unsupported* (`_unsupported_reason`): no error, no latency
+  sample, and the qtype is not sent again for the run, so an `aras_mixed` run
+  against BTE measures the inferred 2/3 alone and says so (`unsupported` in
+  `summary.json`, printed block, headline). The match deliberately reads only
+  the response's own verdict (top-level status/description, ERROR logs), so a
+  WARNING mentioning "not supported" inside a genuine 500 stays an error. If
+  you widen the markers, keep that property: a false match silently drops a
+  query class from the run. The ARS path doesn't need it, since the ARS merges
+  whichever ARAs answered.
 - **Intermediate errors are the trouble a query survived.** The poll loop retries
   through non-200 polls, unparseable poll bodies and a bad merge fetch, so none of
   them change `ars_status` — which means a query that fought through thirty 502s
