@@ -97,6 +97,17 @@ helmsdeep --targets ars_mixed \
   TRAPI 2.0 service rejects. A full version (`2.0.0`) is accepted, and so is the
   `HELMSDEEP_TRAPI_VERSION` environment variable. The banner and
   `summary.json`'s `config.trapi_version` say which was used.
+- `--query-parameters PARAMS` merges extra parameters into **every** query the
+  run sends, overriding what the corpus sets itself — e.g.
+  `--query-parameters bypass_cache=false` lets the ARA/ARS answer from cache.
+  Give `KEY=VALUE` (the value is read as JSON when it parses, so `false`, `0`
+  and `[1, 2]` arrive typed; anything else is a string) or a JSON object
+  (`'{"bypass_cache": false, "timeout": 300}'`); repeat the flag to add more,
+  later values win. They go under the query's `parameters` for TRAPI 2.0 and
+  top-level for 1.x. The banner and `summary.json`'s `config.query_parameters`
+  record them. Overriding Retriever's `tier` this way sends one tier for every
+  KP query instead of the per-shape tier the corpus picks. `helmsdeep-profile`
+  takes the same flag, so a profile can match the load test's queries.
 - `--save-errors [N]` keeps full examples of each error kind (up to N per
   stage, default 3) under `<prefix>_errors/` for the post-mortem. **Off unless
   given** — a run on a box with little disk or RAM writes nothing, though error

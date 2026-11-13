@@ -761,6 +761,12 @@ def _parse_args(argv=None):
              f"{config.TRAPI_VERSION}). Profile in the version the load test "
              f"will send, so the queries match byte for byte.",
     )
+    parser.add_argument(
+        "--query-parameters", action="append", default=None, metavar="PARAMS",
+        help="Extra parameters merged into every probe query, exactly as "
+             "helmsdeep --query-parameters does (KEY=VALUE or a JSON object; "
+             "repeatable). Profile with the parameters the load test will send.",
+    )
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed for --sample/--shuffle.")
     parser.add_argument(
@@ -869,6 +875,13 @@ def main(argv=None):
         # the corpus builders read it as they build each query
         os.environ["HELMSDEEP_TRAPI_VERSION"] = config.trapi_minor(
             args.trapi_version)
+    if args.query_parameters:
+        try:
+            params = config.parse_query_parameters(args.query_parameters)
+        except ValueError as exc:
+            print(f"--query-parameters: {exc}", file=sys.stderr)
+            return 2
+        os.environ[config.QUERY_PARAMETERS_ENV] = json.dumps(params)
     paint = console.painter()
     cuts = _cuts(args.bin_cuts)
     prefix = args.out

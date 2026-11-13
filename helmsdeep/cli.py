@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -133,6 +134,18 @@ def _parse_args(argv=None):
              f"2.0.0 is fine). Default {config.TRAPI_VERSION}. 2.0 sends "
              f"bypass_cache under the query's 'parameters'; 1.x as a top-level "
              f"field, which a TRAPI 2.0 service rejects.",
+    )
+    parser.add_argument(
+        "--query-parameters",
+        action="append",
+        default=None,
+        metavar="PARAMS",
+        help="Extra parameters merged into EVERY query sent, overriding what "
+             "the corpus sets itself (e.g. bypass_cache, Retriever's tier). "
+             "Either KEY=VALUE (VALUE read as JSON when it parses, else as a "
+             "string) or a JSON object; repeatable, later values win. Placed "
+             "under the query's 'parameters' for TRAPI 2.0, top-level for 1.x. "
+             "E.g. --query-parameters bypass_cache=false",
     )
     parser.add_argument(
         "--csv-prefix",
@@ -263,6 +276,16 @@ def main(argv=None):
     trapi = (args.trapi_version
              or config.trapi_minor(env.get("HELMSDEEP_TRAPI_VERSION"))
              or config.TRAPI_VERSION)
+    # Extra query parameters reach the corpus builders as one JSON object.
+    if args.query_parameters:
+        try:
+            params = config.parse_query_parameters(args.query_parameters)
+        except ValueError as exc:
+            print(f"--query-parameters: {exc}", file=sys.stderr)
+            return 2
+        env[config.QUERY_PARAMETERS_ENV] = json.dumps(params)
+    else:
+        params = None
     # Error-sample saving is opt-in: the locustfile reads the per-kind cap from
     # this env var and treats absent/0 as "count kinds, write nothing" -- so a
     # run on a box with little disk or RAM never accumulates response bodies.
@@ -299,6 +322,9 @@ def main(argv=None):
     print(paint(f"           ·  {args.host}{tgt['endpoint']}  ·  TRAPI {trapi}",
                 "grey"))
     _print_plan(plan, natural_s, budget_s, scale)
+    if params:
+        print(paint(f"           ·  query parameters (every query): "
+                    f"{json.dumps(params)}", "grey"))
     # Say which answer-count policy is in force: in "report" mode it changes no
     # measurement, in "enforce" mode it changes the knee, and that difference
     # should not be something you have to remember you set.
