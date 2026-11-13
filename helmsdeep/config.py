@@ -106,6 +106,49 @@ def trapi_minor(version):
     return minor if minor in TRAPI_VERSIONS else None
 
 
+# Extra query parameters merged into EVERY query the corpus builds (the CLI's
+# --query-parameters, carried to the load test and the profiler as a JSON object
+# in HELMSDEEP_QUERY_PARAMETERS). They are placed where the TRAPI version keeps
+# query options -- the ``parameters`` object in 2.0, top-level fields in 1.x --
+# and they WIN over what a builder set itself (``bypass_cache``, Retriever's
+# ``tier``), so ``bypass_cache=false`` turns caching back on for a whole run.
+QUERY_PARAMETERS_ENV = "HELMSDEEP_QUERY_PARAMETERS"
+
+
+def parse_query_parameters(items):
+    """Merge ``--query-parameters`` values into one dict, later items winning.
+
+    Each item is either a JSON object (``'{"bypass_cache": false}'``) or a
+    ``KEY=VALUE`` pair whose VALUE is read as JSON when it parses
+    (``false``, ``0``, ``[1, 2]``, ``"0"``) and as a plain string otherwise.
+    Raises ValueError with a message fit for the user.
+    """
+    import json
+    merged = {}
+    for item in items or ():
+        text = str(item).strip()
+        if text.startswith("{"):
+            try:
+                value = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON in {text!r}: {exc}") from None
+            if not isinstance(value, dict):
+                raise ValueError(f"{text!r} is not a JSON object")
+            merged.update(value)
+            continue
+        key, sep, raw = text.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(
+                f"{text!r}: expected KEY=VALUE or a JSON object, e.g. "
+                f"bypass_cache=false or '{{\"bypass_cache\": false}}'")
+        try:
+            merged[key] = json.loads(raw)
+        except json.JSONDecodeError:
+            merged[key] = raw
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Result-count expectations.
 #

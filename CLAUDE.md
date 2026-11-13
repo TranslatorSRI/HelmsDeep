@@ -216,7 +216,11 @@ Package `helmsdeep/`:
   `--result-check off|report|enforce` (sets `HELMSDEEP_RESULT_CHECK`; the banner
   states which mode is in force, because `enforce` changes the knee),
   `--trapi-version 2.0|1.6` (normalized to major.minor by `config.trapi_minor`;
-  sets `HELMSDEEP_TRAPI_VERSION`; the banner shows the version in force), the two
+  sets `HELMSDEEP_TRAPI_VERSION`; the banner shows the version in force),
+  `--query-parameters PARAMS` (repeatable; `KEY=VALUE` with the value read as
+  JSON when it parses, or a JSON object; merged by
+  `config.parse_query_parameters` and passed as one JSON object in
+  `HELMSDEEP_QUERY_PARAMETERS`; the banner prints it), the two
   output flags `--no-live` (sets `HELMSDEEP_LIVE=0`) / `--verbose`, and the
   opt-in `--save-errors [N]` (`nargs="?"`, const = `config.ERROR_SAMPLES_PER_KIND`,
   default 0; sets `HELMSDEEP_ERROR_SAMPLES=N` only when > 0 -- absent means
@@ -472,6 +476,15 @@ Package `helmsdeep/`:
     qualifier set: `constraints.qualifiers` (a list of plain
     `{qualifier_type_id: value}` mappings) for 2.0, `qualifier_constraints`
     (`[{"qualifier_set": [{qualifier_type_id, qualifier_value}]}]`) for 1.x.
+    `_apply_query_parameters` runs last in both `_qg` and `_pathfinder_qg`
+    and merges the run's `--query-parameters` (`query_parameters()`, read from
+    `HELMSDEEP_QUERY_PARAMETERS` per query) into **every** query, overriding
+    what the builder set (`bypass_cache`, `tier`): under `parameters` for 2.0,
+    top-level for 1.x except a key the builder already nested in `parameters`
+    (`tier`), which is overridden in place. The locustfile reads it once at
+    import (bad JSON fails before any user spawns) and records it as
+    `summary.json`'s `config.query_parameters`; `helmsdeep-profile` takes the
+    same flag. With no flag the queries are unchanged.
     The 1.x query shape is byte-for-byte what 0.3.0 sent; under 2.0 every
     corpus query validates against `translator_tom`'s TRAPI 2.0 `Query` with no
     field the model doesn't define, bar Retriever's own `parameters.tier`.
@@ -594,6 +607,10 @@ pip install -e .          # Python >= 3.11; installs locust
 helmsdeep --targets kps --host https://your-retriever.example.org --csv-prefix run1
 helmsdeep --targets aras --host https://your-ara.example.org --csv-prefix run1
 helmsdeep --targets ars  --host https://ars.ci.transltr.io --csv-prefix run1
+
+# Extra parameters merged into every query (override the corpus's own):
+helmsdeep --targets aras --host https://your-ara.example.org \
+    --query-parameters bypass_cache=false
 
 # Pathfinder is its own (heavier) run type, ARA/ARS only:
 helmsdeep --targets aras_pathfinder --host https://your-ara.example.org --csv-prefix pf1

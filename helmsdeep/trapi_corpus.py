@@ -39,6 +39,7 @@ the pools below are built from it at import. The same file is the baseline a run
 compares its result counts against -- see `baseline_for`.
 """
 
+import copy
 import json
 import os
 import random
@@ -299,6 +300,49 @@ def _set_bypass_cache(env, bypass_cache):
         env["bypass_cache"] = bypass_cache
 
 
+def query_parameters():
+    """The run's extra query parameters (the CLI's --query-parameters), as a
+    dict; empty when none were given.
+
+    Read when each query is built, like ``trapi_version()``, so the flag
+    reaches the load test and the profiler alike.
+    """
+    raw = os.environ.get(config.QUERY_PARAMETERS_ENV)
+    if not raw:
+        return {}
+    try:
+        params = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{config.QUERY_PARAMETERS_ENV}={raw!r}: invalid JSON ({exc})"
+        ) from None
+    if not isinstance(params, dict):
+        raise ValueError(
+            f"{config.QUERY_PARAMETERS_ENV}={raw!r}: expected a JSON object")
+    return params
+
+
+def _apply_query_parameters(env):
+    """Merge the run's --query-parameters into a built query, overriding what
+    the builder set.
+
+    TRAPI 2.0 keeps every query option in ``parameters``. 1.x has no such
+    object for options, so they go top-level (as ``bypass_cache`` does) --
+    except a key the builder already put under ``parameters`` (Retriever's
+    ``tier``), which is overridden where it lives.
+    """
+    params = query_parameters()
+    if not params:
+        return env
+    if trapi_version().startswith("2."):
+        env.setdefault("parameters", {}).update(copy.deepcopy(params))
+    else:
+        nested = env.get("parameters", {})
+        for key, value in params.items():
+            (nested if key in nested else env)[key] = copy.deepcopy(value)
+    return env
+
+
 def _set_qualifiers(edge, qualifiers):
     """Constrain a query edge to one qualifier set (``{type_id: value}``), in
     the TRAPI version's shape.
@@ -327,6 +371,9 @@ def _qg(nodes, edges, tier=None, bypass_cache=None):
       - ``bypass_cache``: forces fresh reasoning. Used by creative-mode (ARA)
         queries so the load test measures reasoning cost, not cache hits.
         Placed per the TRAPI version (see ``_set_bypass_cache``).
+
+    The run's --query-parameters are merged in last and override both (see
+    ``_apply_query_parameters``).
     """
     env = {
         "message": {
@@ -336,7 +383,7 @@ def _qg(nodes, edges, tier=None, bypass_cache=None):
     if tier is not None:
         env["parameters"] = {"tier": tier}
     _set_bypass_cache(env, bypass_cache)
-    return env
+    return _apply_query_parameters(env)
 
 
 def one_hop_lookup_pinned():
@@ -495,7 +542,7 @@ def _pathfinder_qg(nodes, paths, bypass_cache=True):
         }
     }
     _set_bypass_cache(env, bypass_cache)
-    return env
+    return _apply_query_parameters(env)
 
 
 def pathfinder_drug_disease():
