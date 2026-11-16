@@ -699,6 +699,11 @@ cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
   user in a single dispatch iteration (spawn rate = the stage's user count) and
   gates `TRAPIUser.query` on `_draining()`. Without the gate the frozen stage
   keeps collecting requests it never launched under load, inflating its RPS.
+- **Ctrl+C on Windows.** gevent's libuv loop (Windows) drops the
+  `KeyboardInterrupt` ("Unhandled error with no watcher"), so `_windows_ctrl_c`
+  re-throws it into the main greenlet, where Locust stops and writes the
+  reports. The CLI waits on the child instead of `subprocess.run`, which kills
+  it 0.25 s after Ctrl+C.
 - **Closed-loop load.** `TRAPIUser.wait_time = constant(0)` — no think time; users
   hammer the endpoint as fast as responses return.
 - **A compressed run is not a measurement.** `--time-budget`/`--quick` scale

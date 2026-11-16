@@ -58,7 +58,9 @@ import itertools
 import json
 import logging
 import os
+import signal
 import statistics
+import sys
 import time
 from collections import defaultdict
 
@@ -1335,6 +1337,17 @@ def _start_dashboard(environment, **_kw):
 def _set_stop_timeout(environment, **_kw):
     if COOLDOWN_S:
         environment.stop_timeout = REQUEST_TIMEOUT
+
+
+# Windows: gevent drops Ctrl+C there (it lands inside a libuv callback and is
+# logged as "Unhandled error with no watcher"), so the run never stopped. Hand
+# it to the main greenlet, where Locust catches it and shuts down normally.
+@events.init.add_listener
+def _windows_ctrl_c(**_kw):
+    if sys.platform == "win32":
+        hub = gevent.get_hub()
+        signal.signal(signal.SIGINT, lambda *_: hub.loop.run_callback_threadsafe(
+            hub.parent.throw, KeyboardInterrupt))
 
 
 # One runnable Locust user class per query class, weighted by its share of the
