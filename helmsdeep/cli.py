@@ -340,16 +340,14 @@ def main(argv=None):
                     f"(up to {args.save_errors} per failure kind per stage)",
                     "grey"))
     print()
-    # Not subprocess.run: on Ctrl+C it gives the child 0.25s and then kills it,
-    # which is exactly the window Locust needs to stop users and write the
-    # reports. The terminal delivers Ctrl+C to the child too (same console /
-    # process group), so the parent's only job is to keep waiting for it.
+    # Not subprocess.run: it kills the child 0.25s after Ctrl+C, before Locust
+    # writes the reports. The child gets the Ctrl+C too; just wait for it.
     proc = subprocess.Popen(cmd, env=env)
     while True:
         try:
             return proc.wait()
         except KeyboardInterrupt:
-            continue
+            pass
 
 
 if __name__ == "__main__":
