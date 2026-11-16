@@ -1337,6 +1337,52 @@ def _set_stop_timeout(environment, **_kw):
         environment.stop_timeout = REQUEST_TIMEOUT
 
 
+# Ctrl+C on gevent's libuv loop -- the only loop gevent has on Windows. Locust
+# stops a headless run by catching KeyboardInterrupt around main_greenlet.join()
+# (save the HTML report, fire test_stop -> on_test_stop writes every CSV, print
+# the tables). Python's default SIGINT handler raises that KeyboardInterrupt at
+# the next bytecode, and on libuv the next bytecode is almost always the first
+# line of a CFFI loop callback, where gevent can only log "Unhandled error with
+# no watcher" and drop it. So on Windows Ctrl+C printed a traceback and the run
+# carried on. This handler raises nothing in signal context: it queues the
+# KeyboardInterrupt to be thrown into the main greenlet from the hub, which is
+# where Locust is waiting for it. A second Ctrl+C quits at once, without
+# waiting for in-flight queries -- and without the reports.
+def _libuv_loop():
+    try:
+        return "libuv" in type(gevent.get_hub().loop).__module__
+    except Exception:
+        return False
+
+
+@events.init.add_listener
+def _bridge_ctrl_c(environment, **_kw):
+    if isinstance(environment.runner, WorkerRunner) or not _libuv_loop():
+        return
+    import signal
+    hub = gevent.get_hub()
+    presses = []
+
+    def _interrupt_main():
+        if DASHBOARD is not None:
+            DASHBOARD.stop()
+        wait = int(environment.stop_timeout or 0)
+        print("\nCtrl+C -- stopping"
+              + (f": in-flight queries get up to {wait}s to finish" if wait else "")
+              + ". Reports are written on the way out; Ctrl+C again to quit "
+              "now without them.", flush=True)
+        hub.parent.throw(KeyboardInterrupt)
+
+    def _on_sigint(_signum, _frame):
+        presses.append(time.time())
+        if len(presses) > 1:
+            os.write(2, b"\nSecond Ctrl+C -- quitting without reports.\n")
+            os._exit(130)
+        hub.loop.run_callback_threadsafe(_interrupt_main)
+
+    signal.signal(signal.SIGINT, _on_sigint)
+
+
 # One runnable Locust user class per query class, weighted by its share of the
 # users. Locust discovers user classes from this module's globals, so they are
 # bound here by name (InferredUser, PathfinderUser, ShepherdUser, ...). A user

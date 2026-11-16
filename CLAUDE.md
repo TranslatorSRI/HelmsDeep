@@ -699,6 +699,19 @@ cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
   user in a single dispatch iteration (spawn rate = the stage's user count) and
   gates `TRAPIUser.query` on `_draining()`. Without the gate the frozen stage
   keeps collecting requests it never launched under load, inflating its RPS.
+- **Ctrl+C stops a run gracefully, on Windows too.** Locust stops a headless
+  run by catching `KeyboardInterrupt` around `main_greenlet.join()`, then writes
+  the HTML report and fires `test_stop` (so `on_test_stop` writes every CSV).
+  On gevent's libuv loop -- the only loop on Windows -- the default SIGINT
+  handler's `KeyboardInterrupt` lands inside a CFFI loop callback, where gevent
+  logs `Unhandled error with no watcher` and drops it, so the run never stopped.
+  `_bridge_ctrl_c` (an `@events.init` listener, libuv loop only, not on
+  workers) replaces the handler with one that raises nothing in signal context
+  and throws the `KeyboardInterrupt` into the main greenlet from the hub. A
+  second Ctrl+C `os._exit(130)`s at once, without reports. The CLI waits on the
+  child with `Popen.wait()` in a loop that swallows `KeyboardInterrupt`, never
+  `subprocess.run`, which kills the child 0.25 s after a Ctrl+C -- far too soon
+  for Locust to drain users and write the reports.
 - **Closed-loop load.** `TRAPIUser.wait_time = constant(0)` — no think time; users
   hammer the endpoint as fast as responses return.
 - **A compressed run is not a measurement.** `--time-budget`/`--quick` scale
