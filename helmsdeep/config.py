@@ -114,6 +114,10 @@ def trapi_minor(version):
 # ``tier``), so ``bypass_cache=false`` turns caching back on for a whole run.
 QUERY_PARAMETERS_ENV = "HELMSDEEP_QUERY_PARAMETERS"
 
+# Sent as the top-level TRAPI ``submitter`` on every query (same field in 1.x
+# and 2.0), so a service's logs can tell load-test traffic from real traffic.
+SUBMITTER = "HelmsDeep"
+
 
 def parse_query_parameters(items):
     """Merge ``--query-parameters`` values into one dict, later items winning.

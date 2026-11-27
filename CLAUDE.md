@@ -187,7 +187,8 @@ Package `helmsdeep/`:
   (`off`/`report`/`enforce`, default **`report`**) and
   `RESULT_SHORTFALL_TOLERANCE` (default 0.5), with per-target overrides
   `result_check` / `result_shortfall_tolerance` -- see **Result-count
-  expectations** below. And the unsupported-query-class knobs
+  expectations** below. `SUBMITTER` (`"HelmsDeep"`) is the TRAPI `submitter`
+  every query carries. And the unsupported-query-class knobs
   `UNSUPPORTED_STATUSES` (`(501,)`) / `UNSUPPORTED_MARKERS` (per-target
   override `unsupported_markers`) -- see **Unsupported query classes** in the
   conventions.
@@ -485,7 +486,11 @@ Package `helmsdeep/`:
     import (bad JSON fails before any user spawns) and records it as
     `summary.json`'s `config.query_parameters`; `helmsdeep-profile` takes the
     same flag. With no flag the queries are unchanged.
-    The 1.x query shape is byte-for-byte what 0.3.0 sent; under 2.0 every
+    Both envelopes (`_qg` and `_pathfinder_qg`) also stamp the top-level
+    `submitter` (`config.SUBMITTER` = `"HelmsDeep"`, the same field in 1.x and
+    2.0) on **every** query, so a service's logs can tell load-test traffic
+    from real traffic.
+    Bar that `submitter`, the 1.x query shape is what 0.3.0 sent; under 2.0 every
     corpus query validates against `translator_tom`'s TRAPI 2.0 `Query` with no
     field the model doesn't define, bar Retriever's own `parameters.tier`.
     `trapi_version()` reads `HELMSDEEP_TRAPI_VERSION`
