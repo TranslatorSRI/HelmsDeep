@@ -785,6 +785,10 @@ quick visual feel and for sharing a screenshot.
 - **Tier is per query (Retriever only).** Retriever exposes `parameters.tier`
   (0 or 1) to pick its backend graph. `RETRIEVER_CORPUS` pairs multi-hop shapes
   with tier 0 and single-hop shapes with tier 1. ARA queries carry no tier.
+- **Every query names its submitter.** The top-level TRAPI `submitter` field
+  is set to `HelmsDeep` on every query (KP, ARA, ARS, Pathfinder, and the
+  profiler's probes), so a service's logs can tell load-test traffic from real
+  traffic. The value lives in `config.SUBMITTER`.
 - **Shepherd/ARS send inferred + bypass_cache, mixing MVP1 and MVP2.**
   `SHEPHERD_CORPUS` (also used for `ars`) holds creative-mode queries
   (`knowledge_type: "inferred"`, `bypass_cache: true`, under `parameters` in

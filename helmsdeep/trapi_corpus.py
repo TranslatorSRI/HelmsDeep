@@ -374,11 +374,16 @@ def _qg(nodes, edges, tier=None, bypass_cache=None):
 
     The run's --query-parameters are merged in last and override both (see
     ``_apply_query_parameters``).
+
+    Every query also carries the top-level ``submitter`` (``config.SUBMITTER``),
+    the same field in TRAPI 1.x and 2.0, so a service's logs can tell load-test
+    traffic from real traffic.
     """
     env = {
         "message": {
             "query_graph": {"nodes": nodes, "edges": edges}
-        }
+        },
+        "submitter": config.SUBMITTER,
     }
     if tier is not None:
         env["parameters"] = {"tier": tier}
@@ -539,7 +544,8 @@ def _pathfinder_qg(nodes, paths, bypass_cache=True):
     env = {
         "message": {
             "query_graph": {"nodes": nodes, "paths": paths}
-        }
+        },
+        "submitter": config.SUBMITTER,
     }
     _set_bypass_cache(env, bypass_cache)
     return _apply_query_parameters(env)
