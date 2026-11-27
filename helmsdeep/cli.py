@@ -162,10 +162,12 @@ def _parse_args(argv=None):
         metavar="N",
         help=f"Save full examples (request + response body, or the client "
              f"exception) of each distinct error kind under <prefix>_errors/ "
-             f"so a failure can be examined after the run: up to N per kind "
-             f"per stage (default {config.ERROR_SAMPLES_PER_KIND} when N is "
-             f"omitted). Off unless given -- error kinds are still counted in "
-             f"the summary, but nothing is written to disk.",
+             f"so a failure can be examined after the run: up to N per "
+             f"distinct error message per stage (default "
+             f"{config.ERROR_SAMPLES_PER_KIND} when N is omitted). Off unless "
+             f"given -- error kinds, and the distinct messages within each, "
+             f"are still counted in the summary and "
+             f"<prefix>_error_messages.csv, but no example is saved.",
     )
     return parser.parse_args(argv)
 

@@ -108,10 +108,11 @@ helmsdeep --targets ars_mixed \
   record them. Overriding Retriever's `tier` this way sends one tier for every
   KP query instead of the per-shape tier the corpus picks. `helmsdeep-profile`
   takes the same flag, so a profile can match the load test's queries.
-- `--save-errors [N]` keeps full examples of each error kind (up to N per
-  stage, default 3) under `<prefix>_errors/` for the post-mortem. **Off unless
-  given** — a run on a box with little disk or RAM writes nothing, though error
-  kinds are still counted in the summary — see
+- `--save-errors [N]` keeps full examples of each error (up to N per distinct
+  error message per stage, default 3) under `<prefix>_errors/` for the
+  post-mortem. **Off unless given** — a run on a box with little disk or RAM
+  saves no examples, though error kinds and the distinct messages within each
+  are still counted in the summary and `<prefix>_error_messages.csv` — see
   ["Error samples"](#error-samples-prefix_errors) below.
 
 The load profile (users, spawn rate, duration) is driven by the `StepLoad` shape,
@@ -277,6 +278,10 @@ Written to the working directory by the standalone/master node:
 - `<prefix>_ars_completion.csv` — **ARS only**: one row per logical query with its
   end-to-end response time and whether it *eventually* finished — polled past the
   `max_poll_s` failure threshold up to `completion_max_poll_s` (see below)
+- `<prefix>_error_messages.csv` — any target, **whenever anything failed**:
+  one row per distinct error message the service gave, with its error kind,
+  count and stages. This is how you tell apart the different problems behind
+  one status code (see ["Error samples"](#error-samples-prefix_errors) below)
 - `<prefix>_errors/` — **only with `--save-errors`**, any target: saved
   examples of each distinct error kind — the request that was sent and the
   response (status, headers, body) or client-side exception that came back —
@@ -333,26 +338,47 @@ Kinds are named after the failure mode:
 | `ars_done_zero_results` | a `Done` with an empty answer set — saved whichever way `zero_result_is_failure` scores it (`ars.scored_as_failure` says which). |
 | `ars_poll_http_<code>`, `ars_poll_bad_json`, `ars_merge_http_<code>`, `ars_merge_unparseable`, `ars_merge_missing` | **intermediate**: retried past, so the query still reached an outcome (`intermediate: true` in the file). |
 
-Saving is **opt-in**: pass `--save-errors` (or `--save-errors N`) to keep
-examples. Without it a run writes nothing here, deletes nothing, and never
-decodes a failed response's body — the right setting for a box with limited
-disk or RAM — while still counting every error kind for the summary. Samples are
-capped **per kind, per stage** (N, default 3), not per kind overall: the same
-502 at 5 users and at 60 usually has a different body behind it. Every
-occurrence is still **counted**, so the tally is complete even where the files
-are capped. That tally is printed at the end of the run, stored in
-`summary.json` under `error_samples` (per-kind and per-stage counts, plus the
-path of a first example), and repeated in `index.json`:
+**A status code is not a cause.** A service that answers every failure with a
+500 puts all its different problems in one `http_500` kind, so each kind is
+split again by the **message** the service gave. The message is the response's
+own verdict — a TRAPI `status: description`, a `detail`, its last ERROR-level
+log line, or the text of a plain error page — with the parts that vary per
+query (CURIEs, UUIDs, ids, numbers) replaced by placeholders, so one error
+groups together whatever query it was about. This happens on **every run**,
+with or without `--save-errors`: the messages and their counts are printed
+under each kind, stored in `summary.json` (`error_samples.kinds[].messages`),
+and written one per row to `<prefix>_error_messages.csv`. Up to 50 distinct
+messages are tallied per kind (`config.ERROR_MESSAGES_PER_KIND`); any beyond
+that are counted together as `(other messages)`, and a failure with nothing
+readable in its body is `(no message)`. Only a non-2xx response's body is read
+for this, and one over 4 MB is not read at all.
+
+Saving the full examples is **opt-in**: pass `--save-errors` (or
+`--save-errors N`). Without it a run writes nothing here, deletes nothing, and
+keeps no response body — the right setting for a box with limited disk or RAM.
+Samples are capped **per message, per stage** (N, default 3): the common error
+cannot use up the slots a rare one needs, and the same error at 5 users and at
+60 is kept separately. Every occurrence is still **counted**, so the tally is
+complete even where the files are capped. That tally is printed at the end of
+the run, stored in `summary.json` under `error_samples` (per-kind, per-message
+and per-stage counts, plus the path of a first example of each), and repeated
+in `index.json`:
 
 ```
-ERROR SAMPLES (143 error(s) of 3 kind(s); examples in run1_errors/, up to 3 per kind per stage)
+ERROR SAMPLES (143 error(s) of 3 kind(s); examples in run1_errors/, up to 3 per message per stage)
   kind                        count  saved  stages
-  http_502                      131      9  3,4,5
-    e.g. run1_errors/http_502/01_stage3_two_hop_lookup.json
+  http_500                      131     15  3,4,5
+    e.g. run1_errors/http_500/01_stage3_two_hop_lookup.json
+        92 x  Error: Tier <n> backend timed out after <n>s for <curie>  [stage 3,4,5]
+        31 x  Neo4j connection pool exhausted  [stage 4,5]
+         8 x  KeyError: 'knowledge_graph'  [stage 5]
   timeout                        10      6  4,5
     e.g. run1_errors/timeout/01_stage4_one_hop_lookup_open.json
+        10 x  ReadTimeout: HTTPSConnectionPool(host='retriever.example.org', port=<n>): Read timed out. (read timeout=<n>)  [stage 4,5]
   ars_poll_http_502               2      2  4  (intermediate: retried past)
 ```
+
+The first five messages of each kind are printed; the CSV has them all.
 
 Files are written **the moment the error happens**, not at shutdown, so an
 aborted run still leaves its samples behind. The directory is wiped at the
@@ -366,8 +392,14 @@ deliberately not recorded; response headers are.
 # Which kinds, how often, at which stages
 jq '.kinds[] | {kind, occurrences, by_stage}' run1_errors/index.json
 
+# Every distinct message behind each kind, with its count
+jq -r '.error_samples.kinds[] | .kind as $k | .messages[] | [$k, .occurrences, .message] | @tsv' run1_summary.json
+
 # The body of every saved 502
 jq -r '.response.body' run1_errors/http_502/*.json
+
+# The saved examples of one particular message
+jq -r 'select(.message | startswith("Neo4j")) | .response.body' run1_errors/http_500/*.json
 
 # Re-send the query that produced one sample
 jq '.request.json' run1_errors/http_502/01_stage3_two_hop_lookup.json \
