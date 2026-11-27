@@ -222,9 +222,21 @@ UNSUPPORTED_MARKERS = ("does not support", "not supported", "not implemented")
 # CLI's --save-errors [N] (HELMSDEEP_ERROR_SAMPLES=N); error kinds are counted
 # for the summary either way. ERROR_SAMPLES_PER_KIND is the cap when N is
 # omitted: per kind, PER STAGE (the same 502 at 5 users and at 60 usually has a
-# different body behind it). Bodies are truncated to ERROR_SAMPLE_BODY_BYTES.
+# different body behind it) and per message (below). Bodies are truncated to ERROR_SAMPLE_BODY_BYTES.
 ERROR_SAMPLES_PER_KIND = 3
 ERROR_SAMPLE_BODY_BYTES = 64 * 1024
+
+# Error messages: within each kind, errors are grouped by what the service SAID
+# (its description / detail / ERROR log line, with CURIEs, ids and numbers
+# blanked out), because a service that answers every failure with a 500 puts
+# all its different problems in one `http_500` kind. Counted on EVERY run,
+# --save-errors or not: only a non-2xx response's body is read for it, and the
+# sync path already decodes that body to spot an unsupported query class. With
+# --save-errors the cap above applies per kind, per MESSAGE, per stage.
+ERROR_MESSAGES_PER_KIND = 50          # distinct messages tallied per kind; the
+                                      # rest land in "(other messages)"
+ERROR_MESSAGE_CHARS = 200             # a message is cut to this length
+ERROR_MESSAGE_PARSE_BYTES = 4 * 1024 * 1024   # a larger error body isn't read
 
 TARGETS = {
     "kps": {

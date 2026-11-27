@@ -191,7 +191,9 @@ Package `helmsdeep/`:
   every query carries. And the unsupported-query-class knobs
   `UNSUPPORTED_STATUSES` (`(501,)`) / `UNSUPPORTED_MARKERS` (per-target
   override `unsupported_markers`) -- see **Unsupported query classes** in the
-  conventions.
+  conventions. And the error-message grouping knobs
+  `ERROR_MESSAGES_PER_KIND` / `ERROR_MESSAGE_CHARS` /
+  `ERROR_MESSAGE_PARSE_BYTES` (see `error_samples.py`).
   Per-target ramps/SLOs live here because cost profiles differ wildly by layer:
   `kps` holds each stage 5 minutes with a 60s cooldown because Retriever answers
   in seconds to tens of seconds, not the milliseconds the old ~40-KP layer did --
@@ -307,9 +309,30 @@ Package `helmsdeep/`:
   file *immediately* (an aborted run keeps its samples) and always counts the
   occurrence, so `kinds()`/`summary()` are complete even once a `(kind, stage)`
   bucket is full (cap is per kind **per stage** -- the same 502 at 5 and at 60
-  users has different bodies). **Opt-in**: with `per_kind_per_stage=0` (the
-  default, no `--save-errors`) `enabled` is False and the sampler only counts --
-  no file, no directory, no body decoding, and `reset()` doesn't delete either.
+  users has different bodies) **and per message** -- see below). **Opt-in**:
+  with `per_kind_per_stage=0` (the default, no `--save-errors`) `enabled` is
+  False and the sampler only counts -- no file, no directory, no body kept, and
+  `reset()` doesn't delete either.
+  Within a kind, every occurrence is also grouped by the **message** the
+  service gave (`_message()`), because a service that answers every failure
+  with a 500 puts all its problems in one `http_500`. This runs on every run,
+  enabled or not. `response_message(resp)` reads a **non-2xx** response's own
+  verdict (`status: description`, else `detail`/`message`/`error`/`title`,
+  else the last ERROR/CRITICAL log line, else the bare `status`; a non-JSON
+  body is an error page, tags stripped); a status-0 failure uses the client
+  exception; anything else (a 2xx scored as an error: `ars_error`, a
+  shortfall) uses the engine's `error` text, so a 2xx body is still never
+  decoded by a disabled sampler. `normalise_message()` blanks URLs, UUIDs,
+  CURIEs (not `biolink:treats`-style names), hex ids and numbers so one error
+  groups whatever query it was about. At most `messages_per_kind`
+  (`config.ERROR_MESSAGES_PER_KIND`, 50) distinct messages per kind, the rest
+  under `OTHER_MESSAGES`; nothing readable is `NO_MESSAGE`; a body over
+  `config.ERROR_MESSAGE_PARSE_BYTES` (4 MB) is not read. `response_body(resp)`
+  decodes once and memoises on the response; `verdict_texts(resp)` is the
+  shared reading `_unsupported_reason` matches its markers against.
+  `messages(kind)` is the per-message roll-up (`occurrences`/`saved`/`stages`/
+  `by_stage`/`example`) that `kinds()` nests as `messages`; each saved sample
+  and index row carries its `message`.
   When enabled, `reset()` wipes the directory at `test_start`;
   `write_index()` writes `index.json` (tally + every saved sample) at stop.
   `http_kind(resp)` names a kind from a response (`http_502`; status 0 →
@@ -387,7 +410,8 @@ Package `helmsdeep/`:
     written on every terminal path including `SubmitError`/`NoPK`/`Timeout`.
     Every failure on either path also goes through the module-level `_sample()`
     → `SAMPLER` (an `error_samples.ErrorSampler` rooted at `<prefix>_errors`,
-    cap from `HELMSDEEP_ERROR_SAMPLES`, default 0 = count only / write nothing,
+    cap from `HELMSDEEP_ERROR_SAMPLES`, default 0 = count kinds and messages
+    only / save nothing,
     reset on `test_start` on every node; the two `last_poll` descriptions are
     guarded on `SAMPLER.enabled` so a disabled run never decodes a trace body):
     sync failures with the response and
@@ -466,8 +490,11 @@ Package `helmsdeep/`:
     the `ars_completion.csv` sidecar, plus `red_flags` + a `completion` roll-up in
     the summary + printed block. Also `SAMPLER.write_index()` →
     `<prefix>_errors/index.json`, `error_samples` (the sampler's `summary()`)
-    in `summary.json`, a printed ERROR SAMPLES block (kind / count / saved /
-    stages / an example path) and an `ERRORS:` headline line.
+    in `summary.json`, `<prefix>_error_messages.csv` (one row per distinct
+    (kind, message), written whenever anything failed, `--save-errors` or
+    not), a printed ERROR SAMPLES block (kind / count / saved / stages / an
+    example path, then up to `ERROR_MESSAGES_SHOWN` messages per kind with
+    their counts) and an `ERRORS:` headline line.
 - **`trapi_corpus.py`** — the per-component query corpuses:
   - `_qg(nodes, edges, tier=None, bypass_cache=None)` — TRAPI envelope; adds
     scalar `parameters.tier` (KP-only) or `bypass_cache` (ARA/ARS) only when
@@ -667,8 +694,10 @@ cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
   the `<prefix>_ars_completion.csv` sidecar, and a `red_flags` list +
   `completion` roll-up for the `ars` target), with `--save-errors [N]` only a
   `<prefix>_errors/` directory (one JSON file per saved error example, grouped
-  by kind, plus `index.json`; without the flag error kinds are counted in the
-  summary but nothing is written), plus a printed summary table with the knee.
+  by kind, plus `index.json`; without the flag error kinds and messages are
+  counted but no example is saved), (+ `<prefix>_error_messages.csv` whenever
+  anything failed -- one row per distinct message the service gave, per error
+  kind, with its count), plus a printed summary table with the knee.
 
 ## Conventions & gotchas
 
@@ -796,7 +825,13 @@ cp mvp_profile_baselines.json helmsdeep/mvp_baselines.json
   the client exception — written the moment they happen, but **only when the
   run passes `--save-errors`**: the default is count-only, so a run on a box
   with little disk or RAM never accumulates response bodies, and the
-  printed/JSON tally of kinds is the same either way. Adding a new failure
+  printed/JSON tally of kinds is the same either way. The tally goes one level
+  below the status code on every run: each kind is split by the message the
+  service gave (normalised, see `error_samples.py`), and with `--save-errors`
+  the cap is per message, so the rare error behind a wall of identical 500s
+  still gets its own examples. If a service's messages don't group (something
+  unique in every one fills the 50-message cap and the rest land in `(other
+  messages)`), extend `_NORMALISERS`, don't raise the cap. Adding a new failure
   path to the engine means adding a `_sample(...)` call beside its
   `COLLECTOR.record` (terminal) or `issues.add` (intermediate), with a kind
   slug that names the mode, not the query: kinds are what the post-mortem

@@ -39,6 +39,10 @@ Outputs:
   - <prefix>_summary.json       config, all stages, the knee (+ checkpoints,
                                 ars_health/completion/red_flags), and an
                                 error_samples tally of every error kind seen
+                                and of each distinct message within it
+  - <prefix>_error_messages.csv one row per distinct (error kind, message the
+                                service gave), with its count -- written
+                                whenever anything failed
   - <prefix>_errors/            saved examples of each error kind (request +
                                 response body / client exception), one JSON
                                 file each, grouped by kind, + index.json --
@@ -54,6 +58,7 @@ The LoadTestShape drives users/duration, so you do NOT pass -u / -r / -t.
 Per-target load/SLO and the ARS poll knobs live in config.py.
 """
 
+import csv
 import itertools
 import json
 import logging
@@ -184,14 +189,20 @@ QUERY_PARAMETERS = trapi_corpus.query_parameters()
 # saved to <prefix>_errors/ the moment they happen (see error_samples.py). The
 # per-stage tables say a request failed with a 502; the sample says what the 502
 # said. OPT-IN: HELMSDEEP_ERROR_SAMPLES (the CLI's --save-errors [N]) is the
-# per-kind, per-stage cap; absent or 0 means nothing is written and no response
-# body is decoded or kept -- only the count of each kind, for the summary -- so
-# a run on a box with little disk or RAM stays lean.
+# cap on saved files (per kind, per message, per stage); absent or 0 means
+# nothing is written and no response body is kept -- only the count of each
+# kind and of each distinct message within it, for the summary -- so a run on a
+# box with little disk or RAM stays lean. Grouping by message reads the body of
+# a non-2xx response once; a 2xx body is still not decoded unless saving.
 ERROR_SAMPLES_PER_KIND = int(os.environ.get("HELMSDEEP_ERROR_SAMPLES", 0))
+ERROR_MESSAGES_SHOWN = 5   # distinct messages printed per kind; all are in the CSV
 SAMPLER = error_samples.ErrorSampler(
     f"{CSV_PREFIX}_errors",
     per_kind_per_stage=ERROR_SAMPLES_PER_KIND,
     body_limit=config.ERROR_SAMPLE_BODY_BYTES,
+    messages_per_kind=config.ERROR_MESSAGES_PER_KIND,
+    message_chars=config.ERROR_MESSAGE_CHARS,
+    message_parse_bytes=config.ERROR_MESSAGE_PARSE_BYTES,
 )
 
 
@@ -475,24 +486,9 @@ def _unsupported_reason(resp):
         return f"HTTP {status}"
     if not UNSUPPORTED_MARKERS:
         return None
-    try:
-        body = resp.json()
-    except Exception:
-        body = None
-    texts = []
-    if isinstance(body, dict):
-        for key in ("status", "description", "detail", "message"):
-            if isinstance(body.get(key), str):
-                texts.append(body[key])
-        for log in body.get("logs") or []:
-            if (isinstance(log, dict)
-                    and str(log.get("level", "")).upper() in ("ERROR", "CRITICAL")
-                    and isinstance(log.get("message"), str)):
-                texts.append(log["message"])
-    elif body is None:
-        # Not JSON (a plain-text error page): its text is the verdict.
-        texts.append((resp.text or "")[:4096])
-    for text in texts:
+    # The same reading of the body the error sampler groups messages by
+    # (decoded once, memoised on the response).
+    for text in error_samples.verdict_texts(resp):
         low = text.lower()
         if any(m in low for m in UNSUPPORTED_MARKERS):
             return text.strip()[:300]
@@ -1757,6 +1753,20 @@ def on_test_stop(environment, **_kw):
     # tally of every kind seen plus the index of the examples kept for each.
     error_index = SAMPLER.write_index()
     error_summary = SAMPLER.summary()
+    # One row per distinct (kind, message): every different thing the service
+    # said when it failed, with its count. Written whenever anything failed,
+    # --save-errors or not -- it is a tally, not a capture.
+    error_messages_csv = None
+    if error_summary["kinds"]:
+        error_messages_csv = f"{CSV_PREFIX}_error_messages.csv"
+        with open(error_messages_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["kind", "occurrences", "stages", "message", "example"])
+            for k in error_summary["kinds"]:
+                for m in k["messages"]:
+                    w.writerow([k["kind"], m["occurrences"],
+                                " ".join(str(x) for x in m["stages"]),
+                                m["message"], m["example"] or ""])
 
     summary = {
         "config": {
@@ -1972,7 +1982,7 @@ def on_test_stop(environment, **_kw):
         print("-" * 64)
         if SAMPLER.enabled:
             where = (f"examples in {SAMPLER.root}/, up to "
-                     f"{SAMPLER.per_kind_per_stage} per kind per stage")
+                     f"{SAMPLER.per_kind_per_stage} per message per stage")
         else:
             where = "counted only; pass --save-errors to keep examples on disk"
         print(f"ERROR SAMPLES ({error_summary['total_occurrences']} error(s) "
@@ -1985,12 +1995,27 @@ def on_test_stop(environment, **_kw):
                   f"{stages}{note}")
             if k["example"]:
                 print(f"    e.g. {k['example']}")
+            # What the service said, per kind: the same status code usually
+            # hides several different problems.
+            msgs = k["messages"]
+            if len(msgs) > 1 or (msgs and msgs[0]["message"]
+                                 != error_samples.NO_MESSAGE):
+                for m in msgs[:ERROR_MESSAGES_SHOWN]:
+                    mstages = ",".join(str(x) for x in m["stages"])
+                    print(f"    {m['occurrences']:>6} x  {m['message']}"
+                          f"  [stage {mstages}]")
+                if len(msgs) > ERROR_MESSAGES_SHOWN:
+                    print(f"           ... {len(msgs) - ERROR_MESSAGES_SHOWN} "
+                          f"more distinct message(s) in "
+                          f"{CSV_PREFIX}_error_messages.csv")
 
     wrote = [f"{CSV_PREFIX}_stages.csv", f"{CSV_PREFIX}_by_qtype.csv"]
     if class_rows:
         wrote.append(f"{CSV_PREFIX}_by_class.csv")
     if checkpoints:
         wrote.append(f"{CSV_PREFIX}_checkpoints.csv")
+    if error_messages_csv:
+        wrote.append(error_messages_csv)
     if error_index:
         wrote.append(f"{SAMPLER.root}/")
     if ars_health:
