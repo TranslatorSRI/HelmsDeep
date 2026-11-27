@@ -380,10 +380,10 @@ def _qg(nodes, edges, tier=None, bypass_cache=None):
     traffic from real traffic.
     """
     env = {
-        "submitter": config.SUBMITTER,
         "message": {
             "query_graph": {"nodes": nodes, "edges": edges}
-        }
+        },
+        "submitter": config.SUBMITTER,
     }
     if tier is not None:
         env["parameters"] = {"tier": tier}
@@ -542,10 +542,10 @@ def _pathfinder_qg(nodes, paths, bypass_cache=True):
     the ``paths`` map carries the actual query.
     """
     env = {
-        "submitter": config.SUBMITTER,
         "message": {
             "query_graph": {"nodes": nodes, "paths": paths}
-        }
+        },
+        "submitter": config.SUBMITTER,
     }
     _set_bypass_cache(env, bypass_cache)
     return _apply_query_parameters(env)
